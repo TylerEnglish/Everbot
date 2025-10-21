@@ -8,16 +8,21 @@ This seed gives you:
 ## Quickstart (host)
 
 ```bash
+# from repo root
 poetry install
-poetry run everabot selfcheck   # should report blocked writes
-poetry run everabot eval        # runs root test stubs
+poetry run everabot selfcheck
+poetry run everabot eval
 ```
 
-## Docker
-
+# Docker
 ```bash
-make docker-build
-make docker-run
+docker build -t everabot:dev .
+docker run --rm -it `
+  -v "${PWD}\ruleset:/workspace/ruleset:ro" `
+  -v "${PWD}\test:/workspace/test:ro" `
+  -v "${PWD}\snapshots:/workspace/snapshots" `
+  everabot:dev eval
+
 ```
 
 `docker-run` binds:

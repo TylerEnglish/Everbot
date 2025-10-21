@@ -17,24 +17,33 @@ WORKDIR /workspace
 RUN pip install --no-cache-dir poetry==1.8.3
 
 # copy project files
-COPY pyproject.toml README.md Makefile ./
+COPY pyproject.toml README.md ./
 COPY bot/ ./bot/
 COPY ruleset/ ./ruleset/
 COPY test/ ./test/
 COPY app/ ./app/
 COPY snapshots/ ./snapshots/
 
-# install python deps
+# install python deps (system site, no venv)
 RUN poetry config virtualenvs.create false && poetry install --no-interaction --no-ansi
 
-# extra safety: make ruleset/ and test/ read-only inside the image too
+# harden: make ruleset/ and test/ read-only inside the image too
 RUN chmod -R a-w /workspace/ruleset /workspace/test
 
-# switch to non-root
+# ensure the app user owns ONLY /workspace (writable area)
+RUN chown -R botuser:botuser /workspace
+
+# wrapper block
+RUN printf '%s\n' '#!/bin/sh' 'set -e' \
+  '[ "${EVERABOT_STARTUP_CHECK:-0}" = "1" ] && everabot selfcheck || true' \
+  'exec "$@"' > /usr/local/bin/entrypoint && chmod +x /usr/local/bin/entrypoint
+
 USER botuser
 
-# simple healthcheck: CLI should respond
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD python -m bot.cli --help || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+  CMD python -m bot.cli --help || exit 1
 
-ENTRYPOINT ["everabot"]
+ENTRYPOINT ["entrypoint","everabot"]
 CMD ["eval"]
+
+
