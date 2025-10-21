@@ -1,8 +1,33 @@
+version: 1
 tokens_max: 8192
 wall_time_sec_max: 900
 ram_mb_max: 4096
 disk_mb_max: 4096
+
+cpu:
+  percent_max: 85         # informational today (BudgetEnforcer can grow into this)
+fd_limits:
+  soft_max: 512           # informational; kernel limits still apply in container
+
+phases:                   # optional per-phase ceilings (soft; logged in limits.json)
+  RESEARCH:
+    wall_time_sec_max: 240
+  DISTILL:
+    wall_time_sec_max: 120
+  PRACTICE:
+    wall_time_sec_max: 180
+  EVAL:
+    wall_time_sec_max: 120
+  DECIDE:
+    wall_time_sec_max: 30
+
 net:
   allow_http: true
   allow_https: true
-  allowed_hosts: []
+  rps_max: 4              # polite default for fetchers
+  burst_max: 8
+  allowed_hosts: []       # put allowlist here when you tighten
+snapshots:
+  # prefer delta-friendly formats when size matters; reconstructibility required
+  binary_delta: ["vcdiff", "xdelta3"]
+  require_bitwise_reconstruction: true

@@ -1,6 +1,17 @@
+version: 1
 internet:
   allowed: true
   fetchers: ["http", "https"]
+  rate_limit:
+    rps_max: 4
+    burst_max: 8
 file_ops:
   write_whitelist: ["snapshots"]
   write_blacklist: ["ruleset", "test"]
+exec:
+  allowed: false             # default deny; flip true only for a curated command list
+  allowlist: []              # e.g., ["python", "pytest"]
+  denylist: ["bash -c *", "sh -c *", "curl|bash", "pip install *"]
+sandbox:
+  fs_ro_paths: ["ruleset", "test"]
+  net_namespaces: ["default"]   # informative; your Docker does isolation

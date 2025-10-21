@@ -7,6 +7,7 @@ from bot.rules.loader import load_all, topic_allowed, load_last_promoted, pareto
 from bot.governance.budget import BudgetEnforcer
 from bot.core.task_graph import validate_path
 from bot.core.phases import Phase
+from bot.eval.harness import run_all
 
 
 _ROOT = get_project_root()
@@ -79,8 +80,9 @@ class Orchestrator:
                     self._log_phase_result(Phase.PRACTICE, {"attempts": 3, "score_stub": 0.0})
 
                 with self.tracer.start_as_current_span("phase.eval"):
-                    root_ok = True  # stub root tests succeeded
-                    self._log_phase_result(Phase.EVAL, {"root_tests": "PASS (stub)", "root_ok": root_ok})
+                    res = run_all()
+                    root_ok = (res["overall"] == "PASS")
+                    self._log_phase_result(Phase.EVAL, {"root_eval_artifact": res["artifact"], "root_ok": root_ok})
 
             # persist budget summary
             (self.info.snapshot_dir / "limits.json").write_text(

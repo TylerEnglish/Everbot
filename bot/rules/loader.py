@@ -13,12 +13,16 @@ def _read_yaml(name: str) -> Dict[str, Any]:
     return yaml.safe_load(p.read_text(encoding="utf-8"))
 
 def load_all() -> Dict[str, Any]:
-    return {
+    cfg = {
         "limits":    _read_yaml("limits.yaml"),
         "promotion": _read_yaml("promotion.yaml"),
         "tools":     _read_yaml("tools.yaml"),
         "topics":    _read_yaml("topics.yaml"),
     }
+    safety = _RULES / "safety.yaml"
+    if safety.exists():
+        cfg["safety"] = _read_yaml("safety.yaml")
+    return cfg
 
 def topic_allowed(topic: str, topics_cfg: Dict[str, Any]) -> bool:
     slug = re.sub(r"[^a-z0-9]+", "-", topic.strip().lower())

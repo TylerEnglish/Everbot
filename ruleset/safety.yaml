@@ -1,0 +1,30 @@
+# Immutable safety policy (readable by the agent, never writable).
+version: 1
+content:
+  allow_sensitive: false
+  disallow_personal_data: true
+  disallow_harassment: true
+  disallow_illegal: true
+  # Minimal prompt-injection hygiene for retrieval & browsing
+  prompt_injection:
+    strip_url_instructions: true        # ignore instructions embedded in fetched pages
+    refuse_credential_prompts: true
+    require_source_provenance: true     # every distilled "bullet" must carry a source id
+context_policy:
+  framework: ACE                        # Agentic Context Engineering
+  operations: [generate, reflect, curate]   # modular, structured updates (no freeform rewrites)
+  memory_units: bullets                 # atomic tactics/facts, not long paragraphs
+  provenance_required: true             # each bullet links to 1+ sources
+  prevent_collapse: true                # disallow destructive re-summarization of memory
+  update_mode: incremental_append       # append + curated edits only
+self_modification:
+  # SICA-style self-editing is allowed only outside protected roots and behind tests
+  allowed_paths: ["bot", "app", "snapshots"]      # edits here are allowed
+  forbidden_paths: ["ruleset", "test"]            # enforced by guard + RO mounts
+  require_eval_before_commit: true                # run root eval on any self-edit PR
+network:
+  scraping_ethics: "respect robots.txt and rate limits"
+  disallow_credentials_leak: true
+  # Use tools.yaml allowlists for concrete hosts + protocols
+fail_fast:
+  on_policy_violation: true

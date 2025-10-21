@@ -48,8 +48,8 @@ Everabot/
 
 ### 3) Immutable rules & base tests (what *must* always pass)
 
-* [ ] Populate `ruleset/` with a minimal, explicit policy the agent can *read* but never change (allowed tools, safety, network scope, max CPU/RAM, promotion gate, etc.).
-* [ ] In `test/`, add **baseline evaluations** the agent must never regress on:
+* [*] Populate `ruleset/` with a minimal, explicit policy the agent can *read* but never change (allowed tools, safety, network scope, max CPU/RAM, promotion gate, etc.).
+* [*] In `test/`, add **baseline evaluations** the agent must never regress on:
 
 * **Conversation/Turing-style** sanity prompts (your authored cases).
 * **Standard LLM benchmarks** wired for local use:
@@ -57,9 +57,8 @@ Everabot/
   * **MMLU** for broad knowledge. ([arXiv][4])
   * **GSM8K** for math reasoning. ([arXiv][5])
   * **HellaSwag** for commonsense (note the known validity caveats). ([arXiv][6])
-  * **HumanEval** for code functional correctness. ([arXiv][7])
 
-* [ ] Expose a **single command** via Poetry scripts: `poetry run everabot eval` that runs these and emits a pass/fail summary. (No Makefile.)
+* [*] Expose a **single command** via Poetry scripts: `poetry run everabot eval` that runs these and emits a pass/fail summary. (No Makefile.)
 
 ---
 

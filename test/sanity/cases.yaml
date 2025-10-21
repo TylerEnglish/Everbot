@@ -1,0 +1,5 @@
+cases:
+  - prompt: "Say exactly: OK"
+    expect_regex: "^OK$"
+  - prompt: "Answer with the single word 'pong'."
+    expect_regex: "^pong$"
