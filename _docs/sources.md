@@ -1,0 +1,4 @@
+* [ACE](https://arxiv.org/pdf/2510.04618)
+* [Self-Improving Coding Agent](https://arxiv.org/pdf/2504.15228)
+* [RAG](https://arxiv.org/pdf/2506.00054)
+* [Delta Encoding](https://nhsjs.com/2025/investigating-delta-encoding-with-error-control-for-scientific-data-reduction/)
