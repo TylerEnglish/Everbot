@@ -5,7 +5,6 @@
 
 * [*] Create the skeleton you specified:
 
-```
 
 Everabot/
 ├─ ruleset/                 # Immutable runtime rules & governance
@@ -18,7 +17,6 @@ Everabot/
 ├─ poetry.lock
 └─ README.md
 
-```
 
 * [*] Initialize `poetry`, add core deps (Python 3.11+), and commit the empty scaffold.
 
@@ -35,7 +33,7 @@ Everabot/
 
 ### 2) The Python orchestrator & CLI (terminal-first)
 
-* [ ] Create `bot/cli.py` exposing subcommands:
+* [*] Create `bot/cli.py` exposing subcommands:
 
 * `learn <topic>` (RAG + practice + eval + snapshot)
 * `build <thing>` (goal-oriented project, read-only against mission repos unless told)
@@ -43,8 +41,8 @@ Everabot/
 * `train` (weight finetune/QLoRA/LoRA on local data)
 * `eval` (run root tests + any new eval suites)
 * `snapshot` / `rollback`
-* [ ] Define a **Task graph** + **state machine**: `IDLE → RESEARCH → DISTILL → PRACTICE → EVAL → DECIDE(PROMOTE/REJECT)`.
-* [ ] Add **OpenTelemetry** logging hooks (trace spans per stage) to power later XAI reporting; set up a file exporter first. ([OpenTelemetry][3])
+* [*] Define a **Task graph** + **state machine**: `IDLE → RESEARCH → DISTILL → PRACTICE → EVAL → DECIDE(PROMOTE/REJECT)`.
+* [*] Add **OpenTelemetry** logging hooks (trace spans per stage) to power later XAI reporting; set up a file exporter first. ([OpenTelemetry][3])
 
 ---
 
