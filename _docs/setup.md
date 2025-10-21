@@ -39,6 +39,7 @@ Test-Path "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe"
 $env:Path += ";$env:LOCALAPPDATA\Programs\Ollama"
 ollama --version
 setx PATH "$($env:PATH);$env:LOCALAPPDATA\Programs\Ollama"
+setx EVERABOT_XDELTA3 "C:\full\path\to\xdelta3.exe"
 
 
 $env:EVERABOT_LLM = "ollama"

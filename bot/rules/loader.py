@@ -25,9 +25,16 @@ def load_all() -> Dict[str, Any]:
     return cfg
 
 def topic_allowed(topic: str, topics_cfg: Dict[str, Any]) -> bool:
-    slug = re.sub(r"[^a-z0-9]+", "-", topic.strip().lower())
-    allowed = [t.strip().lower() for t in topics_cfg.get("allowed_topics", [])]
-    # allow if any allowed token appears as a whole word in slug
+    import re
+    def _slug(s: str) -> str:
+        # identical normalization for both sides (convert underscores too)
+        return re.sub(r"[^a-z0-9]+", "-", s.strip().lower()).strip("-")
+
+    slug = _slug(topic)
+    allowed_raw = topics_cfg.get("allowed_topics", []) or []
+    allowed = [_slug(t) for t in allowed_raw]
+
+    # allow if any allowed token appears as a whole token delimited by '-'
     return any(re.search(rf"(?:^|-){re.escape(tok)}(?:-|$)", slug) for tok in allowed)
 
 def load_last_promoted() -> Dict[str, Any] | None:

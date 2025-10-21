@@ -1,3 +1,4 @@
+# bot/eval/harness.py
 from __future__ import annotations
 import os, re, yaml, gzip, csv, json, pathlib, subprocess, sys, datetime, random
 from typing import Dict, Any, List
@@ -7,7 +8,7 @@ from bot.llm.provider import ask as llm_ask, NotConfigured
 
 ROOT = get_project_root()
 
-# ----------------- small utils -----------------
+# ---------- small utils ----------
 def _first_existing(paths):
     for p in paths:
         if p and p.exists():
@@ -52,7 +53,6 @@ def _save_cache(bench: str, data: dict) -> None:
     tmp.replace(p)
 
 def _cap(name: str, default: int) -> int:
-    # Hard default = 200; override with env like EVERABOT_MMLU_CAP=500
     try:
         return int(os.getenv(name, default))
     except Exception:
@@ -80,7 +80,7 @@ def _extract_final_number(txt: str) -> str | None:
     m = re.findall(r"-?\d+(?:\.\d+)?", txt or "")
     return m[-1] if m else None
 
-# ----------------- security check -----------------
+# ---------- security ----------
 def test_guard_write_blocked() -> Dict[str, Any]:
     errors: List[str] = []
     for rel in ("ruleset/__eval_probe.txt", "test/__eval_probe.txt"):
@@ -92,7 +92,7 @@ def test_guard_write_blocked() -> Dict[str, Any]:
             pass
     return _pass("Writes blocked") if not errors else _fail("; ".join(errors))
 
-# ----------------- root stub compatibility -----------------
+# ---------- root stub compatibility ----------
 def test_root_stub_script() -> Dict[str, Any]:
     script = ROOT / "test" / "run_root_tests.py"
     if not script.exists():
@@ -101,13 +101,13 @@ def test_root_stub_script() -> Dict[str, Any]:
         [sys.executable, str(script)],
         capture_output=True,
         text=True,
-        encoding="utf-8", errors="replace"   # <— ensure UTF-8 decode on Windows
+        encoding="utf-8", errors="replace"
     )
     if r.returncode == 0:
         return _pass(r.stdout.strip())
     return _fail(f"returncode={r.returncode}, stdout={r.stdout}, stderr={r.stderr}")
 
-# ----------------- MMLU -----------------
+# ---------- MMLU ----------
 def test_mmlu_wired() -> Dict[str, Any]:
     """
     MMLU CSVs are headerless: [Q, A, B, C, D, GOLD_LETTER].
@@ -174,9 +174,9 @@ def test_mmlu_wired() -> Dict[str, Any]:
     status = "PASS" if _meets_threshold(acc, thr) else "FAIL"
     src = str(data_root)
     mode = "model" if used_backend else "random"
-    return {"status": status, "detail": f"{mode}_acc={acc:.3f} on {total} Q, thr={thr}, root={src}"}
+    return {"status": status, "detail": f"{mode}_acc={acc:.3f} on {total} Q (cap={cap_rows}), thr={thr}, root={src}"}
 
-# ----------------- GSM8K -----------------
+# ---------- GSM8K ----------
 def test_gsm8k_wired() -> Dict[str, Any]:
     base = _first_existing([
         ROOT / "test" / "bench_gsm8k" / "raw",
@@ -222,7 +222,7 @@ def test_gsm8k_wired() -> Dict[str, Any]:
                     pred = pred_num
                 except NotConfigured:
                     used_backend = False
-                    pred = "0"  # trivial baseline
+                    pred = "0"
                 except Exception:
                     pred = "0"
                 cache[ex_id] = pred
@@ -237,18 +237,20 @@ def test_gsm8k_wired() -> Dict[str, Any]:
     thr = _promotion_thresholds().get("gsm8k_acc_min")
     status = "PASS" if _meets_threshold(acc, thr) else "FAIL"
     mode = "model" if used_backend else "baseline"
-    return {"status": status, "detail": f"{mode}_em_acc={acc:.3f} on {total} items, thr={thr}, file={str(test_file)}"}
+    return {"status": status, "detail": f"{mode}_em_acc={acc:.3f} on {total} items (cap={cap_rows}), thr={thr}, file={str(test_file)}"}
 
-# ----------------- HellaSwag -----------------
+# ---------- HellaSwag ----------
 def _hella_candidate_files(base: pathlib.Path):
     # Prefer validation/dev; avoid test unless it's the only thing present.
-    order = [
+    preferred = [
         "val.jsonl", "validation.jsonl", "dev.jsonl", "train.jsonl",
+        "hellaswag_val.jsonl", "hellaswag_valid.jsonl", "hellaswag_dev.jsonl", "hellaswag_train.jsonl",
         "val.jsonl.gz", "validation.jsonl.gz", "dev.jsonl.gz", "train.jsonl.gz",
     ]
-    for name in order:
+    for name in preferred:
         p = base / name
         if p.exists(): yield p
+    # Fallbacks
     yield from base.glob("*.jsonl")
     yield from base.glob("*.jsonl.gz")
 
@@ -260,7 +262,7 @@ def test_hellaswag_wired() -> Dict[str, Any]:
     JSONL fields:
       - context (or ctx / ctx_a+ctx_b)
       - endings: list[str] length 4
-      - label: int 0..3 (some public TEST releases omit labels; use validation/dev for scoring)
+      - label: int 0..3
     """
     base = ROOT / "test" / "bench_hellaswag" / "raw"
     if not base.exists():
@@ -292,6 +294,7 @@ def test_hellaswag_wired() -> Dict[str, Any]:
             except Exception:
                 gold = None
 
+            # endings under several names
             endings = (ex.get("endings")
                        or ex.get("ending_options")
                        or ex.get("answers")
@@ -336,7 +339,7 @@ def test_hellaswag_wired() -> Dict[str, Any]:
 
     if total == 0:
         if is_test_like and skip_reasons["nolabel"] > 0:
-            return _skip(f"HellaSwag: test split appears unlabeled — use a validation/dev split for local scoring. Checked: {path}")
+            return _skip(f"HellaSwag: file looks like a TEST split without labels — use a validation/dev split for local scoring. Checked: {path}")
         reason = f"empty after filtering (nolabel={skip_reasons['nolabel']}, bad_endings={skip_reasons['bad_endings']}). File: {path}"
         return _skip(f"HellaSwag parsed but {reason}")
 
@@ -345,9 +348,9 @@ def test_hellaswag_wired() -> Dict[str, Any]:
     thr = _promotion_thresholds().get("hellaswag_acc_min")
     status = "PASS" if _meets_threshold(acc, thr) else "FAIL"
     mode = "model" if used_backend else "random"
-    return {"status": status, "detail": f"{mode}_acc={acc:.3f} on {total} items, thr={thr}, file={path}"}
+    return {"status": status, "detail": f"{mode}_acc={acc:.3f} on {total} items (cap={cap_rows}), thr={thr}, file={path}"}
 
-# ----------------- sanity set -----------------
+# ---------- sanity set ----------
 def test_conversation_sanity() -> Dict[str, Any]:
     backend = os.getenv("EVERABOT_LLM")
     cases_path = ROOT / "test" / "sanity" / "cases.yaml"
@@ -368,7 +371,7 @@ def test_conversation_sanity() -> Dict[str, Any]:
     except Exception as e:
         return _fail(f"Sanity error: {e}")
 
-# ----------------- test runner -----------------
+# ---------- test runner ----------
 def run_all() -> Dict[str, Any]:
     results = {
         "security": {"guard_write_blocked": test_guard_write_blocked()},

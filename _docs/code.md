@@ -551,11 +551,13 @@ import typer, sys, pathlib, subprocess, json
 from rich import print
 from bot.security.guard import install_guard
 from bot.paths import get_project_root
-from bot.paths import get_project_root
 from bot.rules.loader import load_all
 from bot.eval.harness import run_all
+from bot.rag.utils import read_jsonl
 
 app = typer.Typer(help="Everabot CLI")
+rag_app = typer.Typer(help="RAG substrate commands")
+app.add_typer(rag_app, name="rag")
 
 _ROOT = get_project_root()
 _PROTECTED_DIRS = {str(_ROOT / "ruleset"), str(_ROOT / "test")}
@@ -711,6 +713,176 @@ def snapshot_rollback(
     (_ROOT / "snapshots" / "CURRENT_POINTER.txt").write_text(str(target), encoding="utf-8")
     print(f"[green]Rolled back pointer to[/green] {target}\n[dim]Event:[/dim] {out}")
 
+# ------------------- RAG commands -------------------
+
+@rag_app.command("init")
+def rag_init(seed: str = typer.Option("all", help="Seed set: all|none")):
+    """
+    Ingest the initial seed corpus (ACE, SICA, RAG, VCDIFF).
+    """
+    from bot.paths import get_project_root
+    from bot.rag.pipeline import ingest
+    root = get_project_root()
+    out = root / "snapshots" / "rag" / "v1"
+    urls = []
+    if seed == "all":
+        urls = [
+            "https://arxiv.org/pdf/2510.04618",  # ACE
+            "https://arxiv.org/pdf/2504.15228",  # SICA
+            "https://arxiv.org/pdf/2005.11401",  # RAG (Lewis et al.)
+            "https://datatracker.ietf.org/doc/html/rfc3284",  # VCDIFF
+        ]
+    meta = ingest(urls, out)
+    print(f"[green]RAG store created at[/green] {out}  counts={meta['counts']} model={meta['emb_model']}")
+
+@rag_app.command("ingest")
+def rag_ingest(url: list[str] = typer.Argument(..., help="One or more URLs or paths"),
+               out: str = typer.Option(None, "--out", help="Output dir under snapshots/rag")):
+    from bot.paths import get_project_root
+    from bot.rag.pipeline import ingest
+    import pathlib
+    root = get_project_root()
+    out_dir = pathlib.Path(out) if out else (root / "snapshots" / "rag" / "custom")
+    meta = ingest(list(url), out_dir)
+    print(f"[green]Ingested[/green] -> {out_dir} counts={meta['counts']}")
+
+@rag_app.command("query")
+def rag_query(q: str, store: str = typer.Option("v1", help="Subdir under snapshots/rag")):
+    from bot.paths import get_project_root
+    import pyarrow.parquet as pq
+    from bot.rag.embeddings import get_embedder
+    from bot.rag.index_faiss import load_index
+    root = get_project_root()
+    sdir = root / "snapshots" / "rag" / store
+    tab = pq.read_table(sdir / "embeddings.parquet")
+    ids = [x.as_py() for x in tab["chunk_id"]]
+    model, embed = get_embedder()
+    qv = embed([q])
+    idx = load_index(sdir / "index.faiss")
+    D, I = idx.search(qv, 5)
+    # Map chunk_ids back to doc titles (Windows-safe UTF-8 read via read_jsonl)
+    docs = {row["id"]: row for row in read_jsonl(sdir / "docs.jsonl")}
+    chunks_tab = pq.read_table(sdir / "chunks.parquet")
+    text_by_chunk = {chunks_tab["id"][i].as_py(): chunks_tab["text"][i].as_py() for i in range(chunks_tab.num_rows)}
+    out = []
+    for j, score in zip(I[0], D[0]):
+        cid = ids[j]; doc_id = cid.split(":")[0]
+        out.append({"chunk_id": cid, "doc_title": docs[doc_id]["title"], "score": float(score),
+                    "preview": text_by_chunk[cid][:200]})
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+
+@rag_app.command("stats")
+def rag_stats(
+    store: str = typer.Option("v1", "--store", "-s", help="Subdir under snapshots/rag"),
+):
+    from bot.paths import get_project_root
+    import pyarrow.parquet as pq, json
+    root = get_project_root()
+    sdir = root / "snapshots" / "rag" / store
+    docs = sum(1 for _ in open(sdir/"docs.jsonl", "r", encoding="utf-8", errors="replace"))
+    chunks = pq.read_table(sdir / "chunks.parquet").num_rows
+    print(json.dumps({"store": str(sdir), "docs": docs, "chunks": chunks}, indent=2))
+
+@rag_app.command("export")
+def rag_export(
+    store: str = typer.Option(..., "--store", "-s", help="RAG store subdir (e.g., v1)"),
+    out: str   = typer.Option(..., "--out", "-o", help="Output folder for canonical JSONL"),
+):
+    from bot.paths import get_project_root
+    from bot.rag.utils import read_jsonl, canonicalize_json_rows
+    import pathlib, json, pyarrow.parquet as pq
+    root = get_project_root()
+    sdir = root / "snapshots" / "rag" / store
+    out_dir = pathlib.Path(out); out_dir.mkdir(parents=True, exist_ok=True)
+    docs_rows = list(read_jsonl(sdir / "docs.jsonl"))
+    canon_docs = canonicalize_json_rows(docs_rows)
+    (out_dir / "docs.canon.jsonl").write_bytes(canon_docs)
+    tab = pq.read_table(sdir / "chunks.parquet")
+    rows = [{c: tab[c][i].as_py() for c in tab.column_names} for i in range(tab.num_rows)]
+    canon_chunks = canonicalize_json_rows(rows)
+    (out_dir / "chunks.canon.jsonl").write_bytes(canon_chunks)
+    print(f"Exported canonical docs/chunks to {out_dir}")
+
+@rag_app.command("prove-equivalence")
+def rag_prove_equivalence(a: str, b: str, k: int = 5):
+    """
+    Prove both: (1) bitwise canonical equality, (2) top-k equivalence on a frozen query set.
+    """
+    from bot.paths import get_project_root
+    from bot.rag.equiv import bit_for_bit_equivalent, topk_equivalent
+    root = get_project_root()
+    import pathlib, json
+    A = (root / "snapshots" / "rag" / a).resolve()
+    B = (root / "snapshots" / "rag" / b).resolve()
+    ok_bits, detail_bits = bit_for_bit_equivalent(A, B)
+    queries = [
+        "What is ACE and how does it prevent context collapse?",
+        "How does RAG combine parametric and non-parametric memory?",
+        "What is VCDIFF used for in snapshots?",
+        "Self-improving coding agent promotion gates"
+    ]
+    ok_topk, detail_topk = topk_equivalent(A, B, queries, k=k)
+    result = {"bitwise": ok_bits, "topk": ok_topk,
+              "detail_bits": detail_bits, "detail_topk": detail_topk}
+    print(json.dumps(result, indent=2))
+    raise typer.Exit(code=0 if (ok_bits and ok_topk) else 1)
+
+@rag_app.command("delta-create")
+def rag_delta_create(
+    base: str = typer.Argument(..., help="Path to BASE store dir (e.g., snapshots/rag/v1)"),
+    target: str = typer.Argument(..., help="Path to TARGET store dir (similar schema)"),
+    out: str = typer.Option(..., "--out", "-o", help="Output folder for .vcdiff files + PROOF.json"),
+):
+    """
+    Create VCDIFF (xdelta3) deltas for heavy files between two stores and verify reconstruction.
+    """
+    import pathlib, json
+    from bot.snapshots.delta import roundtrip_manifest
+    base_p, tgt_p, out_p = pathlib.Path(base), pathlib.Path(target), pathlib.Path(out)
+    files = ["docs.jsonl", "chunks.parquet", "embeddings.parquet", "index.faiss"]
+    proof = roundtrip_manifest(base_p, tgt_p, files, out_p)
+    print(json.dumps(proof, indent=2))
+    raise typer.Exit(code=0 if proof["all_equal"] else 1)
+
+@rag_app.command("delta-reconstruct")
+def rag_delta_reconstruct(
+    base: str = typer.Argument(..., help="Path to BASE store dir"),
+    delta_dir: str = typer.Argument(..., help="Folder with .vcdiff files (created by delta-create)"),
+    out: str = typer.Option(None, "--out", "-o", help="Reconstruction output dir (defaults to <delta_dir>/recon)"),
+):
+    """
+    Reconstruct target files from base + deltas.
+    """
+    import pathlib, json
+    from bot.snapshots.delta import apply_delta
+    base_p, dd = pathlib.Path(base), pathlib.Path(delta_dir)
+    recon = pathlib.Path(out) if out else (dd / "recon"); recon.mkdir(parents=True, exist_ok=True)
+    files = ["docs.jsonl", "chunks.parquet", "embeddings.parquet", "index.faiss"]
+    for rel in files:
+        b = base_p / rel
+        d = dd / f"{rel}.vcdiff"
+        r = recon / rel
+        apply_delta(b, d, r)
+    print(json.dumps({"reconstructed": str(recon)}, indent=2))
+
+@rag_app.command("delta-roundtrip")
+def rag_delta_roundtrip(
+    base: str = typer.Argument(..., help="Path to BASE store dir"),
+    target: str = typer.Argument(..., help="Path to TARGET store dir"),
+    out: str = typer.Option(..., "--out", "-o", help="Delta output dir (will contain .vcdiff + recon + PROOF.json)"),
+):
+    """
+    One-shot: create deltas, reconstruct, and prove byte-identical equality via SHA-256.
+    """
+    import pathlib, json
+    from bot.snapshots.delta import roundtrip_manifest
+    base_p, tgt_p, out_p = pathlib.Path(base), pathlib.Path(target), pathlib.Path(out)
+    files = ["docs.jsonl", "chunks.parquet", "embeddings.parquet", "index.faiss"]
+    proof = roundtrip_manifest(base_p, tgt_p, files, out_p)
+    print(json.dumps(proof, indent=2))
+    raise typer.Exit(code=0 if proof["all_equal"] else 1)
+
+# ------------------- rules commands -------------------
 
 rules_app = typer.Typer(help="Inspect and validate ruleset")
 app.add_typer(rules_app, name="rules")
@@ -723,7 +895,6 @@ def rules_show():
 
 if __name__ == "__main__":
     app()
-
 
 ```
 
@@ -843,7 +1014,20 @@ class Orchestrator:
             # Enforce budgets for the whole run (soft-fail; influences DECIDE)
             with BudgetEnforcer(self.rules["limits"], self.info.snapshot_dir) as budget:
                 with self.tracer.start_as_current_span("phase.research"):
-                    self._log_phase_result(Phase.RESEARCH, {"topic": topic, "notes": "RAG: TBD"})
+                    # Seed from rules (internet allowlisted in ruleset/tools.yaml)
+                    urls = [
+                        "https://arxiv.org/pdf/2510.04618",
+                        "https://arxiv.org/pdf/2504.15228",
+                        "https://arxiv.org/pdf/2005.11401",
+                        "https://datatracker.ietf.org/doc/html/rfc3284",
+                    ]
+                    from bot.rag.pipeline import ingest
+                    rag_dir = self.info.snapshot_dir / "rag_store"
+                    meta = ingest(urls, rag_dir)
+                    self._log_phase_result(Phase.RESEARCH, {
+                        "topic": topic, "rag_store": str(rag_dir),
+                        "counts": meta.get("counts"), "emb_model": meta.get("emb_model")
+                    })
 
                 with self.tracer.start_as_current_span("phase.distill"):
                     self._log_phase_result(Phase.DISTILL, {"bullets": ["(stub) atomic tactics"]})
@@ -955,6 +1139,7 @@ def validate_path(phases: Sequence[Union[Phase, str]]) -> bool:
 
 eval/harness.py
 ```python
+# bot/eval/harness.py
 from __future__ import annotations
 import os, re, yaml, gzip, csv, json, pathlib, subprocess, sys, datetime, random
 from typing import Dict, Any, List
@@ -964,7 +1149,7 @@ from bot.llm.provider import ask as llm_ask, NotConfigured
 
 ROOT = get_project_root()
 
-# ----------------- small utils -----------------
+# ---------- small utils ----------
 def _first_existing(paths):
     for p in paths:
         if p and p.exists():
@@ -1009,7 +1194,6 @@ def _save_cache(bench: str, data: dict) -> None:
     tmp.replace(p)
 
 def _cap(name: str, default: int) -> int:
-    # Hard default = 200; override with env like EVERABOT_MMLU_CAP=500
     try:
         return int(os.getenv(name, default))
     except Exception:
@@ -1037,7 +1221,7 @@ def _extract_final_number(txt: str) -> str | None:
     m = re.findall(r"-?\d+(?:\.\d+)?", txt or "")
     return m[-1] if m else None
 
-# ----------------- security check -----------------
+# ---------- security ----------
 def test_guard_write_blocked() -> Dict[str, Any]:
     errors: List[str] = []
     for rel in ("ruleset/__eval_probe.txt", "test/__eval_probe.txt"):
@@ -1049,7 +1233,7 @@ def test_guard_write_blocked() -> Dict[str, Any]:
             pass
     return _pass("Writes blocked") if not errors else _fail("; ".join(errors))
 
-# ----------------- root stub compatibility -----------------
+# ---------- root stub compatibility ----------
 def test_root_stub_script() -> Dict[str, Any]:
     script = ROOT / "test" / "run_root_tests.py"
     if not script.exists():
@@ -1058,13 +1242,13 @@ def test_root_stub_script() -> Dict[str, Any]:
         [sys.executable, str(script)],
         capture_output=True,
         text=True,
-        encoding="utf-8", errors="replace"   # <— ensure UTF-8 decode on Windows
+        encoding="utf-8", errors="replace"
     )
     if r.returncode == 0:
         return _pass(r.stdout.strip())
     return _fail(f"returncode={r.returncode}, stdout={r.stdout}, stderr={r.stderr}")
 
-# ----------------- MMLU -----------------
+# ---------- MMLU ----------
 def test_mmlu_wired() -> Dict[str, Any]:
     """
     MMLU CSVs are headerless: [Q, A, B, C, D, GOLD_LETTER].
@@ -1083,7 +1267,7 @@ def test_mmlu_wired() -> Dict[str, Any]:
     if not csvs:
         return _skip("MMLU found but no CSVs under data/**")
 
-    cap_rows = _cap("EVERABOT_MMLU_CAP", 50)
+    cap_rows = _cap("EVERABOT_MMLU_CAP", 200)
     cache = _load_cache("mmlu")
     used = total = correct = 0
     used_backend = True
@@ -1131,9 +1315,9 @@ def test_mmlu_wired() -> Dict[str, Any]:
     status = "PASS" if _meets_threshold(acc, thr) else "FAIL"
     src = str(data_root)
     mode = "model" if used_backend else "random"
-    return {"status": status, "detail": f"{mode}_acc={acc:.3f} on {total} Q, thr={thr}, root={src}"}
+    return {"status": status, "detail": f"{mode}_acc={acc:.3f} on {total} Q (cap={cap_rows}), thr={thr}, root={src}"}
 
-# ----------------- GSM8K -----------------
+# ---------- GSM8K ----------
 def test_gsm8k_wired() -> Dict[str, Any]:
     base = _first_existing([
         ROOT / "test" / "bench_gsm8k" / "raw",
@@ -1150,7 +1334,7 @@ def test_gsm8k_wired() -> Dict[str, Any]:
     if not test_file:
         return _skip("Found GSM8K folder but no test*.jsonl.")
 
-    cap_rows = _cap("EVERABOT_GSM8K_CAP", 50)
+    cap_rows = _cap("EVERABOT_GSM8K_CAP", 200)
     cache = _load_cache("gsm8k")
     total = correct = used = 0
     used_backend = True
@@ -1179,7 +1363,7 @@ def test_gsm8k_wired() -> Dict[str, Any]:
                     pred = pred_num
                 except NotConfigured:
                     used_backend = False
-                    pred = "0"  # trivial baseline
+                    pred = "0"
                 except Exception:
                     pred = "0"
                 cache[ex_id] = pred
@@ -1194,18 +1378,20 @@ def test_gsm8k_wired() -> Dict[str, Any]:
     thr = _promotion_thresholds().get("gsm8k_acc_min")
     status = "PASS" if _meets_threshold(acc, thr) else "FAIL"
     mode = "model" if used_backend else "baseline"
-    return {"status": status, "detail": f"{mode}_em_acc={acc:.3f} on {total} items, thr={thr}, file={str(test_file)}"}
+    return {"status": status, "detail": f"{mode}_em_acc={acc:.3f} on {total} items (cap={cap_rows}), thr={thr}, file={str(test_file)}"}
 
-# ----------------- HellaSwag -----------------
+# ---------- HellaSwag ----------
 def _hella_candidate_files(base: pathlib.Path):
     # Prefer validation/dev; avoid test unless it's the only thing present.
-    order = [
+    preferred = [
         "val.jsonl", "validation.jsonl", "dev.jsonl", "train.jsonl",
+        "hellaswag_val.jsonl", "hellaswag_valid.jsonl", "hellaswag_dev.jsonl", "hellaswag_train.jsonl",
         "val.jsonl.gz", "validation.jsonl.gz", "dev.jsonl.gz", "train.jsonl.gz",
     ]
-    for name in order:
+    for name in preferred:
         p = base / name
         if p.exists(): yield p
+    # Fallbacks
     yield from base.glob("*.jsonl")
     yield from base.glob("*.jsonl.gz")
 
@@ -1217,7 +1403,7 @@ def test_hellaswag_wired() -> Dict[str, Any]:
     JSONL fields:
       - context (or ctx / ctx_a+ctx_b)
       - endings: list[str] length 4
-      - label: int 0..3 (some public TEST releases omit labels; use validation/dev for scoring)
+      - label: int 0..3
     """
     base = ROOT / "test" / "bench_hellaswag" / "raw"
     if not base.exists():
@@ -1229,7 +1415,7 @@ def test_hellaswag_wired() -> Dict[str, Any]:
 
     is_test_like = "test" in path.name.lower()
 
-    cap_rows = _cap("EVERABOT_HELLASWAG_CAP", 50)
+    cap_rows = _cap("EVERABOT_HELLASWAG_CAP", 200)
     cache = _load_cache("hellaswag")
     total = correct = used = 0
     used_backend = True
@@ -1249,6 +1435,7 @@ def test_hellaswag_wired() -> Dict[str, Any]:
             except Exception:
                 gold = None
 
+            # endings under several names
             endings = (ex.get("endings")
                        or ex.get("ending_options")
                        or ex.get("answers")
@@ -1293,7 +1480,7 @@ def test_hellaswag_wired() -> Dict[str, Any]:
 
     if total == 0:
         if is_test_like and skip_reasons["nolabel"] > 0:
-            return _skip(f"HellaSwag: test split appears unlabeled — use a validation/dev split for local scoring. Checked: {path}")
+            return _skip(f"HellaSwag: file looks like a TEST split without labels — use a validation/dev split for local scoring. Checked: {path}")
         reason = f"empty after filtering (nolabel={skip_reasons['nolabel']}, bad_endings={skip_reasons['bad_endings']}). File: {path}"
         return _skip(f"HellaSwag parsed but {reason}")
 
@@ -1302,9 +1489,9 @@ def test_hellaswag_wired() -> Dict[str, Any]:
     thr = _promotion_thresholds().get("hellaswag_acc_min")
     status = "PASS" if _meets_threshold(acc, thr) else "FAIL"
     mode = "model" if used_backend else "random"
-    return {"status": status, "detail": f"{mode}_acc={acc:.3f} on {total} items, thr={thr}, file={path}"}
+    return {"status": status, "detail": f"{mode}_acc={acc:.3f} on {total} items (cap={cap_rows}), thr={thr}, file={path}"}
 
-# ----------------- sanity set -----------------
+# ---------- sanity set ----------
 def test_conversation_sanity() -> Dict[str, Any]:
     backend = os.getenv("EVERABOT_LLM")
     cases_path = ROOT / "test" / "sanity" / "cases.yaml"
@@ -1325,7 +1512,7 @@ def test_conversation_sanity() -> Dict[str, Any]:
     except Exception as e:
         return _fail(f"Sanity error: {e}")
 
-# ----------------- test runner -----------------
+# ---------- test runner ----------
 def run_all() -> Dict[str, Any]:
     results = {
         "security": {"guard_write_blocked": test_guard_write_blocked()},
@@ -1492,6 +1679,397 @@ def ask(prompt: str, max_tokens: int = 128, temperature: float = 0.2) -> str:
 
 ```
 
+rag/chunk.py
+```python
+from __future__ import annotations
+from typing import List
+import math
+
+def estimate_tokens(s: str) -> int:
+    # Simple: ~1 token ≈ 4 chars (rough); deterministic, fast
+    return max(1, math.ceil(len(s) / 4))
+
+def chunk_text(doc_id: str, text: str, chunk_tokens: int = 400, overlap_tokens: int = 60):
+    words = text.split()
+    # map "token" to ~word, stable enough for our caps
+    step = max(1, chunk_tokens - overlap_tokens)
+    chunks = []
+    i = 0
+    ord_ = 0
+    while i < len(words):
+        window = words[i:i+chunk_tokens]
+        if not window: break
+        body = " ".join(window).strip()
+        if body:
+            chunks.append((f"{doc_id}:{ord_}", ord_, body, estimate_tokens(body)))
+            ord_ += 1
+        i += step
+    return chunks
+
+```
+
+rag/embeddings.py
+```python
+from __future__ import annotations
+import os
+import numpy as np
+from typing import List, Callable, Tuple
+
+def _l2_normalize(X: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
+    return X / n
+
+def _hashing_embedder(dim: int = 384) -> Callable[[List[str]], np.ndarray]:
+    import mmh3
+    dtype = np.float32
+    def _one(texts: List[str]) -> np.ndarray:
+        out = np.zeros((len(texts), dim), dtype=dtype)
+        for i, t in enumerate(texts):
+            if not isinstance(t, str):
+                t = str(t)
+            vals = []
+            for j in range(dim):
+                h = mmh3.hash128(t + f"|{j}", signed=False)
+                vals.append((h % 1000003) * 1.0)
+            out[i] = np.array(vals, dtype=dtype)
+        return _l2_normalize(out)
+    return _one
+
+def get_embedder(model_hint: str | None = None) -> Tuple[str, Callable[[List[str]], np.ndarray]]:
+    """
+    Returns (model_id, embed_fn).
+    Tries:
+      1) FastEmbed (ONNX Runtime)
+      2) sentence-transformers (PyTorch)
+      3) hashing fallback (always works)
+    You can force with EVERABOT_EMBED_BACKEND in {"fastembed","st","hash"}.
+    """
+    forced = (os.getenv("EVERABOT_EMBED_BACKEND") or "").strip().lower()
+
+    # 1) FastEmbed
+    if forced in ("", "fastembed"):
+        try:
+            from fastembed import TextEmbedding
+            model_id = model_hint or "BAAI/bge-small-en-v1.5"
+            te = TextEmbedding(model_id)
+            def _fastembed(texts: List[str]) -> np.ndarray:
+                embs = list(te.query_embed(texts))
+                X = np.vstack(embs).astype(np.float32, copy=False)
+                return _l2_normalize(X)
+            return f"fastembed/{model_id}", _fastembed
+        except Exception:
+            pass
+
+    # 2) sentence-transformers
+    if forced in ("", "st"):
+        try:
+            from sentence_transformers import SentenceTransformer
+            model_id = model_hint or "sentence-transformers/all-MiniLM-L6-v2"
+            st = SentenceTransformer(model_id)
+            def _st(texts: List[str]) -> np.ndarray:
+                X = st.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
+                return np.asarray(X, dtype=np.float32)
+            return model_id, _st
+        except Exception:
+            pass
+
+    # 3) hashing fallback
+    dim = 384
+    hf = _hashing_embedder(dim=dim)
+    return f"hashing/{dim}", hf
+
+```
+
+rag/equiv.py
+```python
+from __future__ import annotations
+import pathlib, json, numpy as np, pyarrow.parquet as pq
+from typing import List, Tuple, Dict, Any
+from bot.rag.utils import read_jsonl, canonicalize_json_rows, sha256_bytes
+from bot.rag.embeddings import get_embedder
+from bot.rag.index_faiss import load_index, search
+import faiss
+
+def _canonical_hash_docs(root: pathlib.Path) -> str:
+    rows = list(read_jsonl(root / "docs.jsonl"))
+    return sha256_bytes(canonicalize_json_rows(rows))
+
+def _canonical_hash_chunks(root: pathlib.Path) -> str:
+    import pyarrow.parquet as pq
+    tab = pq.read_table(root / "chunks.parquet")
+    rows = [dict(zip(tab.column_names, [col[i].as_py() for col in tab.columns]))
+            for i in range(tab.num_rows)]
+    return sha256_bytes(canonicalize_json_rows(rows))
+
+def bit_for_bit_equivalent(a: pathlib.Path, b: pathlib.Path) -> Tuple[bool, Dict[str, Any]]:
+    ha = {"docs": _canonical_hash_docs(a), "chunks": _canonical_hash_chunks(a)}
+    hb = {"docs": _canonical_hash_docs(b), "chunks": _canonical_hash_chunks(b)}
+    ok = (ha == hb)
+    return ok, {"a": ha, "b": hb}
+
+def topk_equivalent(a: pathlib.Path, b: pathlib.Path,
+                    queries: List[str], k: int = 5) -> Tuple[bool, Dict[str, Any]]:
+    # Load embeddings order to map FAISS ids -> chunk_ids
+    ta, tb = pq.read_table(a / "embeddings.parquet"), pq.read_table(b / "embeddings.parquet")
+    ids_a = [x.as_py() for x in ta["chunk_id"]]
+    ids_b = [x.as_py() for x in tb["chunk_id"]]
+    # Load FAISS indices
+    ia, ib = faiss.read_index(str(a / "index.faiss")), faiss.read_index(str(b / "index.faiss"))
+
+    model_name, embed = get_embedder()
+    qv = embed(queries)
+
+    Da, Ia = ia.search(qv, k); Db, Ib = ib.search(qv, k)
+    tops_a = [[ids_a[j] for j in row] for row in Ia]
+    tops_b = [[ids_b[j] for j in row] for row in Ib]
+    ok = (tops_a == tops_b)
+    detail = {"queries": queries, "topk_a": tops_a, "topk_b": tops_b}
+    return ok, detail
+
+```
+
+rag/fetchers.py
+```python
+from __future__ import annotations
+import requests, pathlib, re
+from bs4 import BeautifulSoup
+from PyPDF2 import PdfReader
+
+_UA = {"User-Agent": "Everabot/0.1 (+https://example.invalid)"}
+
+def fetch(url_or_path: str) -> tuple[str,str]:
+    """
+    Returns (title, text). If local path to .pdf/.html/.txt, we parse locally.
+    If URL, we fetch politely (no crawling; single GET).
+    """
+    if re.match(r"^https?://", url_or_path, re.I):
+        r = requests.get(url_or_path, headers=_UA, timeout=30)
+        r.raise_for_status()
+        ct = (r.headers.get("content-type") or "").lower()
+        if "pdf" in ct or url_or_path.lower().endswith(".pdf"):
+            return (url_or_path, _pdf_bytes_to_text(r.content))
+        elif "html" in ct or "<html" in r.text.lower():
+            return _html_to_text(r.text, url_or_path)
+        else:
+            return (url_or_path, r.text)
+    # local file
+    p = pathlib.Path(url_or_path)
+    if p.suffix.lower() == ".pdf":
+        return (p.name, _pdf_bytes_to_text(p.read_bytes()))
+    if p.suffix.lower() in {".html", ".htm"}:
+        return _html_to_text(p.read_text(encoding="utf-8", errors="replace"), str(p))
+    # txt or anything else
+    return (p.name, p.read_text(encoding="utf-8", errors="replace"))
+
+def _pdf_bytes_to_text(b: bytes) -> str:
+    import io
+    reader = PdfReader(io.BytesIO(b))
+    out = []
+    for page in reader.pages:
+        try:
+            out.append(page.extract_text() or "")
+        except Exception:
+            pass
+    return "\n".join(out)
+
+def _html_to_text(html: str, title_fallback: str) -> tuple[str,str]:
+    soup = BeautifulSoup(html, "html.parser")
+    title = (soup.title.string.strip() if soup.title and soup.title.string else title_fallback)
+    # crude readability: drop scripts/styles
+    for tag in soup(["script","style","noscript"]):
+        tag.decompose()
+    text = " ".join(soup.get_text(" ").split())
+    return (title, text)
+
+```
+
+rag/index_faiss.py
+```python
+from __future__ import annotations
+import numpy as np, pathlib, json
+from typing import Dict, Any
+import faiss
+
+def build_index(X: np.ndarray) -> faiss.Index:
+    # X expected normalized; use inner-product (cosine when normalized)
+    d = X.shape[1]
+    idx = faiss.IndexFlatIP(d)
+    idx.add(X)
+    return idx
+
+def save_index(idx: faiss.Index, path: pathlib.Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    faiss.write_index(idx, str(path))
+
+def load_index(path: pathlib.Path) -> faiss.Index:
+    return faiss.read_index(str(path))
+
+def search(idx: faiss.Index, q_vecs: np.ndarray, k: int = 5):
+    D, I = idx.search(q_vecs, k)
+    return D, I
+
+def save_meta(path: pathlib.Path, meta: Dict[str, Any]):
+    path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+```
+
+rag/pipeline.py
+```python
+from __future__ import annotations
+import pathlib, json
+from typing import List, Tuple
+from bot.rag.fetchers import fetch
+from bot.rag.chunk import chunk_text
+from bot.rag.embeddings import get_embedder
+from bot.rag.schemas import Document, Chunk
+from bot.rag.utils import sha256_str
+from bot.rag.store import save_store
+from bot.rag.index_faiss import build_index, save_index
+
+def ingest(urls: List[str], out_dir: pathlib.Path) -> dict:
+    docs: List[Document] = []
+    chunks: List[Chunk] = []
+    for u in urls:
+        title, text = fetch(u)
+        did = sha256_str(u)
+        doc = Document(id=did, source=u, title=title, text=text, sha256=sha256_str(text))
+        docs.append(doc)
+
+        for (cid, ord_, body, ntok) in chunk_text(did, text, chunk_tokens=400, overlap_tokens=60):
+            chunks.append(Chunk(id=cid, doc_id=did, ord=ord_, text=body, n_tokens_est=ntok))
+
+    model_name, embed = get_embedder()
+    emb = embed([c.text for c in chunks])  # np.ndarray [N, D]
+
+    meta = save_store(out_dir, docs, chunks, emb, model_name)
+    idx = build_index(emb)
+    save_index(idx, out_dir / "index.faiss")
+
+    (out_dir / "CURRENT.json").write_text(json.dumps({
+        "ts": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()),
+        "count_docs": len(docs), "count_chunks": len(chunks),
+        "emb_model": model_name
+    }, indent=2), encoding="utf-8")
+    return meta
+
+
+```
+
+rag/schemas.py
+```python
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class Document:
+    id: str
+    source: str          # URL or local path
+    title: str
+    text: str
+    sha256: str
+
+@dataclass
+class Chunk:
+    id: str              # f"{doc_id}:{ord}"
+    doc_id: str
+    ord: int
+    text: str
+    n_tokens_est: int
+
+```
+
+rag/store.py
+```python
+from __future__ import annotations
+import pathlib, json
+import pyarrow as pa, pyarrow.parquet as pq
+import numpy as np
+from typing import List, Dict, Any
+from bot.rag.schemas import Document, Chunk
+from bot.rag.utils import write_jsonl, canonicalize_json_rows, sha256_bytes
+
+def _chunks_table(rows: List[Dict[str, Any]]) -> pa.Table:
+    return pa.Table.from_pylist(rows)
+
+def _emb_table(vecs: np.ndarray, ids: List[str]) -> pa.Table:
+    arr = pa.array(vecs.tolist(), type=pa.list_(pa.float32()))
+    return pa.table({"chunk_id": ids, "vector": arr})
+
+def save_store(root: pathlib.Path,
+               docs: List[Document],
+               chunks: List[Chunk],
+               emb: np.ndarray,
+               emb_model: str):
+    root.mkdir(parents=True, exist_ok=True)
+
+    # docs.jsonl
+    docs_rows = [vars(d) for d in docs]
+    docs_path = root / "docs.jsonl"
+    write_jsonl(docs_path, docs_rows)
+
+    # chunks.parquet
+    chunk_rows = [vars(c) for c in chunks]
+    pq.write_table(_chunks_table(chunk_rows), root / "chunks.parquet")
+
+    # embeddings.parquet
+    pq.write_table(_emb_table(emb, [c.id for c in chunks]), root / "embeddings.parquet")
+
+    # manifest
+    canon_docs = canonicalize_json_rows(docs_rows)
+    canon_chunks = canonicalize_json_rows(chunk_rows)
+    meta = {
+        "version": 1,
+        "emb_model": emb_model,
+        "hash_docs": sha256_bytes(canon_docs),
+        "hash_chunks": sha256_bytes(canon_chunks),
+        "counts": {"docs": len(docs), "chunks": len(chunks)},
+    }
+    (root / "manifest.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return meta
+
+```
+
+rag/utils.py
+```python
+from __future__ import annotations
+import hashlib, json, pathlib, time
+from typing import Iterable, Dict, Any
+
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+def sha256_str(s: str) -> str:
+    return sha256_bytes(s.encode("utf-8", "replace"))
+
+def sha256_file(path: pathlib.Path) -> str:
+    return sha256_bytes(path.read_bytes())
+
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+def write_jsonl(path: pathlib.Path, rows: Iterable[Dict[str, Any]]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+def read_jsonl(path: pathlib.Path):
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            yield json.loads(line)
+
+def canonicalize_json_rows(rows: Iterable[Dict[str, Any]]) -> bytes:
+    # Stable JSONL with sorted keys
+    buf = []
+    for r in rows:
+        buf.append(json.dumps(r, ensure_ascii=False, sort_keys=True))
+    buf.sort()
+    return ("\n".join(buf) + "\n").encode("utf-8")
+
+```
+
+
 rules/loader.py
 ```python
 from __future__ import annotations
@@ -1521,9 +2099,16 @@ def load_all() -> Dict[str, Any]:
     return cfg
 
 def topic_allowed(topic: str, topics_cfg: Dict[str, Any]) -> bool:
-    slug = re.sub(r"[^a-z0-9]+", "-", topic.strip().lower())
-    allowed = [t.strip().lower() for t in topics_cfg.get("allowed_topics", [])]
-    # allow if any allowed token appears as a whole word in slug
+    import re
+    def _slug(s: str) -> str:
+        # identical normalization for both sides (convert underscores too)
+        return re.sub(r"[^a-z0-9]+", "-", s.strip().lower()).strip("-")
+
+    slug = _slug(topic)
+    allowed_raw = topics_cfg.get("allowed_topics", []) or []
+    allowed = [_slug(t) for t in allowed_raw]
+
+    # allow if any allowed token appears as a whole token delimited by '-'
     return any(re.search(rf"(?:^|-){re.escape(tok)}(?:-|$)", slug) for tok in allowed)
 
 def load_last_promoted() -> Dict[str, Any] | None:
@@ -1625,6 +2210,141 @@ def install_guard(deny_dirs: set[str] | set[os.PathLike]):
     pathlib.Path.open = _patched_path_open  # type: ignore[assignment]
 
 ```
+
+snapshots/delta.py:
+```python
+from __future__ import annotations
+import os, shutil, subprocess, pathlib, json, platform
+from typing import Iterable, Dict, Any
+from bot.rag.utils import sha256_bytes
+from bot.paths import get_project_root
+
+def _which(cmd: str) -> str | None:
+    return shutil.which(cmd)
+
+def _candidates_windows() -> list[pathlib.Path]:
+    # Common spots if installed via package managers/tools
+    return [
+        pathlib.Path(r"C:\ProgramData\chocolatey\bin\xdelta3.exe"),
+        pathlib.Path(r"C:\msys64\usr\bin\xdelta3.exe"),
+        pathlib.Path(r"C:\msys64\mingw64\bin\xdelta3.exe"),
+        pathlib.Path(r"C:\Program Files\xdelta3\xdelta3.exe"),
+    ]
+
+def ensure_xdelta3() -> str:
+    """
+    Locate an xdelta3 executable. Supports:
+      - EVERABOT_XDELTA3=<absolute path to exe>
+      - PATH (xdelta3 / xdelta3.exe)
+      - repo-local fallbacks (snapshots/bin, tools/bin)
+      - common Windows install locations
+    """
+    # 0) explicit override
+    override = os.getenv("EVERABOT_XDELTA3", "").strip()
+    if override:
+        p = pathlib.Path(override)
+        if p.exists():
+            return str(p)
+
+    # 1) PATH
+    for name in ("xdelta3", "xdelta3.exe"):
+        exe = _which(name)
+        if exe:
+            return exe
+
+    # 2) repo-local fallbacks
+    root = get_project_root()
+    local_bins = [
+        root / "snapshots" / "bin" / "xdelta3",
+        root / "snapshots" / "bin" / "xdelta3.exe",
+        root / "tools" / "bin" / "xdelta3",
+        root / "tools" / "bin" / "xdelta3.exe",
+    ]
+    for p in local_bins:
+        if p.exists():
+            return str(p)
+
+    # 3) Windows common locations
+    if os.name == "nt":
+        for p in _candidates_windows():
+            if p.exists():
+                return str(p)
+
+    # 4) no luck
+    raise RuntimeError(
+        "xdelta3 not found.\n\n"
+        "How to install:\n"
+        "  • Linux (Debian/Ubuntu):   sudo apt-get update && sudo apt-get install xdelta3\n"
+        "  • macOS (Homebrew):        brew install xdelta\n"
+        "  • Windows (MSYS2):         install MSYS2, then run: pacman -S xdelta3\n"
+        "                              (ensure C:\\msys64\\usr\\bin is on your PATH)\n"
+        "  • Or point to a binary via env var EVERABOT_XDELTA3=<full\\path\\to\\xdelta3.exe>\n"
+        "\n"
+        "After installing, re-run your command."
+    )
+
+def sha256_file(p: pathlib.Path) -> str:
+    return sha256_bytes(p.read_bytes())
+
+def make_delta(base: pathlib.Path, target: pathlib.Path, delta_out: pathlib.Path) -> None:
+    exe = ensure_xdelta3()
+    delta_out.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run([exe, "-e", "-s", str(base), str(target), str(delta_out)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        raise RuntimeError(f"xdelta3 encode failed for {target.name}: {r.stderr or r.stdout}")
+
+def apply_delta(base: pathlib.Path, delta_file: pathlib.Path, out_path: pathlib.Path) -> None:
+    exe = ensure_xdelta3()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run([exe, "-d", "-s", str(base), str(delta_file), str(out_path)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        raise RuntimeError(f"xdelta3 decode failed for {delta_file.name}: {r.stderr or r.stdout}")
+
+def roundtrip_manifest(base_dir: pathlib.Path, tgt_dir: pathlib.Path,
+                       files: Iterable[str], delta_dir: pathlib.Path) -> Dict[str, Any]:
+    base_dir = base_dir.resolve(); tgt_dir = tgt_dir.resolve()
+    delta_dir = delta_dir.resolve(); recon_dir = (delta_dir / "recon")
+    recon_dir.mkdir(parents=True, exist_ok=True)
+
+    entries = []
+    for rel in files:
+        b = base_dir / rel
+        t = tgt_dir / rel
+        d = delta_dir / f"{rel}.vcdiff"
+        r = recon_dir / rel
+
+        if not b.exists() or not t.exists():
+            raise FileNotFoundError(f"Missing base/target file for delta: {rel}")
+
+        make_delta(b, t, d)
+        apply_delta(b, d, r)
+
+        entry = {
+            "file": rel,
+            "base_sha256": sha256_file(b),
+            "target_sha256": sha256_file(t),
+            "recon_sha256": sha256_file(r),
+            "delta_bytes": d.stat().st_size,
+            "equal": sha256_file(t) == sha256_file(r),
+            "delta_path": str(d),
+        }
+        entries.append(entry)
+
+    proof = {
+        "algorithm": "xdelta3 (RFC 3284 VCDIFF)",
+        "base": str(base_dir),
+        "target": str(tgt_dir),
+        "delta_dir": str(delta_dir),
+        "entries": entries,
+        "all_equal": all(e["equal"] for e in entries),
+    }
+    (delta_dir / "PROOF.json").write_text(json.dumps(proof, indent=2), encoding="utf-8")
+    return proof
+
+```
+
 
 telemetry/tracing.py
 ```python
@@ -1746,7 +2466,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # system basics
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl build-essential ca-certificates git && \
+    curl build-essential ca-certificates git xdelta3 && \
     rm -rf /var/lib/apt/lists/*
 
 # non-root runtime user
@@ -1786,8 +2506,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
 ENTRYPOINT ["entrypoint","everabot"]
 CMD ["eval"]
 
-
-
 ```
 
 pyproject.toml:
@@ -1802,13 +2520,22 @@ packages = [{ include = "bot" }]
 
 [tool.poetry.dependencies]
 python = ">=3.11,<3.13"
-typer = {extras = ["all"], version = "^0.12.3"}
+typer = {extras = ["all"], version = "^0.17.5"}
+click = "^8.2.1"   # works with Typer ≥ 0.16, avoids the make_metavar error
+fastembed = "^0.3.0"         # ONNX-based embeddings (no Torch)
+onnxruntime = "^1.18.0"      # runtime used by fastembed
 rich = "^13.7.1"
 pyarrow = "^17.0.0"
 opentelemetry-api = "^1.27.0"
 opentelemetry-sdk = "^1.27.0"
 pyyaml = "^6.0.2"
-psutil = "^5.9.8"      # new: budget monitoring (RAM)
+psutil = "^5.9.8"
+numpy = "^2.1.0"
+requests = "^2.32.3"
+beautifulsoup4 = "^4.12.3"
+PyPDF2 = "^3.0.1"
+sentence-transformers = "^3.0.1"
+faiss-cpu = "^1.8.0.post1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.3"
@@ -1819,7 +2546,6 @@ everabot = "bot.cli:app"
 [build-system]
 requires = ["poetry-core>=1.9.0"]
 build-backend = "poetry.core.masonry.api"
-
 
 ```
 

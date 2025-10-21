@@ -71,7 +71,20 @@ class Orchestrator:
             # Enforce budgets for the whole run (soft-fail; influences DECIDE)
             with BudgetEnforcer(self.rules["limits"], self.info.snapshot_dir) as budget:
                 with self.tracer.start_as_current_span("phase.research"):
-                    self._log_phase_result(Phase.RESEARCH, {"topic": topic, "notes": "RAG: TBD"})
+                    # Seed from rules (internet allowlisted in ruleset/tools.yaml)
+                    urls = [
+                        "https://arxiv.org/pdf/2510.04618",
+                        "https://arxiv.org/pdf/2504.15228",
+                        "https://arxiv.org/pdf/2005.11401",
+                        "https://datatracker.ietf.org/doc/html/rfc3284",
+                    ]
+                    from bot.rag.pipeline import ingest
+                    rag_dir = self.info.snapshot_dir / "rag_store"
+                    meta = ingest(urls, rag_dir)
+                    self._log_phase_result(Phase.RESEARCH, {
+                        "topic": topic, "rag_store": str(rag_dir),
+                        "counts": meta.get("counts"), "emb_model": meta.get("emb_model")
+                    })
 
                 with self.tracer.start_as_current_span("phase.distill"):
                     self._log_phase_result(Phase.DISTILL, {"bullets": ["(stub) atomic tactics"]})
