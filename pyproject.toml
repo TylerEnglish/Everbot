@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "everabot"
+version = "0.1.0"
+description = "Everabot — self-evolving, test-gated local agent"
+authors = ["You <you@example.com>"]
+readme = "README.md"
+packages = [{ include = "bot" }]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.13"
+typer = {extras = ["all"], version = "^0.12.3"}
+rich = "^13.7.1"
+pyarrow = "^17.0.0"              # for Parquet substrate later
+opentelemetry-api = "^1.27.0"    # hooks in place; wire later
+opentelemetry-sdk = "^1.27.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.3"
+
+[tool.poetry.scripts]
+everabot = "bot.cli:app"
+
+[build-system]
+requires = ["poetry-core>=1.9.0"]
+build-backend = "poetry.core.masonry.api"

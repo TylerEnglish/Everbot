@@ -1,0 +1,6 @@
+internet:
+  allowed: true
+  fetchers: ["http", "https"]
+file_ops:
+  write_whitelist: ["snapshots"]
+  write_blacklist: ["ruleset", "test"]

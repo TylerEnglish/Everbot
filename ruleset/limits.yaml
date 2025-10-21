@@ -1,0 +1,8 @@
+tokens_max: 8192
+wall_time_sec_max: 900
+ram_mb_max: 4096
+disk_mb_max: 4096
+net:
+  allow_http: true
+  allow_https: true
+  allowed_hosts: []

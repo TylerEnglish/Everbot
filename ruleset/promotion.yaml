@@ -1,0 +1,4 @@
+pareto_gate:
+  require_no_regressions: true
+  new_topic_min_score: 0.80
+rollback_on_fail: true
