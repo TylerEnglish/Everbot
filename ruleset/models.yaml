@@ -1,0 +1,15 @@
+version: 1
+default:
+  backend: llama_cpp
+  llama_cpp:
+    model_path: "snapshots/models/TinyLlama-1.1B-Chat-v1.0.Q4_K_M.gguf"
+    n_ctx: 2048
+    n_threads: null     # auto
+    n_batch: 128
+    temperature: 0.1
+  transformers:
+    model: "distilgpt2"
+    temperature: 0.2
+notes:
+  - "Defaults favor CPU-friendly small models (GGUF Q4_K_M) for modest machines."
+  - "Override per run with env: EVERABOT_LLM, EVERABOT_LLAMA_PATH, EVERABOT_TRANSFORMERS_MODEL, etc."

@@ -54,7 +54,11 @@ $env:EVERABOT_OLLAMA_MODEL='llama3'
 # $env:OLLAMA_HOST = "http://127.0.0.1:11434"
 
 Invoke-WebRequest http://127.0.0.1:11434/api/tags | Select-Object -ExpandProperty Content
-poetry install
+poetry lock
+poetry install --with llamacpp
+poetry run python -c "import llama_cpp, sys; print('llama-cpp-python', getattr(llama_cpp,'__version__','imported'), 'ok on', sys.version)"
+poetry update
+docker build -t everabot .
 $env:EVERABOT_LLM = "ollama"
 $env:EVERABOT_OLLAMA_MODEL = "llama3"
 poetry run everabot selfcheck

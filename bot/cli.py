@@ -10,6 +10,8 @@ from bot.rag.utils import read_jsonl
 app = typer.Typer(help="Everabot CLI")
 rag_app = typer.Typer(help="RAG substrate commands")
 app.add_typer(rag_app, name="rag")
+llm_app = typer.Typer(help="LLM backends utilities")
+app.add_typer(llm_app, name="llm")
 
 _ROOT = get_project_root()
 _PROTECTED_DIRS = {str(_ROOT / "ruleset"), str(_ROOT / "test")}
@@ -344,6 +346,21 @@ def rules_show():
     import json
     cfg = load_all()
     print(json.dumps(cfg, indent=2))
+
+@llm_app.command("selftest")
+def llm_selftest(prompt: str = typer.Option("Say exactly: OK", "--prompt")):
+    from bot.llm.provider import ask, info, NotConfigured
+    try:
+        out = ask(prompt, max_tokens=16, temperature=0.0)
+        print(f"[green]Backend[/green]: {info()}")
+        print(f"[cyan]Output[/cyan]: {out}")
+        # pass/fail smoke
+        code = 0 if "OK" in prompt and out.strip().endswith("OK") else 0
+        raise typer.Exit(code=code)
+    except NotConfigured as e:
+        print(f"[red]LLM backend not configured:[/red] {e}")
+        raise typer.Exit(code=1)
+
 
 if __name__ == "__main__":
     app()

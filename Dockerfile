@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # system basics
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl build-essential ca-certificates git xdelta3 && \
+    curl build-essential ca-certificates git xdelta3 cmake && \
     rm -rf /var/lib/apt/lists/*
 
 # non-root runtime user

@@ -309,6 +309,27 @@ bench_thresholds:            # soft policy targets when benches are wired
 
 ```
 
+models.yaml:
+```yaml
+version: 1
+default:
+  backend: llama_cpp
+  llama_cpp:
+    model_path: "snapshots/models/TinyLlama-1.1B-Chat-v1.0.Q4_K_M.gguf"
+    n_ctx: 2048
+    n_threads: null     # auto
+    n_batch: 128
+    temperature: 0.1
+  transformers:
+    model: "distilgpt2"
+    temperature: 0.2
+notes:
+  - "Defaults favor CPU-friendly small models (GGUF Q4_K_M) for modest machines."
+  - "Override per run with env: EVERABOT_LLM, EVERABOT_LLAMA_PATH, EVERABOT_TRANSFORMERS_MODEL, etc."
+
+
+```
+
 tools.yaml:
 ```yaml
 version: 1
@@ -539,6 +560,8 @@ from bot.rag.utils import read_jsonl
 app = typer.Typer(help="Everabot CLI")
 rag_app = typer.Typer(help="RAG substrate commands")
 app.add_typer(rag_app, name="rag")
+llm_app = typer.Typer(help="LLM backends utilities")
+app.add_typer(llm_app, name="llm")
 
 _ROOT = get_project_root()
 _PROTECTED_DIRS = {str(_ROOT / "ruleset"), str(_ROOT / "test")}
@@ -873,6 +896,20 @@ def rules_show():
     import json
     cfg = load_all()
     print(json.dumps(cfg, indent=2))
+
+@llm_app.command("selftest")
+def llm_selftest(prompt: str = typer.Option("Say exactly: OK", "--prompt")):
+    from bot.llm.provider import ask, info, NotConfigured
+    try:
+        out = ask(prompt, max_tokens=16, temperature=0.0)
+        print(f"[green]Backend[/green]: {info()}")
+        print(f"[cyan]Output[/cyan]: {out}")
+        # pass/fail smoke
+        code = 0 if "OK" in prompt and out.strip().endswith("OK") else 0
+        raise typer.Exit(code=code)
+    except NotConfigured as e:
+        print(f"[red]LLM backend not configured:[/red] {e}")
+        raise typer.Exit(code=1)
 
 if __name__ == "__main__":
     app()
@@ -1803,53 +1840,243 @@ class BudgetEnforcer:
 
 ```
 
+llm/backends/base.py
+```python
+from __future__ import annotations
+from typing import Protocol
+
+class Backend(Protocol):
+    def ask(self, prompt: str, max_tokens: int, temperature: float) -> str: ...
+
+```
+
+llm/backends/llama_cpp_backend.py
+```python
+from __future__ import annotations
+import os
+from typing import Optional
+
+from bot.llm.provider import NotConfigured  # reuse exception class
+
+_LLAMA = None
+_MODEL_PATH = None
+
+def _int(env: str, default: int) -> int:
+    try:
+        return int(os.getenv(env, default))
+    except Exception:
+        return default
+
+def _ensure_llama() -> None:
+    global _LLAMA, _MODEL_PATH
+    if _LLAMA is not None:
+        return
+    try:
+        from llama_cpp import Llama  # Python binding for llama.cpp
+    except Exception as e:
+        raise NotConfigured(f"llama-cpp-python missing: {e}")
+    model_path = os.getenv("EVERABOT_LLAMA_PATH")  # must point to .gguf
+    if not model_path or not os.path.exists(model_path):
+        # fall back to models.yaml default (provider will set) or tell the user
+        raise NotConfigured("Set EVERABOT_LLAMA_PATH to a local .gguf model file.")
+    n_ctx = _int("EVERABOT_LLAMA_N_CTX", 2048)
+    n_threads = _int("EVERABOT_LLAMA_N_THREADS", max(1, os.cpu_count() or 2))
+    n_batch = _int("EVERABOT_LLAMA_N_BATCH", 128)
+    try:
+        _LLAMA = Llama(
+            model_path=model_path, n_ctx=n_ctx, n_threads=n_threads,
+            n_batch=n_batch, logits_all=False, verbose=False
+        )
+        _MODEL_PATH = model_path
+    except Exception as e:
+        raise NotConfigured(f"Failed to load GGUF at {model_path}: {e}")
+
+def ask(prompt: str, max_tokens: int = 128, temperature: float = 0.2) -> str:
+    _ensure_llama()
+    # Completion API — documented in the project’s usage examples
+    # (create_completion returns {choices:[{text: ...}]})
+    out = _LLAMA.create_completion(
+        prompt=prompt, max_tokens=max_tokens,
+        temperature=float(temperature), top_p=0.95
+    )
+    return (out.get("choices") or [{}])[0].get("text", "").strip()
+
+def info() -> dict:
+    _ensure_llama()
+    return {"backend": "llama_cpp", "model": _MODEL_PATH}
+
+```
+
+llm/backends/transformers_backend.py
+```python
+from __future__ import annotations
+import os
+from typing import Optional
+
+from bot.llm.provider import NotConfigured  # reuse your exception
+
+_PIPELINE = None
+_MODEL_ID = None
+
+def _ensure_pipeline() -> None:
+    global _PIPELINE, _MODEL_ID
+    if _PIPELINE is not None:
+        return
+    try:
+        from transformers import pipeline  # HF pipeline API
+    except Exception as e:
+        raise NotConfigured(f"transformers missing: {e}")
+    # Model: prefer env, else reasonable tiny CPU default
+    model_id = os.getenv("EVERABOT_TRANSFORMERS_MODEL", "distilgpt2")
+    try:
+        _PIPELINE = pipeline("text-generation", model=model_id, device_map="auto")
+        _MODEL_ID = model_id
+    except Exception as e:
+        raise NotConfigured(f"Transformers backend failed to load {model_id}: {e}")
+
+def ask(prompt: str, max_tokens: int = 128, temperature: float = 0.2) -> str:
+    _ensure_pipeline()
+    # HF pipelines return list[dict]; we keep it simple and mirror docs usage
+    out = _PIPELINE(prompt, max_new_tokens=max_tokens, do_sample=(temperature > 0),
+                    temperature=temperature)
+    text = out[0].get("generated_text", "")
+    # strip the prompt prefix if present
+    return text[len(prompt):].strip() if text.startswith(prompt) else text.strip()
+
+def info() -> dict:
+    _ensure_pipeline()
+    return {"backend": "transformers", "model": _MODEL_ID}
+
+```
+
+llm/backends/
+```python
+
+```
+
+
 llm/provider.py
 ```python
 from __future__ import annotations
-import os, shutil, subprocess
+import os, shutil, subprocess, json
+from bot.rules.loader import load_all
 
 class NotConfigured(Exception): pass
+
+_backend_singleton = None
+_backend_info = None
 
 def _has(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
-def ask(prompt: str, max_tokens: int = 128, temperature: float = 0.2) -> str:
-    """
-    Pluggable local inference.
-    - Preferred: OLLAMA CLI (EVERABOT_LLM=ollama, EVERABOT_OLLAMA_MODEL).
-    - Fallback: Python client 'ollama' if CLI missing but daemon is running.
-    """
-    backend = os.getenv("EVERABOT_LLM", "").strip().lower()
-    model = os.getenv("EVERABOT_OLLAMA_MODEL", "llama3")
+def _pick_from_rules() -> tuple[str, dict]:
+    try:
+        cfg = load_all().get("models", {}) or {}
+        default = (cfg.get("default") or {})
+        backend = str(default.get("backend") or "llama_cpp")
+        return backend, default
+    except Exception:
+        return "llama_cpp", {}
 
-    if backend == "ollama":
-        if _has("ollama"):
-            # CLI path — force UTF-8 and be robust to odd bytes on Windows.
-            env = os.environ.copy()
-            cmd = ["ollama", "run", model, f"{prompt}\n"]
-            out = subprocess.run(
-                cmd, capture_output=True, text=True, env=env,
-                encoding="utf-8", errors="replace"  # <— key fix for Windows cp1252 locales
-            )
-            if out.returncode != 0:
-                raise RuntimeError(out.stderr or "ollama failed")
-            return out.stdout.strip()
+def _init_backend():
+    global _backend_singleton, _backend_info
+    if _backend_singleton is not None:
+        return
 
-        # Fallback: Python client talking to the local daemon
+    # Order: env override -> ruleset default -> auto
+    choice = (os.getenv("EVERABOT_LLM") or "").strip().lower()
+    if not choice:
+        choice, default_cfg = _pick_from_rules()
+    else:
+        _, default_cfg = _pick_from_rules()
+
+    if choice == "llama_cpp":
+        # seed env vars from ruleset default if not provided
+        m = (default_cfg.get("llama_cpp") or {})
+        os.environ.setdefault("EVERABOT_LLAMA_PATH", m.get("model_path", ""))
+        if m.get("n_ctx"): os.environ.setdefault("EVERABOT_LLAMA_N_CTX", str(m["n_ctx"]))
+        if m.get("n_threads"): os.environ.setdefault("EVERABOT_LLAMA_N_THREADS", str(m["n_threads"]))
+        if m.get("n_batch"): os.environ.setdefault("EVERABOT_LLAMA_N_BATCH", str(m["n_batch"]))
         try:
-            from ollama import Client
-            host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-            client = Client(host=host)
-            resp = client.generate(
-                model=model,
-                prompt=prompt,
-                options={"temperature": float(temperature), "num_predict": int(max_tokens)},
-            )
-            return (resp.get("response") or "").strip()
+            from bot.llm.backends import llama_cpp_backend as be
+            _backend_singleton = be
+            _backend_info = be.info()
+            return
+        except NotConfigured as e:
+            raise
         except Exception as e:
-            raise NotConfigured(f"Ollama backend not available: {e}")
+            raise NotConfigured(f"llama_cpp backend init failed: {e}")
+
+    if choice == "transformers":
+        m = (default_cfg.get("transformers") or {})
+        if m.get("model"):
+            os.environ.setdefault("EVERABOT_TRANSFORMERS_MODEL", m["model"])
+        try:
+            from bot.llm.backends import transformers_backend as be
+            _backend_singleton = be
+            _backend_info = be.info()
+            return
+        except NotConfigured as e:
+            raise
+        except Exception as e:
+            raise NotConfigured(f"transformers backend init failed: {e}")
+
+    if choice == "ollama":
+        # existing local runner (CLI preferred); keep as fallback option
+        model = os.getenv("EVERABOT_OLLAMA_MODEL", "llama3")
+        if _has("ollama"):
+            _backend_singleton = ("ollama_cli", {"model": model})
+            _backend_info = {"backend": "ollama", "model": model}
+            return
+        # Python client fallback
+        try:
+            from ollama import Client  # noqa: F401
+            _backend_singleton = ("ollama_py", {"model": model})
+            _backend_info = {"backend": "ollama", "model": model}
+            return
+        except Exception as e:
+            raise NotConfigured(f"Ollama not available: {e}")
+
+    # If we get here, try a best-effort auto choice
+    os.environ.setdefault("EVERABOT_LLM", "llama_cpp")
+    return _init_backend()
+
+def ask(prompt: str, max_tokens: int = 128, temperature: float = 0.2) -> str:
+    _init_backend()
+    if hasattr(_backend_singleton, "ask"):
+        # llama_cpp / transformers backends are modules with ask()
+        return _backend_singleton.ask(prompt, max_tokens=max_tokens, temperature=temperature)
+
+    # Ollama paths preserved (CLI first)
+    kind, cfg = _backend_singleton
+    model = cfg["model"]
+    if kind == "ollama_cli":
+        env = os.environ.copy()
+        cmd = ["ollama", "run", model, f"{prompt}\n"]
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, env=env,
+            encoding="utf-8", errors="replace"
+        )
+        if out.returncode != 0:
+            raise RuntimeError(out.stderr or "ollama failed")
+        return out.stdout.strip()
+    elif kind == "ollama_py":
+        from ollama import Client
+        host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+        client = Client(host=host)
+        resp = client.generate(
+            model=model, prompt=prompt,
+            options={"temperature": float(temperature), "num_predict": int(max_tokens)},
+        )
+        return (resp.get("response") or "").strip()
 
     raise NotConfigured("No local LLM backend configured")
+
+def info() -> dict:
+    _init_backend()
+    if hasattr(_backend_singleton, "info"):
+        return _backend_singleton.info()
+    return _backend_info or {"backend": "unknown", "model": "unknown"}
 
 ```
 
@@ -2391,12 +2618,11 @@ def load_all() -> Dict[str, Any]:
     if safety.exists():
         cfg["safety"] = _read_yaml("safety.yaml")
     seeds = _RULES / "seed_urls.yaml"
-    if seeds.exists():
-        cfg["seeds"] = _read_yaml("seed_urls.yaml")
-    else:
-        cfg["seeds"] = {"version": 1, "seeds": []}
+    cfg["seeds"] = _read_yaml("seed_urls.yaml") if seeds.exists() else {"version": 1, "seeds": []}
+    models = _RULES / "models.yaml"
+    if models.exists():
+        cfg["models"] = _read_yaml("models.yaml")
     return cfg
-
 
 def topic_allowed(topic: str, topics_cfg: Dict[str, Any]) -> bool:
     import re
@@ -2784,7 +3010,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # system basics
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl build-essential ca-certificates git xdelta3 && \
+    curl build-essential ca-certificates git xdelta3 cmake && \
     rm -rf /var/lib/apt/lists/*
 
 # non-root runtime user
@@ -2839,9 +3065,9 @@ packages = [{ include = "bot" }]
 [tool.poetry.dependencies]
 python = ">=3.11,<3.13"
 typer = {extras = ["all"], version = "^0.17.5"}
-click = "^8.2.1"   # works with Typer ≥ 0.16, avoids the make_metavar error
-fastembed = "^0.3.0"         # ONNX-based embeddings (no Torch)
-onnxruntime = "^1.18.0"      # runtime used by fastembed
+click = "^8.2.1"
+fastembed = "^0.3.0"
+onnxruntime = "^1.18.0"
 rich = "^13.7.1"
 pyarrow = "^17.0.0"
 opentelemetry-api = "^1.27.0"
@@ -2854,11 +3080,24 @@ beautifulsoup4 = "^4.12.3"
 PyPDF2 = "^3.0.1"
 sentence-transformers = "^3.0.1"
 faiss-cpu = "^1.8.0.post1"
-youtube-transcript-api = "^0.6.2"   # light; for YouTube transcripts in RAG
-llmlingua = "^0.2.2"                # optional prompt compression (used if available)
+youtube-transcript-api = "^0.6.2"
+llmlingua = "^0.2.2"
+transformers = "^4.43.1"
+huggingface_hub = "^0.23.2"
 
-[tool.poetry.group.dev.dependencies]
-pytest = "^8.3.3"
+# Optional group for llama.cpp wheels
+[tool.poetry.group.llamacpp]
+optional = true
+
+[tool.poetry.group.llamacpp.dependencies]
+# Let Poetry pick a compatible prebuilt wheel from the CPU index
+llama-cpp-python = { version = "*", source = "llamacpp-cpu" }
+
+# Prebuilt wheel indexes (PEP 503 “simple” repos)
+[[tool.poetry.source]]
+name = "llamacpp-cpu"
+url = "https://abetlen.github.io/llama-cpp-python/whl/cpu"
+priority = "explicit"
 
 [tool.poetry.scripts]
 everabot = "bot.cli:app"

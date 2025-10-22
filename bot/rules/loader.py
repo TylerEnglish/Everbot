@@ -23,12 +23,11 @@ def load_all() -> Dict[str, Any]:
     if safety.exists():
         cfg["safety"] = _read_yaml("safety.yaml")
     seeds = _RULES / "seed_urls.yaml"
-    if seeds.exists():
-        cfg["seeds"] = _read_yaml("seed_urls.yaml")
-    else:
-        cfg["seeds"] = {"version": 1, "seeds": []}
+    cfg["seeds"] = _read_yaml("seed_urls.yaml") if seeds.exists() else {"version": 1, "seeds": []}
+    models = _RULES / "models.yaml"
+    if models.exists():
+        cfg["models"] = _read_yaml("models.yaml")
     return cfg
-
 
 def topic_allowed(topic: str, topics_cfg: Dict[str, Any]) -> bool:
     import re
