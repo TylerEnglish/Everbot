@@ -24,6 +24,8 @@ beautifulsoup4 = "^4.12.3"
 PyPDF2 = "^3.0.1"
 sentence-transformers = "^3.0.1"
 faiss-cpu = "^1.8.0.post1"
+youtube-transcript-api = "^0.6.2"   # light; for YouTube transcripts in RAG
+llmlingua = "^0.2.2"                # optional prompt compression (used if available)
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.3"

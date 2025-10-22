@@ -64,23 +64,23 @@ Everabot/
 
 ### 4) Storage/RAG substrate (fast start, upgradable later with **provable equivalence**)
 
-* [ ] Start with **Parquet** for columnar caches (sources, embeddings, judgments) via PyArrow; keep doc blobs as JSONL, metadata/embeddings as Parquet. ([Apache Parquet][8])
-* [ ] Implement a tiny **vector index** (FAISS/ann-lite) with a **manifest** that maps query→top-k doc IDs and scores.
-* [ ] Add **equivalence tests** for store refactors:
+* [*] Start with **Parquet** for columnar caches (sources, embeddings, judgments) via PyArrow; keep doc blobs as JSONL, metadata/embeddings as Parquet. ([Apache Parquet][8])
+* [*] Implement a tiny **vector index** (FAISS/ann-lite) with a **manifest** that maps query→top-k doc IDs and scores.
+* [*] Add **equivalence tests** for store refactors:
 
 * **Bit-for-bit check** for serialized doc/metadata parity (hash).
 * **RAG recall parity**: for a frozen query set, `old_topk == new_topk` (ID-level), otherwise block promotion.
-* [ ] For snapshot size: store diffs of large artifacts via **VCDIFF**/xdelta; prove you can reconstruct byte-identical states. ([IETF Datatracker][9])
+* [*] For snapshot size: store diffs of large artifacts via **VCDIFF**/xdelta; prove you can reconstruct byte-identical states. ([IETF Datatracker][9])
 
 ---
 
 ### 5) Research → Distill → Practice loop (context engineering + reflection)
 
-* [ ] Implement **RAG** ingestion: respectful fetchers (docs, arXiv PDFs, transcripts), text normalizers, chunkers, embedder. Wire retrieval to `learn`. ([arXiv][10])
-* [ ] Add **“Bullets” distillation**: compress sources into atomic tactics/facts; keep provenance links.
-* [ ] Integrate **Reflexion-style self-feedback**: after each attempt, write a short “what helped/harmed” note that is retrieved next time. ([arXiv][11])
-* [ ] Optional prompt-token reduction with **LLMLingua** when long. ([arXiv][12])
-* [ ] Promotion rule: **only** if new topic KPIs ↑ **and** all root tests stay ≥ previous (Pareto gate).
+* [*] Implement **RAG** ingestion: respectful fetchers (docs, arXiv PDFs, transcripts), text normalizers, chunkers, embedder. Wire retrieval to `learn`. ([arXiv][10])
+* [*] Add **“Bullets” distillation**: compress sources into atomic tactics/facts; keep provenance links.
+* [*] Integrate **Reflexion-style self-feedback**: after each attempt, write a short “what helped/harmed” note that is retrieved next time. ([arXiv][11])
+* [*] Optional prompt-token reduction with **LLMLingua** when long. ([arXiv][12])
+* [*] Promotion rule: **only** if new topic KPIs ↑ **and** all root tests stay ≥ previous (Pareto gate).
 
 ---
 

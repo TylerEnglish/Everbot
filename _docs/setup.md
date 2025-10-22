@@ -34,24 +34,50 @@ Test-Path "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe"
 & "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" --version
 
 & "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" pull llama3
-& "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" run llama3
-/bye
+# & "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" run llama3
+# /bye
 $env:Path += ";$env:LOCALAPPDATA\Programs\Ollama"
 ollama --version
 setx PATH "$($env:PATH);$env:LOCALAPPDATA\Programs\Ollama"
-setx EVERABOT_XDELTA3 "C:\full\path\to\xdelta3.exe"
+$Env:EVERABOT_XDELTA3 = "C:\Tools\xdelta3\xdelta3.exe"
+setx EVERABOT_XDELTA3 "C:\Tools\xdelta3\xdelta3.exe"
 
+# (optional) force 200 caps
+$env:EVERABOT_MMLU_CAP='10'
+$env:EVERABOT_GSM8K_CAP='10'
+$env:EVERABOT_HELLASWAG_CAP='10'
 
-$env:EVERABOT_LLM = "ollama"
-$env:EVERABOT_OLLAMA_MODEL = "llama3"
+# if needed ensure Ollama env is set
+$env:EVERABOT_LLM='ollama'
+$env:EVERABOT_OLLAMA_MODEL='llama3'
 # optional if you didn’t use the default port:
 # $env:OLLAMA_HOST = "http://127.0.0.1:11434"
 
 Invoke-WebRequest http://127.0.0.1:11434/api/tags | Select-Object -ExpandProperty Content
 poetry install
-poetry run everabot selfcheck   # should report blocked writes
-poetry run everabot eval        # runs root test stubs
-
 $env:EVERABOT_LLM = "ollama"
 $env:EVERABOT_OLLAMA_MODEL = "llama3"
+poetry run everabot selfcheck
 poetry run everabot eval
+poetry run everabot learn web-dev
+# ingest the seed corpus (ACE, SICA, RAG, VCDIFF) into snapshots/rag/v1
+poetry run everabot rag init
+
+# see counts
+poetry run everabot rag stats --store v1
+
+# smoke test a query
+poetry run everabot rag query "How does ACE avoid context collapse?" --store v1
+
+# remove any half-made copy
+Remove-Item -Recurse -Force snapshots\rag\v1_copy -ErrorAction SilentlyContinue
+
+# copy the whole tree
+Copy-Item -Recurse -Force snapshots\rag\v1 snapshots\rag\v1_copy
+
+# sanity check
+Get-Item snapshots\rag\v1_copy\docs.jsonl
+
+# prove bitwise + top-k equivalence
+poetry run everabot rag prove-equivalence v1 v1_copy
+poetry run everabot rag delta-roundtrip snapshots/rag/v1 snapshots/rag/v1_copy --out snapshots/rag/deltas/v1_to_v1copy

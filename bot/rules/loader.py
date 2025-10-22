@@ -22,7 +22,13 @@ def load_all() -> Dict[str, Any]:
     safety = _RULES / "safety.yaml"
     if safety.exists():
         cfg["safety"] = _read_yaml("safety.yaml")
+    seeds = _RULES / "seed_urls.yaml"
+    if seeds.exists():
+        cfg["seeds"] = _read_yaml("seed_urls.yaml")
+    else:
+        cfg["seeds"] = {"version": 1, "seeds": []}
     return cfg
+
 
 def topic_allowed(topic: str, topics_cfg: Dict[str, Any]) -> bool:
     import re
@@ -48,10 +54,29 @@ def save_last_promoted(payload: Dict[str, Any]) -> None:
 
 def pareto_gate(new_topic_score: float, root_ok: bool, promo_cfg: Dict[str, Any],
                 last: Dict[str, Any] | None) -> tuple[bool, str]:
-    require_no_reg = bool(promo_cfg.get("pareto_gate", {}).get("require_no_regressions", True))
-    min_score = float(promo_cfg.get("pareto_gate", {}).get("new_topic_min_score", 0.0))
+    """
+    Promotion gate = Pareto improvement:
+      1) No regressions in root tests, and
+      2) KPI strictly increases vs last promoted snapshot, and
+      3) KPI meets the absolute threshold.
+    """
+    gate = promo_cfg.get("pareto_gate", {}) or {}
+    require_no_reg = bool(gate.get("require_no_regressions", True))
+    min_score = float(gate.get("new_topic_min_score", 0.0))
+
+    # (1) hard block on any root regression / non-pass
     if require_no_reg and not root_ok:
-        return (False, "Rejected: root tests regressed.")
+        return (False, "Rejected: root tests regressed or did not pass.")
+
+    # (2) threshold check
     if new_topic_score < min_score:
         return (False, f"Rejected: new_topic_score {new_topic_score:.2f} < threshold {min_score:.2f}.")
-    return (True, "Promoted.")
+
+    # (3) strict improvement over last promoted (if any)
+    if last is not None:
+        prev = float(last.get("new_topic_score", 0.0))
+        if not (new_topic_score > prev):
+            return (False, f"Rejected: KPI did not improve (prev={prev:.2f}, new={new_topic_score:.2f}).")
+
+    return (True, "Promoted: no regressions and KPI improved beyond threshold.")
+

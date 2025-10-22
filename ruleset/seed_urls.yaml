@@ -1,0 +1,6 @@
+version: 1
+seeds:
+  - https://arxiv.org/pdf/2510.04618        # ACE
+  - https://arxiv.org/pdf/2303.11366        # Reflexion
+  - https://arxiv.org/pdf/2005.11401        # RAG (Lewis et al.)
+  - https://datatracker.ietf.org/doc/html/rfc3284  # VCDIFF (HTML canonical)

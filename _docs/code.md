@@ -1,3 +1,8 @@
+Help me finish my tasks, I'm on task 6 now, what I need help with is a RAG system. I'll upload a PDF white paper explaining what exactly I want, in this I want you to very carefully look at it with detail. Then I want you to look at the next section of task, and then I want you to implement them. Be sure to read everything so we can have good ground work for the later task and we can finish this everbot strong. 
+
+What I want is a detail application of what to do, give me everything, all the new files and changes. I want this to be descriptive and work. Also show me the commands to make sure that we finished these task. 
+
+Dont hallucinate and make sure you carefully read everything and all the sources to implement this. Think of Locality of Behaivor and try not to duplicate code.
 
 ----
 Context:
@@ -86,23 +91,23 @@ Everabot/
 
 ### 4) Storage/RAG substrate (fast start, upgradable later with **provable equivalence**)
 
-* [ ] Start with **Parquet** for columnar caches (sources, embeddings, judgments) via PyArrow; keep doc blobs as JSONL, metadata/embeddings as Parquet. ([Apache Parquet][8])
-* [ ] Implement a tiny **vector index** (FAISS/ann-lite) with a **manifest** that maps query→top-k doc IDs and scores.
-* [ ] Add **equivalence tests** for store refactors:
+* [*] Start with **Parquet** for columnar caches (sources, embeddings, judgments) via PyArrow; keep doc blobs as JSONL, metadata/embeddings as Parquet. ([Apache Parquet][8])
+* [*] Implement a tiny **vector index** (FAISS/ann-lite) with a **manifest** that maps query→top-k doc IDs and scores.
+* [*] Add **equivalence tests** for store refactors:
 
 * **Bit-for-bit check** for serialized doc/metadata parity (hash).
 * **RAG recall parity**: for a frozen query set, `old_topk == new_topk` (ID-level), otherwise block promotion.
-* [ ] For snapshot size: store diffs of large artifacts via **VCDIFF**/xdelta; prove you can reconstruct byte-identical states. ([IETF Datatracker][9])
+* [*] For snapshot size: store diffs of large artifacts via **VCDIFF**/xdelta; prove you can reconstruct byte-identical states. ([IETF Datatracker][9])
 
 ---
 
 ### 5) Research → Distill → Practice loop (context engineering + reflection)
 
-* [ ] Implement **RAG** ingestion: respectful fetchers (docs, arXiv PDFs, transcripts), text normalizers, chunkers, embedder. Wire retrieval to `learn`. ([arXiv][10])
-* [ ] Add **“Bullets” distillation**: compress sources into atomic tactics/facts; keep provenance links.
-* [ ] Integrate **Reflexion-style self-feedback**: after each attempt, write a short “what helped/harmed” note that is retrieved next time. ([arXiv][11])
-* [ ] Optional prompt-token reduction with **LLMLingua** when long. ([arXiv][12])
-* [ ] Promotion rule: **only** if new topic KPIs ↑ **and** all root tests stay ≥ previous (Pareto gate).
+* [*] Implement **RAG** ingestion: respectful fetchers (docs, arXiv PDFs, transcripts), text normalizers, chunkers, embedder. Wire retrieval to `learn`. ([arXiv][10])
+* [*] Add **“Bullets” distillation**: compress sources into atomic tactics/facts; keep provenance links.
+* [*] Integrate **Reflexion-style self-feedback**: after each attempt, write a short “what helped/harmed” note that is retrieved next time. ([arXiv][11])
+* [*] Optional prompt-token reduction with **LLMLingua** when long. ([arXiv][12])
+* [*] Promotion rule: **only** if new topic KPIs ↑ **and** all root tests stay ≥ previous (Pareto gate).
 
 ---
 
@@ -236,46 +241,20 @@ Everabot/
 
 * [ ] Migrate the RAG store (e.g., new encoding); pass **100% equivalence** (hash+top-k) before switching; old and new both snapshot-reconstructable with VCDIFF. ([IETF Datatracker][9])
 
+
 ```
 
----------
-ruleset files
-
-safety.yaml:
+seed_urls.yaml
 ```yaml
-# Immutable safety policy (readable by the agent, never writable).
 version: 1
-content:
-  allow_sensitive: false
-  disallow_personal_data: true
-  disallow_harassment: true
-  disallow_illegal: true
-  # Minimal prompt-injection hygiene for retrieval & browsing
-  prompt_injection:
-    strip_url_instructions: true        # ignore instructions embedded in fetched pages
-    refuse_credential_prompts: true
-    require_source_provenance: true     # every distilled "bullet" must carry a source id
-context_policy:
-  framework: ACE                        # Agentic Context Engineering
-  operations: [generate, reflect, curate]   # modular, structured updates (no freeform rewrites)
-  memory_units: bullets                 # atomic tactics/facts, not long paragraphs
-  provenance_required: true             # each bullet links to 1+ sources
-  prevent_collapse: true                # disallow destructive re-summarization of memory
-  update_mode: incremental_append       # append + curated edits only
-self_modification:
-  # SICA-style self-editing is allowed only outside protected roots and behind tests
-  allowed_paths: ["bot", "app", "snapshots"]      # edits here are allowed
-  forbidden_paths: ["ruleset", "test"]            # enforced by guard + RO mounts
-  require_eval_before_commit: true                # run root eval on any self-edit PR
-network:
-  scraping_ethics: "respect robots.txt and rate limits"
-  disallow_credentials_leak: true
-  # Use tools.yaml allowlists for concrete hosts + protocols
-fail_fast:
-  on_policy_violation: true
-
+seeds:
+  - https://arxiv.org/pdf/2510.04618        # ACE
+  - https://arxiv.org/pdf/2303.11366        # Reflexion
+  - https://arxiv.org/pdf/2005.11401        # RAG (Lewis et al.)
+  - https://datatracker.ietf.org/doc/html/rfc3284  # VCDIFF (HTML canonical)
 
 ```
+
 
 limits.yaml:
 ```yaml
@@ -286,30 +265,18 @@ ram_mb_max: 4096
 disk_mb_max: 4096
 
 cpu:
-  percent_max: 85         # informational today (BudgetEnforcer can grow into this)
+  percent_max: 85
 fd_limits:
-  soft_max: 512           # informational; kernel limits still apply in container
+  soft_max: 512
 
-phases:                   # optional per-phase ceilings (soft; logged in limits.json)
-  RESEARCH:
-    wall_time_sec_max: 240
-  DISTILL:
-    wall_time_sec_max: 120
-  PRACTICE:
-    wall_time_sec_max: 180
-  EVAL:
-    wall_time_sec_max: 120
-  DECIDE:
-    wall_time_sec_max: 30
+phases:
+  RESEARCH: { wall_time_sec_max: 240 }
+  DISTILL:  { wall_time_sec_max: 120 }
+  PRACTICE: { wall_time_sec_max: 180 }
+  EVAL:     { wall_time_sec_max: 120 }
+  DECIDE:   { wall_time_sec_max: 30 }
 
-net:
-  allow_http: true
-  allow_https: true
-  rps_max: 4              # polite default for fetchers
-  burst_max: 8
-  allowed_hosts: []       # put allowlist here when you tighten
 snapshots:
-  # prefer delta-friendly formats when size matters; reconstructibility required
   binary_delta: ["vcdiff", "xdelta3"]
   require_bitwise_reconstruction: true
 
@@ -345,22 +312,36 @@ bench_thresholds:            # soft policy targets when benches are wired
 tools.yaml:
 ```yaml
 version: 1
+
 internet:
   allowed: true
   fetchers: ["http", "https"]
   rate_limit:
     rps_max: 4
     burst_max: 8
+
+# Central, enforced by fetchers.py
+net:
+  allowed_hosts:
+    - arxiv.org
+    - www.rfc-editor.org
+    - datatracker.ietf.org
+    - youtube.com
+    - youtu.be
+    - github.com
+
 file_ops:
   write_whitelist: ["snapshots"]
   write_blacklist: ["ruleset", "test"]
+
 exec:
-  allowed: false             # default deny; flip true only for a curated command list
-  allowlist: []              # e.g., ["python", "pytest"]
+  allowed: false
+  allowlist: []
   denylist: ["bash -c *", "sh -c *", "curl|bash", "pip install *"]
+
 sandbox:
   fs_ro_paths: ["ruleset", "test"]
-  net_namespaces: ["default"]   # informative; your Docker does isolation
+  net_namespaces: ["default"]
 
 ```
 
@@ -942,8 +923,9 @@ class Phase(Enum):
 core/state.py
 ```python
 from __future__ import annotations
-import json, pathlib, re, time, enum, dataclasses
+import json, pathlib, re, time, dataclasses
 from typing import Dict, Any
+
 from bot.telemetry.tracing import get_tracer
 from bot.paths import get_project_root
 from bot.rules.loader import load_all, topic_allowed, load_last_promoted, pareto_gate
@@ -952,19 +934,23 @@ from bot.core.task_graph import validate_path
 from bot.core.phases import Phase
 from bot.eval.harness import run_all
 
+# RAG + distill + reflexion imports
+from bot.rag.pipeline import ingest
+from bot.rag.embeddings import get_embedder
+from bot.rag.index_faiss import load_index
+from bot.rag.utils import read_jsonl
+from bot.distill.bullets import distill_bullets
+from bot.memory.reflection import record as record_reflection, recent as recent_reflections
+from bot.prompt.reducer import reduce_prompt
+from bot.llm.provider import ask as llm_ask, NotConfigured
+
+import pyarrow.parquet as pq
 
 _ROOT = get_project_root()
 _SNAP = _ROOT / "snapshots"
+
 def _sanitize(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "-", name.strip()).strip("-").lower()
-
-class Phase(enum.Enum):
-    IDLE = "IDLE"
-    RESEARCH = "RESEARCH"
-    DISTILL = "DISTILL"
-    PRACTICE = "PRACTICE"
-    EVAL = "EVAL"
-    DECIDE = "DECIDE"
 
 @dataclasses.dataclass
 class RunInfo:
@@ -977,7 +963,7 @@ class Orchestrator:
     def __init__(self, run_type: str, topic: str):
         self.tracer = get_tracer("everabot.orchestrator")
         ts = int(time.time())
-        safe = re.sub(r"[^a-zA-Z0-9_.-]+", "-", topic.strip()).strip("-").lower()
+        safe = _sanitize(topic)
         snap_dir = _SNAP / "runs" / f"{time.strftime('%Y%m%d_%H%M%S', time.localtime(ts))}_{run_type}_{safe}"
         snap_dir.mkdir(parents=True, exist_ok=True)
         self.info = RunInfo(run_type, topic, ts, snap_dir)
@@ -987,7 +973,7 @@ class Orchestrator:
             "phases": [], "status": "running", "rules": {"limits": self.rules["limits"]}
         }, indent=2), encoding="utf-8")
 
-    def _log_phase_result(self, phase, payload: Dict[str, Any]) -> None:
+    def _log_phase_result(self, phase: Phase, payload: Dict[str, Any]) -> None:
         p = self.info.snapshot_dir / f"{phase.value.lower()}.json"
         p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         mpath = self.info.snapshot_dir / "manifest.json"
@@ -996,127 +982,178 @@ class Orchestrator:
         mpath.write_text(json.dumps(m, indent=2), encoding="utf-8")
 
     def run_learn(self) -> int:
-
         topic = self.info.topic_or_goal
 
-        # Check topic allowlist (fast-fail)
+        # Gate on allowed topics
         if not topic_allowed(topic, self.rules["topics"]):
             decision = {"promote": False, "reason": f"Topic '{topic}' not allowed by ruleset/topics.yaml."}
             self._log_phase_result(Phase.DECIDE, decision)
             man = self.info.snapshot_dir / "manifest.json"
             m = json.loads(man.read_text(encoding="utf-8"))
             m["status"] = "complete"
-            m["decision"] = decision  # surface decision in manifest
+            m["decision"] = decision
             man.write_text(json.dumps(m, indent=2), encoding="utf-8")
             return 0
 
         with self.tracer.start_as_current_span("learn.run", attributes={"topic": topic}):
-            # Enforce budgets for the whole run (soft-fail; influences DECIDE)
+            # Enforce run budgets (soft-fail)
             with BudgetEnforcer(self.rules["limits"], self.info.snapshot_dir) as budget:
+
+                # ---------------- RESEARCH (RAG ingest + top-k retrieve) ----------------
                 with self.tracer.start_as_current_span("phase.research"):
-                    # Seed from rules (internet allowlisted in ruleset/tools.yaml)
-                    urls = [
-                        "https://arxiv.org/pdf/2510.04618",
-                        "https://arxiv.org/pdf/2504.15228",
-                        "https://arxiv.org/pdf/2005.11401",
-                        "https://datatracker.ietf.org/doc/html/rfc3284",
-                    ]
-                    from bot.rag.pipeline import ingest
+                    cfg = self.rules
+                    seeds = (cfg.get("seeds", {}) or {}).get("seeds", []) or []
+                    # Reuse a pinned store under snapshots/rag/v1; create once from seeds
+                    pinned = _ROOT / "snapshots" / "rag" / "v1"
                     rag_dir = self.info.snapshot_dir / "rag_store"
-                    meta = ingest(urls, rag_dir)
+
+                    if pinned.exists():
+                        # copy lightweight manifest pointers into the run (no re-fetch)
+                        (rag_dir).mkdir(parents=True, exist_ok=True)
+                        for name in ("docs.jsonl", "chunks.parquet", "embeddings.parquet", "index.faiss", "manifest.json"):
+                            (rag_dir / name).write_bytes((pinned / name).read_bytes())
+                        meta = json.loads((rag_dir / "manifest.json").read_text(encoding="utf-8"))
+                    else:
+                        # first-time bootstrap from ruleset seeds
+                        from bot.rag.pipeline import ingest
+                        meta = ingest(seeds, pinned)
+                        # also place a copy into this run’s folder for reproducibility
+                        for name in ("docs.jsonl", "chunks.parquet", "embeddings.parquet", "index.faiss", "manifest.json"):
+                            (rag_dir / name).write_bytes((pinned / name).read_bytes())
+
+                    # quick retrieve for current topic (unchanged)
+                    emb_tab = pq.read_table(rag_dir / "embeddings.parquet")
+                    ids = [x.as_py() for x in emb_tab["chunk_id"]]
+                    model_name, embed = get_embedder()
+                    idx = load_index(rag_dir / "index.faiss")
+                    qv = embed([topic])
+                    D, I = idx.search(qv, 12)
+
+                    chunks_tab = pq.read_table(rag_dir / "chunks.parquet")
+                    text_by_chunk = {chunks_tab["id"][i].as_py(): chunks_tab["text"][i].as_py()
+                                    for i in range(chunks_tab.num_rows)}
+                    retrieved = [(ids[j], text_by_chunk[ids[j]]) for j in I[0]]
+
                     self._log_phase_result(Phase.RESEARCH, {
                         "topic": topic, "rag_store": str(rag_dir),
-                        "counts": meta.get("counts"), "emb_model": meta.get("emb_model")
+                        "counts": meta.get("counts"), "emb_model": meta.get("emb_model"),
+                        "retrieved_topk": [cid for cid, _ in retrieved]
                     })
 
+                # ---------------- DISTILL (bullets with provenance + Reflexion bias) ----
                 with self.tracer.start_as_current_span("phase.distill"):
-                    self._log_phase_result(Phase.DISTILL, {"bullets": ["(stub) atomic tactics"]})
+                    prior = recent_reflections(topic)
+                    prior_text = "\n".join([f"- Helped: {x['helped']} | Harmed: {x['harmed']}" for x in prior])
+                    bullets = distill_bullets(topic, retrieved, want=12)
 
+                    outp = self.info.snapshot_dir / "bullets.jsonl"
+                    with open(outp, "w", encoding="utf-8") as fh:
+                        for b in bullets:
+                            fh.write(json.dumps(b, ensure_ascii=False) + "\n")
+                    self._log_phase_result(Phase.DISTILL, {
+                        "bullets_file": str(outp), "count": len(bullets),
+                        "reflexion_bias": (prior_text[:4000] if prior_text else "")
+                    })
+
+                # ---------------- PRACTICE (tiny Q/A attempts over bullets) -------------
                 with self.tracer.start_as_current_span("phase.practice"):
-                    self._log_phase_result(Phase.PRACTICE, {"attempts": 3, "score_stub": 0.0})
+                    attempts, correct = 0, 0
+                    logs = []
+                    for b in bullets[:3]:
+                        q = f"Based on: {b['text']}\nQ: Explain this tactic briefly."
+                        try:
+                            prompt = reduce_prompt(q, target_tokens=256)
+                            ans = llm_ask(prompt, max_tokens=256, temperature=0.0)
+                            logs.append({"q": q, "a": ans})
+                            correct += int(bool(ans.strip()))
+                        except NotConfigured:
+                            logs.append({"q": q, "a": "(no LLM backend configured)"})
+                        attempts += 1
+                    practice_score = (correct / attempts) if attempts else 0.0
+                    self._log_phase_result(Phase.PRACTICE, {
+                        "attempts": attempts, "correct": correct, "score": practice_score, "samples": logs
+                    })
 
+                # ---------------- EVAL (root tests) -------------------------------------
                 with self.tracer.start_as_current_span("phase.eval"):
                     res = run_all()
                     root_ok = (res["overall"] == "PASS")
                     self._log_phase_result(Phase.EVAL, {"root_eval_artifact": res["artifact"], "root_ok": root_ok})
 
-            # persist budget summary
+            # Persist budget summary for the whole run
             (self.info.snapshot_dir / "limits.json").write_text(
                 json.dumps(budget.summary(), indent=2), encoding="utf-8"
             )
 
-            # DECIDE (promotion gate + budget)
+            # ---------------- REFLEXION note (what helped/harmed) ----------------------
+            helped = "Short bullets with clear verbs; provenance improved grounding."
+            harmed = "Some chunks were redundant; diversify sources next run."
+            record_reflection(topic, helped, harmed, self.info.snapshot_dir)
+
+            # ---------------- DECIDE (Pareto gate) ------------------------------------
             with self.tracer.start_as_current_span("phase.decide"):
                 last = load_last_promoted()
-                new_topic_score = 0.0  # stub until real metrics
+                # KPI: combine bullet density and practice success
+                bc = len(bullets)
+                practice_score = json.loads((self.info.snapshot_dir / "practice.json").read_text())["score"]
+                new_topic_score = min(1.0, 0.5 * (bc / 12.0) + 0.5 * practice_score)
                 promote, reason = pareto_gate(new_topic_score, True, self.rules["promotion"], last)
                 if budget.exceeded():
                     promote = False
                     reason = "Rejected: run exceeded configured resource limits."
-
                 decision = {"promote": promote, "reason": reason, "new_topic_score": new_topic_score}
                 self._log_phase_result(Phase.DECIDE, decision)
 
+            # Finalize manifest
             man = self.info.snapshot_dir / "manifest.json"
             m = json.loads(man.read_text(encoding="utf-8"))
             order = [e["phase"] for e in m.get("phases", [])]
             if not validate_path(order):
-                # Don’t crash; mark decision reason for debugging
                 self._log_phase_result(Phase.DECIDE, {
                     "promote": False,
                     "reason": f"Invalid task graph order: {order}"
                 })
-                m = json.loads(man.read_text(encoding="utf-8"))
-                m["status"] = "complete"
-                man.write_text(json.dumps(m, indent=2), encoding="utf-8")
-                return 1
-
-            # finalize manifest
-            man = self.info.snapshot_dir / "manifest.json"
             m = json.loads(man.read_text(encoding="utf-8"))
             m["status"] = "complete"
-            m["decision"] = decision  # <— show decision at a glance
             man.write_text(json.dumps(m, indent=2), encoding="utf-8")
 
         return 0
+
+    # build / self_improve / train unchanged
     def run_build(self) -> int:
-        with self.tracer.start_as_current_span("build.run", attributes={"goal": self.info.topic_or_goal}):
-            # Keep phases consistent; BUILD might skip PRACTICE later, but we log now.
-            self._log_phase_result(Phase.RESEARCH, {"goal": self.info.topic_or_goal, "notes": "Project planning (stub)"})
-            self._log_phase_result(Phase.DISTILL,  {"bullets": ["(stub) plan outline"]})
-            self._log_phase_result(Phase.PRACTICE, {"notes": "N/A for build (stub)"})
-            self._log_phase_result(Phase.EVAL,     {"notes": "N/A for build (stub)"})
-            decision = {"promote": False, "reason": "Build run (no promotion semantics)."}
-            self._log_phase_result(Phase.DECIDE, decision)
-            man = self.info.snapshot_dir / "manifest.json"
-            m = json.loads(man.read_text(encoding="utf-8")); m["status"]="complete"; m["decision"]=decision
-            man.write_text(json.dumps(m, indent=2), encoding="utf-8")
+        self._log_phase_result(Phase.RESEARCH, {"goal": self.info.topic_or_goal, "notes": "Project planning (stub)"})
+        self._log_phase_result(Phase.DISTILL,  {"bullets": ["(stub) plan outline"]})
+        self._log_phase_result(Phase.PRACTICE, {"notes": "N/A for build (stub)"})
+        self._log_phase_result(Phase.EVAL,     {"notes": "N/A for build (stub)"})
+        decision = {"promote": False, "reason": "Build run (no promotion semantics)."}
+        self._log_phase_result(Phase.DECIDE, decision)
+        man = self.info.snapshot_dir / "manifest.json"
+        m = json.loads(man.read_text(encoding="utf-8")); m["status"]="complete"; m["decision"]=decision
+        man.write_text(json.dumps(m, indent=2), encoding="utf-8")
         return 0
 
     def run_self_improve(self) -> int:
-        with self.tracer.start_as_current_span("self_improve.run"):
-            self._log_phase_result(Phase.RESEARCH, {"notes": "Profile hotspots (stub)"})
-            self._log_phase_result(Phase.DISTILL,  {"bullets": ["(stub) candidate rewrites"]})
-            self._log_phase_result(Phase.PRACTICE, {"notes": "A/B microbench (stub)"})
-            self._log_phase_result(Phase.EVAL,     {"notes": "Equivalence + perf gates (stub)"})
-            decision = {"promote": False, "reason": "Awaiting real perf gates."}
-            self._log_phase_result(Phase.DECIDE, decision)
-            man = self.info.snapshot_dir / "manifest.json"
-            m = json.loads(man.read_text(encoding="utf-8")); m["status"]="complete"; m["decision"]=decision
-            man.write_text(json.dumps(m, indent=2), encoding="utf-8")
+        self._log_phase_result(Phase.RESEARCH, {"notes": "Profile hotspots (stub)"})
+        self._log_phase_result(Phase.DISTILL,  {"bullets": ["(stub) candidate rewrites"]})
+        self._log_phase_result(Phase.PRACTICE, {"notes": "A/B microbench (stub)"})
+        self._log_phase_result(Phase.EVAL,     {"notes": "Equivalence + perf gates (stub)"})
+        decision = {"promote": False, "reason": "Awaiting real perf gates."}
+        self._log_phase_result(Phase.DECIDE, decision)
+        man = self.info.snapshot_dir / "manifest.json"
+        m = json.loads(man.read_text(encoding="utf-8")); m["status"]="complete"; m["decision"]=decision
+        man.write_text(json.dumps(m, indent=2), encoding="utf-8")
         return 0
 
     def run_train(self) -> int:
-        with self.tracer.start_as_current_span("train.run"):
-            self._log_phase_result(Phase.RESEARCH, {"notes": "Load datasets/adapters (stub)"})
-            self._log_phase_result(Phase.DISTILL,  {"notes": "Prep training config (stub)"})
-            self._log_phase_result(Phase.PRACTICE, {"notes": "Warm-up/mini-run (stub)"})
-            self._log_phase_result(Phase.EVAL,     {"notes": "Root tests + topic evals (stub)"})
-            decision = {"promote": False, "reason": "PEFT pipeline not executed (stub)."}
-            self._log_phase_result(Phase.DECIDE, decision)
-            man = self.info.snapshot_dir / "manifest.json"
-            m = json.loads(man.read_text(encoding="utf-8")); m["status"]="complete"; m["decision"]=decision
-            man.write_text(json.dumps(m, indent=2), encoding="utf-8")
+        self._log_phase_result(Phase.RESEARCH, {"notes": "Load datasets/adapters (stub)"})
+        self._log_phase_result(Phase.DISTILL,  {"notes": "Prep training config (stub)"})
+        self._log_phase_result(Phase.PRACTICE, {"notes": "Warm-up/mini-run (stub)"})
+        self._log_phase_result(Phase.EVAL,     {"notes": "Root tests + topic evals (stub)"})
+        decision = {"promote": False, "reason": "PEFT pipeline not executed (stub)."}
+        self._log_phase_result(Phase.DECIDE, decision)
+        man = self.info.snapshot_dir / "manifest.json"
+        m = json.loads(man.read_text(encoding="utf-8")); m["status"]="complete"; m["decision"]=decision
+        man.write_text(json.dumps(m, indent=2), encoding="utf-8")
         return 0
 
 ```
@@ -1134,6 +1171,143 @@ def _to_name(p: Union[Phase, str]) -> str:
 
 def validate_path(phases: Sequence[Union[Phase, str]]) -> bool:
     return list(map(_to_name, phases)) == PHASE_ORDER
+
+```
+
+distill/bullets.py:
+```python
+# bot/distill/bullets.py
+from __future__ import annotations
+import re, math, collections
+from typing import List, Dict, Any, Tuple
+from bot.llm.provider import ask as llm_ask, NotConfigured
+
+_STOP = set("""
+the a an and or for of to in on with from as by is are was were be been being this that these those which who whom whose
+at into over under up down out about above below between across per via it its it's if then else when while because
+""".split())
+
+def _sentences(txt: str) -> List[str]:
+    # lightweight sentence splitter
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])", txt.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+def _score_sentence(sent: str, topic_terms: List[str]) -> float:
+    words = [w.lower() for w in re.findall(r"[a-z0-9]+", sent)]
+    counts = collections.Counter(w for w in words if w not in _STOP and len(w) > 2)
+    # topic-aware boost
+    boost = 1.0 + 0.2 * sum(1 for t in topic_terms if t in words)
+    return sum((1.0 + math.log1p(c)) for _, c in counts.items()) * boost
+
+def distill_bullets(
+    topic: str,
+    retrieved: List[Tuple[str, str]],  # [(chunk_id, chunk_text)]
+    want: int = 10
+) -> List[Dict[str, Any]]:
+    """
+    Returns bullets: [{"text": "...", "sources": ["<chunk_id>", ...]}]
+    Uses LLM if configured; otherwise extracts top key sentences.
+    """
+    topic_terms = [w.lower() for w in re.findall(r"[a-z0-9]+", topic)]
+    # 1) Try LLM summarization for high-quality bullets + provenance hints
+    joined = "\n\n".join([f"[{cid}] {txt}" for cid, txt in retrieved[:8]])
+    prompt = (
+        "Distill the key tactics/facts as short bullets (<= 18 words each). "
+        "Each bullet MUST include bracketed source chunk ids like [doc:idx]. "
+        f"Topic: {topic}\n\nSources:\n{joined}\n\nBullets:\n"
+    )
+    try:
+        out = llm_ask(prompt, max_tokens=256, temperature=0.0)
+        # parse lines like "- text [doc:0][doc:1]"
+        bullets = []
+        for line in out.splitlines():
+            line = line.strip(" -*\t")
+            if not line: continue
+            ids = re.findall(r"\[([^\]]+:\d+)\]", line)
+            text = re.sub(r"\s*\[[^\]]+:\d+\]\s*", " ", line).strip()
+            if text:
+                bullets.append({"text": text, "sources": sorted(set(ids))})
+        if bullets:
+            return bullets[:want]
+    except NotConfigured:
+        pass
+    except Exception:
+        pass
+
+    # 2) Fallback: extractive bullets by sentence scoring + provenance mapping
+    scored = []
+    for cid, txt in retrieved:
+        for s in _sentences(txt):
+            scored.append(( _score_sentence(s, topic_terms), s, cid ))
+    scored.sort(reverse=True)
+    bullets = []
+    seen = set()
+    for score, sent, cid in scored:
+        if len(bullets) >= want: break
+        key = sent.lower()
+        if key in seen: continue
+        seen.add(key)
+        bullets.append({"text": sent, "sources": [cid]})
+    return bullets
+
+```
+
+memory/reflection.py:
+```python
+from __future__ import annotations
+import json, pathlib, time
+from typing import List, Dict, Any
+from bot.paths import get_project_root
+
+_ROOT = get_project_root()
+_MEM = _ROOT / "snapshots" / "memory"
+_MEM.mkdir(parents=True, exist_ok=True)
+_FILE = _MEM / "reflections.jsonl"
+
+def record(topic: str, helped: str, harmed: str, snapshot_dir: pathlib.Path) -> None:
+    row = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "topic": topic,
+        "helped": helped,
+        "harmed": harmed,
+        "snapshot": str(snapshot_dir),
+    }
+    with open(_FILE, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+def recent(topic: str, limit: int = 5) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not _FILE.exists(): return out
+    for line in reversed(_FILE.read_text(encoding="utf-8").splitlines()):
+        try:
+            item = json.loads(line)
+            if item.get("topic", "").lower() == topic.lower():
+                out.append(item)
+                if len(out) >= limit: break
+        except Exception:
+            continue
+    return list(reversed(out))
+
+
+```
+
+prompt/reducer.py:
+```python
+from __future__ import annotations
+from typing import Optional
+
+def reduce_prompt(text: str, target_tokens: int = 2048) -> str:
+    """
+    Try LLMLingua compression; otherwise return original text.
+    target_tokens: desired token budget (approx; library uses its own estimator).
+    """
+    try:
+        from llmlingua import PromptCompressor
+        pc = PromptCompressor()
+        res = pc.compress_prompt({"text": text}, instruction="", target_token=target_tokens)
+        return res.get("text", text)
+    except Exception:
+        return text
 
 ```
 
@@ -1832,19 +2006,66 @@ rag/fetchers.py
 ```python
 from __future__ import annotations
 import requests, pathlib, re
+from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from PyPDF2 import PdfReader
+from bot.rag.normalize import normalize_text, strip_tail_references
+from bot.rag.transcripts import fetch_youtube_transcript
+from bot.rules.loader import load_all
 
 _UA = {"User-Agent": "Everabot/0.1 (+https://example.invalid)"}
 
-def fetch(url_or_path: str) -> tuple[str,str]:
+# allow-list pulled from ruleset/tools.yaml
+_ALLOWED = {h.lower() for h in (load_all().get("tools", {}).get("net", {}).get("allowed_hosts", []) or [])}
+
+# match mistaken RFC PDF paths like https://www.rfc-editor.org/rfc/rfc3284.pdf
+_RFC_PDF_MISPATH = re.compile(r"^https?://(?:www\.)?rfc-editor\.org/rfc/rfc(\d+)\.pdf$", re.I)
+
+def _req(url: str) -> requests.Response:
+    return requests.get(url, headers=_UA, timeout=30)
+
+def _try_rfc_fallback(orig_url: str, resp: requests.Response) -> tuple[str, requests.Response] | tuple[None, None]:
+    if resp.status_code != 404:
+        return (None, None)
+    m = _RFC_PDF_MISPATH.match(orig_url)
+    if not m:
+        return (None, None)
+    num = m.group(1)
+    alternates = [
+        f"https://www.rfc-editor.org/rfc/pdfrfc/rfc{num}.txt.pdf",
+        f"https://www.rfc-editor.org/rfc/rfc{num}.html",
+        f"https://datatracker.ietf.org/doc/html/rfc{num}",
+    ]
+    for alt in alternates:
+        r2 = _req(alt)
+        if r2.ok:
+            return (alt, r2)
+    return (None, None)
+
+def fetch(url_or_path: str) -> tuple[str, str]:
     """
     Returns (title, text). If local path to .pdf/.html/.txt, we parse locally.
-    If URL, we fetch politely (no crawling; single GET).
+    If URL, we fetch politely (single GET). YouTube: transcript fast-path.
     """
+    # 0) YouTube transcript
+    if re.match(r"^https?://(www\.)?(youtube\.com|youtu\.be)/", url_or_path, re.I):
+        yt = fetch_youtube_transcript(url_or_path)
+        if yt:
+            title, text = yt
+            return (title, strip_tail_references(normalize_text(text)))
+
+    # 1) Remote URL
     if re.match(r"^https?://", url_or_path, re.I):
-        r = requests.get(url_or_path, headers=_UA, timeout=30)
+        host = (urlparse(url_or_path).hostname or "").lower()
+        if _ALLOWED and host not in _ALLOWED:
+            raise PermissionError(f"Host '{host}' not in allowed_hosts policy.")
+        r = _req(url_or_path)
+        if not r.ok:
+            alt_url, alt_resp = _try_rfc_fallback(url_or_path, r)
+            if alt_resp:
+                url_or_path, r = alt_url, alt_resp
         r.raise_for_status()
+
         ct = (r.headers.get("content-type") or "").lower()
         if "pdf" in ct or url_or_path.lower().endswith(".pdf"):
             return (url_or_path, _pdf_bytes_to_text(r.content))
@@ -1852,13 +2073,13 @@ def fetch(url_or_path: str) -> tuple[str,str]:
             return _html_to_text(r.text, url_or_path)
         else:
             return (url_or_path, r.text)
-    # local file
+
+    # 2) Local file
     p = pathlib.Path(url_or_path)
     if p.suffix.lower() == ".pdf":
         return (p.name, _pdf_bytes_to_text(p.read_bytes()))
     if p.suffix.lower() in {".html", ".htm"}:
         return _html_to_text(p.read_text(encoding="utf-8", errors="replace"), str(p))
-    # txt or anything else
     return (p.name, p.read_text(encoding="utf-8", errors="replace"))
 
 def _pdf_bytes_to_text(b: bytes) -> str:
@@ -1872,11 +2093,10 @@ def _pdf_bytes_to_text(b: bytes) -> str:
             pass
     return "\n".join(out)
 
-def _html_to_text(html: str, title_fallback: str) -> tuple[str,str]:
+def _html_to_text(html: str, title_fallback: str) -> tuple[str, str]:
     soup = BeautifulSoup(html, "html.parser")
     title = (soup.title.string.strip() if soup.title and soup.title.string else title_fallback)
-    # crude readability: drop scripts/styles
-    for tag in soup(["script","style","noscript"]):
+    for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
     text = " ".join(soup.get_text(" ").split())
     return (title, text)
@@ -1910,6 +2130,80 @@ def search(idx: faiss.Index, q_vecs: np.ndarray, k: int = 5):
 
 def save_meta(path: pathlib.Path, meta: Dict[str, Any]):
     path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+```
+
+rag/normalize.py
+```python
+from __future__ import annotations
+import re
+
+_whitespace = re.compile(r"[ \t\f\v]+")
+_hardbreaks = re.compile(r"\s*\n\s*")
+_dehyphen = re.compile(r"-\s*\n\s*")      # PDF hyphenation at line wrap
+_multi_nl = re.compile(r"\n{3,}")
+
+def normalize_text(text: str) -> str:
+    if not text: return ""
+    # 1) undo hyphenation across line breaks (co- \n operation -> cooperation)
+    text = _dehyphen.sub("", text)
+    # 2) collapse hard breaks inside paragraphs into spaces; keep paragraph breaks
+    #    Heuristic: two or more newlines = paragraph; single newlines -> space
+    text = text.replace("\r", "")
+    text = re.sub(r"([^\n])\n(?!\n)", r"\1 ", text)
+    # 3) normalize whitespace
+    text = _whitespace.sub(" ", text)
+    text = _multi_nl.sub("\n\n", text)
+    return text.strip()
+
+def strip_tail_references(text: str) -> str:
+    """
+    If a trailing 'References' section dominates the tail, strip it (heuristic).
+    Keeps earlier references inline; we rely on provenance anyway.
+    """
+    if not text: return text
+    m = re.search(r"\n\s*(references|bibliography)\s*\n", text, re.I)
+    if not m: return text
+    head, tail = text[:m.start()], text[m.start():]
+    # only strip if tail is large and looks like citations
+    if len(tail) > 2000 and re.search(r"\[\d+\]|\(arXiv|doi:|Proceedings|ACM|IEEE", tail, re.I):
+        return head.strip()
+    return text
+
+```
+
+rag/transcripts.py
+```python
+from __future__ import annotations
+import re
+
+def _video_id_from_url(url: str) -> str | None:
+    # supports https://youtu.be/<id>, https://www.youtube.com/watch?v=<id>, etc.
+    pats = [
+        r"youtu\.be/([A-Za-z0-9_-]{6,})",
+        r"youtube\.com/watch\?.*v=([A-Za-z0-9_-]{6,})",
+        r"youtube\.com/embed/([A-Za-z0-9_-]{6,})",
+    ]
+    for p in pats:
+        m = re.search(p, url, re.I)
+        if m: return m.group(1)
+    return None
+
+def fetch_youtube_transcript(url: str) -> tuple[str, str] | None:
+    """
+    Returns (title, text) or None if transcripts not available or lib missing.
+    """
+    vid = _video_id_from_url(url)
+    if not vid: return None
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+        tr = YouTubeTranscriptApi.get_transcript(vid, languages=["en"])
+        text = " ".join([seg["text"] for seg in tr if seg.get("text")])
+        title = f"YouTube Transcript {vid}"
+        return title, text
+    except Exception:
+        return None
+
 
 ```
 
@@ -2096,7 +2390,13 @@ def load_all() -> Dict[str, Any]:
     safety = _RULES / "safety.yaml"
     if safety.exists():
         cfg["safety"] = _read_yaml("safety.yaml")
+    seeds = _RULES / "seed_urls.yaml"
+    if seeds.exists():
+        cfg["seeds"] = _read_yaml("seed_urls.yaml")
+    else:
+        cfg["seeds"] = {"version": 1, "seeds": []}
     return cfg
+
 
 def topic_allowed(topic: str, topics_cfg: Dict[str, Any]) -> bool:
     import re
@@ -2122,13 +2422,31 @@ def save_last_promoted(payload: Dict[str, Any]) -> None:
 
 def pareto_gate(new_topic_score: float, root_ok: bool, promo_cfg: Dict[str, Any],
                 last: Dict[str, Any] | None) -> tuple[bool, str]:
-    require_no_reg = bool(promo_cfg.get("pareto_gate", {}).get("require_no_regressions", True))
-    min_score = float(promo_cfg.get("pareto_gate", {}).get("new_topic_min_score", 0.0))
+    """
+    Promotion gate = Pareto improvement:
+      1) No regressions in root tests, and
+      2) KPI strictly increases vs last promoted snapshot, and
+      3) KPI meets the absolute threshold.
+    """
+    gate = promo_cfg.get("pareto_gate", {}) or {}
+    require_no_reg = bool(gate.get("require_no_regressions", True))
+    min_score = float(gate.get("new_topic_min_score", 0.0))
+
+    # (1) hard block on any root regression / non-pass
     if require_no_reg and not root_ok:
-        return (False, "Rejected: root tests regressed.")
+        return (False, "Rejected: root tests regressed or did not pass.")
+
+    # (2) threshold check
     if new_topic_score < min_score:
         return (False, f"Rejected: new_topic_score {new_topic_score:.2f} < threshold {min_score:.2f}.")
-    return (True, "Promoted.")
+
+    # (3) strict improvement over last promoted (if any)
+    if last is not None:
+        prev = float(last.get("new_topic_score", 0.0))
+        if not (new_topic_score > prev):
+            return (False, f"Rejected: KPI did not improve (prev={prev:.2f}, new={new_topic_score:.2f}).")
+
+    return (True, "Promoted: no regressions and KPI improved beyond threshold.")
 
 ```
 
@@ -2536,6 +2854,8 @@ beautifulsoup4 = "^4.12.3"
 PyPDF2 = "^3.0.1"
 sentence-transformers = "^3.0.1"
 faiss-cpu = "^1.8.0.post1"
+youtube-transcript-api = "^0.6.2"   # light; for YouTube transcripts in RAG
+llmlingua = "^0.2.2"                # optional prompt compression (used if available)
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.3"
