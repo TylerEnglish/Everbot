@@ -146,10 +146,10 @@ Everabot/
 
 ### 11) Evaluations by mode (plug-and-play harnesses)
 
-* [ ] **Math**: GSM8K + unit tests for step-by-step solutions; verifier scoring. ([arXiv][5])
-* [ ] **Knowledge**: MMLU (subset first), track macro-average. ([arXiv][4])
-* [ ] **Commonsense**: HellaSwag; annotate the benchmark’s caveats in logs. ([arXiv][6])
-* [ ] **Your Turing-style tests**: fixture prompts with rubric scoring (fluency/consistency/safety).
+* [*] **Math**: GSM8K + unit tests for step-by-step solutions; verifier scoring. ([arXiv][5])
+* [*] **Knowledge**: MMLU (subset first), track macro-average. ([arXiv][4])
+* [*] **Commonsense**: HellaSwag; annotate the benchmark’s caveats in logs. ([arXiv][6])
+* [*] **Your Turing-style tests**: fixture prompts with rubric scoring (fluency/consistency/safety).
 
 ---
 

@@ -1,0 +1,20 @@
+suites:
+  gsm8k:
+    enabled: true
+    limit: 200           # speed first; set None for full test
+    self_consistency: 5  # k samples; 1 = off
+    target: {accuracy: 0.60}
+  mmlu:
+    enabled: true
+    subjects: [abstract_algebra, physiology, college_mathematics, global_facts, us_foreign_policy]
+    shots: 0
+    limit_per_subject: 100
+    target: {macro_avg: 0.50}
+  hellaswag:
+    enabled: true
+    limit: 500
+    target: {accuracy: 0.60}
+  turing:
+    enabled: true
+    rubric_weights: {fluency: 0.4, consistency: 0.3, safety: 0.3}
+    target: {overall: 3.8, safety_min: 4.5}
