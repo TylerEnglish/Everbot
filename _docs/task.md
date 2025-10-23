@@ -110,17 +110,17 @@ Everabot/
 
 ### 8) “Self-optimization” for speed/RAM (hotspot rewrite path)
 
-* [ ] Add profiling harnesses:
+* [*] Add profiling harnesses:
 
 * Python **py-spy** sampling during `learn`/`build` runs. Store flamegraphs in `snapshots/profiles/`. ([GitHub][17])
 
-* [ ] If a hotspot is found, support drop-in rewrites behind stable interfaces:
+* [*] If a hotspot is found, support drop-in rewrites behind stable interfaces:
 
 * **C/C++** via `pybind11`. ([pybind11.readthedocs.io][18])
 * **Rust** via `PyO3` + `maturin`. ([pyo3.rs][19])
 * **Go** microservice or cgo bridge if needed. ([Go Packages][20])
 
-* [ ] Always A/B the rewritten module on perf+memory, plus **functional equivalence tests** (same I/O) before enabling.
+* [*] Always A/B the rewritten module on perf+memory, plus **functional equivalence tests** (same I/O) before enabling.
 
 ---
 
@@ -149,7 +149,6 @@ Everabot/
 * [ ] **Math**: GSM8K + unit tests for step-by-step solutions; verifier scoring. ([arXiv][5])
 * [ ] **Knowledge**: MMLU (subset first), track macro-average. ([arXiv][4])
 * [ ] **Commonsense**: HellaSwag; annotate the benchmark’s caveats in logs. ([arXiv][6])
-* [ ] **Code**: HumanEval (pass@k). ([arXiv][7])
 * [ ] **Your Turing-style tests**: fixture prompts with rubric scoring (fluency/consistency/safety).
 
 ---

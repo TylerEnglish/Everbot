@@ -38,8 +38,15 @@ rapidfuzz = "^3.9.7"
 # bitsandbytes is optional; only needed for QLoRA when you have CUDA
 bitsandbytes = { version = "^0.43.3", optional = true }
 
+py-spy = ">=0.3.14,<0.5.0"
+
+pybind11 = {version="^2.11.0", optional=true}
+scikit-build-core = {version="^0.8.0", optional=true}
+maturin = {version="^1.5.0", optional=true}   # for Rust lane  
+
 [tool.poetry.extras]
-qlora = ["bitsandbytes"]
+qlora = ["bitsandbytes","pybind11","scikit-build-core","maturin"]
+accel = ["pybind11","scikit-build-core","maturin"] 
 
 # Optional group for llama.cpp wheels
 [tool.poetry.group.llamacpp]

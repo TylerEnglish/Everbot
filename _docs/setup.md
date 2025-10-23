@@ -1,3 +1,5 @@
+pip install -U py-spy
+
 # MMLU
 # from repo root (Everbot/Everbot)
 New-Item -ItemType Directory -Force test/bench_mmlu/raw | Out-Null

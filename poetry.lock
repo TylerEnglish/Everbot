@@ -1189,6 +1189,35 @@ files = [
 ]
 
 [[package]]
+name = "maturin"
+version = "1.9.6"
+description = "Build and publish crates with pyo3, cffi and uniffi bindings as well as rust binaries as python packages"
+optional = true
+python-versions = ">=3.7"
+groups = ["main"]
+markers = "extra == \"qlora\" or extra == \"accel\""
+files = [
+    {file = "maturin-1.9.6-py3-none-linux_armv6l.whl", hash = "sha256:26e3ab1a42a7145824210e9d763f6958f2c46afb1245ddd0bab7d78b1f59bb3f"},
+    {file = "maturin-1.9.6-py3-none-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:5263dda3f71feef2e4122baf5c4620e4b3710dbb7f2121f85a337182de214369"},
+    {file = "maturin-1.9.6-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:fe78262c2800c92f67d1ce3c0f6463f958a692cc67bfb572e5dbf5b4b696a8ba"},
+    {file = "maturin-1.9.6-py3-none-manylinux_2_12_i686.manylinux2010_i686.musllinux_1_1_i686.whl", hash = "sha256:7ab827c6e8c022eb2e1e7fb6deede54549c8460b20ccc2e9268cc6e8cde957a8"},
+    {file = "maturin-1.9.6-py3-none-manylinux_2_12_x86_64.manylinux2010_x86_64.musllinux_1_1_x86_64.whl", hash = "sha256:0246202377c49449315305209f45c8ecef6e2d6bd27a04b5b6f1ab3e4ea47238"},
+    {file = "maturin-1.9.6-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.musllinux_1_1_aarch64.whl", hash = "sha256:f5bac167700fbb6f8c8ed1a97b494522554b4432d7578e11403b894b6a91d99f"},
+    {file = "maturin-1.9.6-py3-none-manylinux_2_17_armv7l.manylinux2014_armv7l.musllinux_1_1_armv7l.whl", hash = "sha256:7f53d3b1d8396d3fea3e1ee5fd37558bca5719090f3d194ba1c02b0b56327ae3"},
+    {file = "maturin-1.9.6-py3-none-manylinux_2_17_ppc64le.manylinux2014_ppc64le.musllinux_1_1_ppc64le.whl", hash = "sha256:7f506eb358386d94d6ec3208c003130cf4b69cab26034fc0cbbf8bf83afa4c2e"},
+    {file = "maturin-1.9.6-py3-none-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:f2d6984ab690af509f525dbd2b130714207c06ebb14a5814edbe1e42b17ae0de"},
+    {file = "maturin-1.9.6-py3-none-manylinux_2_31_riscv64.whl", hash = "sha256:5c2252b0956bb331460ac750c805ddf0d9b44442449fc1f16e3b66941689d0bc"},
+    {file = "maturin-1.9.6-py3-none-win32.whl", hash = "sha256:f2c58d29ebdd4346fd004e6be213d071fdd94a77a16aa91474a21a4f9dbf6309"},
+    {file = "maturin-1.9.6-py3-none-win_amd64.whl", hash = "sha256:1b39a5d82572c240d20d9e8be024d722dfb311d330c5e28ddeb615211755941a"},
+    {file = "maturin-1.9.6-py3-none-win_arm64.whl", hash = "sha256:ac02a30083553d2a781c10cd6f5480119bf6692fd177e743267406cad2ad198c"},
+    {file = "maturin-1.9.6.tar.gz", hash = "sha256:2c2ae37144811d365509889ed7220b0598487f1278c2441829c3abf56cc6324a"},
+]
+
+[package.extras]
+patchelf = ["patchelf"]
+zig = ["ziglang (>=0.10.0,<0.13.0)"]
+
+[[package]]
 name = "mdurl"
 version = "0.1.2"
 description = "Markdown URL utilities"
@@ -2458,6 +2487,27 @@ files = [
 test = ["enum34 ; python_version <= \"3.4\"", "ipaddress ; python_version < \"3.0\"", "mock ; python_version < \"3.0\"", "pywin32 ; sys_platform == \"win32\"", "wmi ; sys_platform == \"win32\""]
 
 [[package]]
+name = "py-spy"
+version = "0.4.1"
+description = ""
+optional = false
+python-versions = "*"
+groups = ["main"]
+files = [
+    {file = "py_spy-0.4.1-py2.py3-none-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:809094208c6256c8f4ccadd31e9a513fe2429253f48e20066879239ba12cd8cc"},
+    {file = "py_spy-0.4.1-py2.py3-none-macosx_11_0_arm64.whl", hash = "sha256:1fb8bf71ab8df95a95cc387deed6552934c50feef2cf6456bc06692a5508fd0c"},
+    {file = "py_spy-0.4.1-py2.py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:ee776b9d512a011d1ad3907ed53ae32ce2f3d9ff3e1782236554e22103b5c084"},
+    {file = "py_spy-0.4.1-py2.py3-none-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:532d3525538254d1859b49de1fbe9744df6b8865657c9f0e444bf36ce3f19226"},
+    {file = "py_spy-0.4.1-py2.py3-none-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:4972c21890b6814017e39ac233c22572c4a61fd874524ebc5ccab0f2237aee0a"},
+    {file = "py_spy-0.4.1-py2.py3-none-manylinux_2_5_x86_64.manylinux1_x86_64.whl", hash = "sha256:6a80ec05eb8a6883863a367c6a4d4f2d57de68466f7956b6367d4edd5c61bb29"},
+    {file = "py_spy-0.4.1-py2.py3-none-win_amd64.whl", hash = "sha256:d92e522bd40e9bf7d87c204033ce5bb5c828fca45fa28d970f58d71128069fdc"},
+    {file = "py_spy-0.4.1.tar.gz", hash = "sha256:e53aa53daa2e47c2eef97dd2455b47bb3a7e7f962796a86cc3e7dbde8e6f4db4"},
+]
+
+[package.extras]
+test = ["numpy"]
+
+[[package]]
 name = "pyarrow"
 version = "17.0.0"
 description = "Python library for Apache Arrow"
@@ -2508,6 +2558,22 @@ numpy = ">=1.16.6"
 
 [package.extras]
 test = ["cffi", "hypothesis", "pandas", "pytest", "pytz"]
+
+[[package]]
+name = "pybind11"
+version = "2.13.6"
+description = "Seamless operability between C++11 and Python"
+optional = true
+python-versions = ">=3.7"
+groups = ["main"]
+markers = "extra == \"qlora\" or extra == \"accel\""
+files = [
+    {file = "pybind11-2.13.6-py3-none-any.whl", hash = "sha256:237c41e29157b962835d356b370ededd57594a26d5894a795960f0047cb5caf5"},
+    {file = "pybind11-2.13.6.tar.gz", hash = "sha256:ba6af10348c12b24e92fa086b39cfba0eff619b61ac77c406167d813b096d39a"},
+]
+
+[package.extras]
+global = ["pybind11-global (==2.13.6)"]
 
 [[package]]
 name = "pygments"
@@ -3088,6 +3154,33 @@ tensorflow = ["safetensors[numpy]", "tensorflow (>=2.11.0)"]
 testing = ["h5py (>=3.7.0)", "huggingface-hub (>=0.12.1)", "hypothesis (>=6.70.2)", "pytest (>=7.2.0)", "pytest-benchmark (>=4.0.0)", "safetensors[numpy]", "setuptools-rust (>=1.5.2)"]
 testingfree = ["huggingface-hub (>=0.12.1)", "hypothesis (>=6.70.2)", "pytest (>=7.2.0)", "pytest-benchmark (>=4.0.0)", "safetensors[numpy]", "setuptools-rust (>=1.5.2)"]
 torch = ["safetensors[numpy]", "torch (>=1.10)"]
+
+[[package]]
+name = "scikit-build-core"
+version = "0.8.2"
+description = "Build backend for CMake based projects"
+optional = true
+python-versions = ">=3.7"
+groups = ["main"]
+markers = "extra == \"qlora\" or extra == \"accel\""
+files = [
+    {file = "scikit_build_core-0.8.2-py3-none-any.whl", hash = "sha256:9c088746b39f6b1dc922dacaa741cf614b539ed86b4339b0971e2335b1fcd249"},
+    {file = "scikit_build_core-0.8.2.tar.gz", hash = "sha256:50ec24b9568c9aa6e27233deeb2978932bc79856212b30575cbfa4049655c436"},
+]
+
+[package.dependencies]
+packaging = ">=20.9"
+
+[package.extras]
+cov = ["pytest-cov[toml]"]
+dev = ["rich"]
+docs = ["furo", "myst-parser (>=0.13)", "pathspec (>=0.10.1)", "pyproject-metadata (>=0.5)", "sphinx (>=7.0,<=7.1.2)", "sphinx-autodoc-typehints", "sphinx-copybutton", "sphinx-inline-tabs", "sphinx-jsonschema"]
+pyproject = ["pathspec (>=0.10.1)", "pyproject-metadata (>=0.5)"]
+test = ["build[virtualenv]", "cattrs (>=22.2.0)", "pathspec (>=0.10.1)", "pybind11", "pyproject-metadata (>=0.5)", "pytest (>=7.0)", "pytest-subprocess (>=1.5)", "setuptools", "virtualenv", "wheel"]
+test-meta = ["hatch-fancy-pypi-readme (>=22.3)", "setuptools-scm"]
+test-numpy = ["numpy (>=1.21.0,<1.22.0) ; python_version == \"3.7\" and platform_python_implementation == \"PyPy\" and sys_platform == \"linux\"", "numpy (>=1.24.0,<1.25.0) ; python_version == \"3.8\" and platform_python_implementation == \"PyPy\"", "numpy (>=1.25.0,<1.26.0) ; python_version == \"3.9\" and platform_python_implementation == \"PyPy\"", "numpy ; python_version < \"3.12\" and platform_python_implementation != \"PyPy\""]
+test-schema = ["fastjsonschema", "validate-pyproject"]
+wheels = ["cmake", "ninja ; sys_platform != \"win32\""]
 
 [[package]]
 name = "scikit-learn"
@@ -4154,9 +4247,10 @@ test = ["big-O", "jaraco.functools", "jaraco.itertools", "jaraco.test", "more_it
 type = ["pytest-mypy"]
 
 [extras]
-qlora = ["bitsandbytes"]
+accel = ["maturin", "pybind11", "scikit-build-core"]
+qlora = ["bitsandbytes", "maturin", "pybind11", "scikit-build-core"]
 
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<3.13"
-content-hash = "c3baa2111f1b85ffbd8266901ad7c1a7e58d033dd4c42addcaf78df6bfc2d50f"
+content-hash = "5d2218ff405e628a23e15e994acb6abae2a83ef0f2cf77ba462d47170d6497f8"

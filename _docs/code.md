@@ -1,4 +1,4 @@
-Help me finish my tasks, I'm on task 8 now, what I need help with is a RAG system. I'll upload a PDF white paper explaining what exactly I want, in this I want you to very carefully look at it with detail. Then I want you to look at the next section of task, and then I want you to implement them. Be sure to read everything so we can have good ground work for the later task and we can finish this everbot strong. 
+Help me finish my tasks, I'm on task 9 now, what I need help with is a RAG system. I'll upload a PDF white paper explaining what exactly I want, in this I want you to very carefully look at it with detail. Then I want you to look at the next section of task, and then I want you to implement them. Be sure to read everything so we can have good ground work for the later task and we can finish this everbot strong. 
 
 What I want is a detail application of what to do, give me everything, all the new files and changes. I want this to be descriptive and work. Also show me the commands to make sure that we finished these task. 
 
@@ -137,17 +137,17 @@ Everabot/
 
 ### 8) “Self-optimization” for speed/RAM (hotspot rewrite path)
 
-* [ ] Add profiling harnesses:
+* [*] Add profiling harnesses:
 
 * Python **py-spy** sampling during `learn`/`build` runs. Store flamegraphs in `snapshots/profiles/`. ([GitHub][17])
 
-* [ ] If a hotspot is found, support drop-in rewrites behind stable interfaces:
+* [*] If a hotspot is found, support drop-in rewrites behind stable interfaces:
 
 * **C/C++** via `pybind11`. ([pybind11.readthedocs.io][18])
 * **Rust** via `PyO3` + `maturin`. ([pyo3.rs][19])
 * **Go** microservice or cgo bridge if needed. ([Go Packages][20])
 
-* [ ] Always A/B the rewritten module on perf+memory, plus **functional equivalence tests** (same I/O) before enabling.
+* [*] Always A/B the rewritten module on perf+memory, plus **functional equivalence tests** (same I/O) before enabling.
 
 ---
 
@@ -176,7 +176,6 @@ Everabot/
 * [ ] **Math**: GSM8K + unit tests for step-by-step solutions; verifier scoring. ([arXiv][5])
 * [ ] **Knowledge**: MMLU (subset first), track macro-average. ([arXiv][4])
 * [ ] **Commonsense**: HellaSwag; annotate the benchmark’s caveats in logs. ([arXiv][6])
-* [ ] **Code**: HumanEval (pass@k). ([arXiv][7])
 * [ ] **Your Turing-style tests**: fixture prompts with rubric scoring (fluency/consistency/safety).
 
 ---
@@ -240,17 +239,6 @@ Everabot/
 **Milestone E — RAG Refactor**
 
 * [ ] Migrate the RAG store (e.g., new encoding); pass **100% equivalence** (hash+top-k) before switching; old and new both snapshot-reconstructable with VCDIFF. ([IETF Datatracker][9])
-
-```
-
-seed_urls.yaml
-```yaml
-version: 1
-seeds:
-  - https://arxiv.org/pdf/2510.04618        # ACE
-  - https://arxiv.org/pdf/2303.11366        # Reflexion
-  - https://arxiv.org/pdf/2005.11401        # RAG (Lewis et al.)
-  - https://datatracker.ietf.org/doc/html/rfc3284  # VCDIFF (HTML canonical)
 
 ```
 
@@ -548,6 +536,7 @@ bot so far:
 cli.py:
 ```python
 from __future__ import annotations
+import os
 import typer, sys, pathlib, subprocess, json
 from rich import print
 from bot.security.guard import install_guard
@@ -562,6 +551,8 @@ rag_app = typer.Typer(help="RAG substrate commands")
 app.add_typer(rag_app, name="rag")
 llm_app = typer.Typer(help="LLM backends utilities")
 app.add_typer(llm_app, name="llm")
+opt_app = typer.Typer(help="Optimization & profiling tools")
+app.add_typer(opt_app, name="opt")
 
 _ROOT = get_project_root()
 _PROTECTED_DIRS = {str(_ROOT / "ruleset"), str(_ROOT / "test")}
@@ -626,6 +617,165 @@ def train(
                   lr=lr, lora_r=r, lora_alpha=alpha, lora_dropout=dropout, qlora=bool(qlora))
     print("[cyan]train[/cyan] complete")
     raise typer.Exit(code=code)
+
+# ---------- opt: profile / build-accel / AB ----------
+@opt_app.command("profile")
+def opt_profile(
+    mode: str = typer.Argument(..., help="learn|build|train|self-improve"),
+    arg: str  = typer.Argument(..., help="topic/goal (passed to subcommand)"),
+    duration: int = typer.Option(60, help="Seconds to record"),
+    rate: int = typer.Option(100, help="Sampling Hz"),
+    label: str = typer.Option(None, help="Label in SVG filename"),
+    attach: bool = typer.Option(False, help="Force attach-by-PID (advanced)"),
+    pyspy_exe: Optional[str] = typer.Option(
+        None, help="Path to py-spy (or py-spy.exe) if not on PATH / to override Conda build"
+    ),
+    pyspy_python: Optional[str] = typer.Option(
+        None,
+        help="On Windows, path to a python.org interpreter for py-spy to launch (e.g. C:\\\\Users\\\\you\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python311\\\\python.exe).",
+    ),
+):
+    """
+    Profile a run with py-spy and save SVG under snapshots/profiles/.
+    Uses short flags for compatibility; on Windows will retry via a clean interpreter if needed.
+    """
+    from bot.profiling.pyspy_harness import record_child, record_exec
+    out_dir = _ROOT / "snapshots" / "profiles"; out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, "-m", "bot.cli", mode, arg]
+
+    try:
+        if os.name == "nt" and not attach:
+            out = record_exec(
+                cmd, out_dir, label or mode, duration, rate,
+                pyspy_exe=pyspy_exe, pyspy_python=pyspy_python
+            )
+        else:
+            out = record_child(
+                cmd, out_dir, label or mode, duration, rate,
+                pyspy_exe=pyspy_exe
+            )
+        print(out)
+    except Exception as e:
+        print("[red]py-spy profiling failed[/red]")
+        # Helpful hints shown only on failure
+        print(str(e))
+        print("\n[dim]Hints:[/dim]")
+        print(" • Try installing the official py-spy (pipx/pip) instead of a Conda build.")
+        print(" • On Windows, pass --pyspy-python to a python.org interpreter.")
+        print(' • Self-test example (avoid pure sleep which has no Python frames):')
+        print('   py-spy record -d 2 -f flamegraph -o test.svg -- python -c "import time; t=time.time()+2\nwhile time.time()<t: pass"')
+        raise typer.Exit(code=1)
+
+@opt_app.command("build-accel")
+def opt_build_accel(
+    target: str = typer.Option("chunk-cpp", help="chunk-cpp|chunk-rust"),
+):
+    """
+    Build an optional accelerator. Kept off by default; see A/B to enable safely.
+    """
+    import subprocess, sys, pathlib
+    if target == "chunk-cpp":
+        pkg_dir = pathlib.Path("bot/accel/cpp")
+        cmd = [sys.executable, "-m", "pip", "install", "-v", "--no-build-isolation", str(pkg_dir)]
+    elif target == "chunk-rust":
+        pkg_dir = pathlib.Path("bot/accel/rust")
+        cmd = [sys.executable, "-m", "maturin", "develop", "--release", "-m", str(pkg_dir/"pyproject.toml")]
+    else:
+        raise typer.BadParameter("Unknown target")
+    subprocess.check_call(cmd)
+    print(f"[green]Built[/green] accelerator: {target}")
+
+@opt_app.command("ab-chunk")
+def opt_ab_chunk(
+    store: str = typer.Option(None, help="If provided, sample texts from snapshots/rag/<store>"),
+    n: int = typer.Option(5000, help="Num sentences to chunk (approx)"),
+    chunk_tokens: int = typer.Option(400),
+    overlap_tokens: int = typer.Option(60),
+    impl: str = typer.Option("auto", help="python|cpp|rust|go|auto"),
+):
+    """
+    A/B + equivalence for accelerated chunker vs Python spec.
+    """
+    import time, json, pyarrow.parquet as pq, pathlib, random, tracemalloc, psutil, os
+    from bot.rag.chunk_spec import chunk_text_equiv as py_spec
+
+    def time_and_mem(fn):
+        proc = psutil.Process()
+        rss0 = proc.memory_info().rss
+        tracemalloc.start()
+        t0 = time.perf_counter()
+        out = fn()
+        t1 = time.perf_counter()
+        cur, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        rss1 = proc.memory_info().rss
+        return out, (t1 - t0), {"rss_delta": int(rss1 - rss0), "py_peak_bytes": int(peak)}
+
+    # texts
+    texts = []
+    if store:
+        sdir = pathlib.Path("snapshots/rag") / store
+        tab = pq.read_table(sdir / "chunks.parquet")
+        pool = [tab["text"][i].as_py() for i in range(tab.num_rows)]
+        random.shuffle(pool)
+        texts = pool[:min(len(pool), n)]
+    else:
+        base = "RAG speeds up retrieval by chunking documents into overlapping windows. "
+        texts = [base * 20 for _ in range(n)]
+
+    # baseline (Python spec)
+    def run_py():
+        return [py_spec("doc", t, chunk_tokens, overlap_tokens) for t in texts]
+    py_out, py_sec, py_mem = time_and_mem(run_py)
+
+    # accelerator selection
+    accel_impl = impl
+    out_accel = None
+    if impl in ("auto", "cpp"):
+        try:
+            import everabot_chunk_cpp as cpp
+            def run_cpp():
+                return [cpp.chunk_text_equiv("doc", t, chunk_tokens, overlap_tokens) for t in texts]
+            out_accel, accel_sec, accel_mem = time_and_mem(run_cpp)
+            accel_impl = "cpp"
+        except Exception:
+            if impl == "cpp":
+                raise
+    if out_accel is None and impl in ("auto", "rust"):
+        try:
+            import everabot_chunk_rust as r
+            def run_rust():
+                return [r.chunk_text_equiv("doc", t, chunk_tokens, overlap_tokens) for t in texts]
+            out_accel, accel_sec, accel_mem = time_and_mem(run_rust)
+            accel_impl = "rust"
+        except Exception:
+            if impl == "rust":
+                raise
+    if out_accel is None and impl in ("auto", "go"):
+        try:
+            from bot.accel.go.go_client import chunk_text_equiv as go_chunk
+            def run_go():
+                return [go_chunk("doc", t, chunk_tokens, overlap_tokens) for t in texts]
+            out_accel, accel_sec, accel_mem = time_and_mem(run_go)
+            accel_impl = "go"
+        except Exception:
+            if impl == "go":
+                raise
+    if out_accel is None and impl == "auto":
+        accel_impl, accel_sec, accel_mem, out_accel = "python", py_sec, py_mem, py_out
+
+    equivalent = (py_out == out_accel)
+    result = {
+        "equivalent": bool(equivalent),
+        "python_sec": py_sec,
+        "accel_sec": accel_sec,
+        "accel_impl": accel_impl,
+        "speedup_x": (py_sec / accel_sec) if accel_sec > 0 else None,
+        "python_mem": py_mem,
+        "accel_mem": accel_mem,
+    }
+    print(json.dumps(result, indent=2))
+    raise typer.Exit(code=0 if equivalent else 1)
 
 # -------- snapshot subcommands (robust) --------
 snapshot_app = typer.Typer(help="Manage learn/train run snapshots")
@@ -872,7 +1022,11 @@ def rag_export(
     print(f"Exported canonical docs/chunks to {out_dir}")
 
 @rag_app.command("prove-equivalence")
-def rag_prove_equivalence(a: str, b: str, k: int = 5):
+def rag_prove_equivalence(
+    a: str,
+    b: str,
+    k: int = typer.Option(5, "--k", "-k", help="Top-k for equivalence check"),
+):
     """
     Prove both: (1) bitwise canonical equality, (2) top-k equivalence on a frozen query set.
     """
@@ -1030,10 +1184,11 @@ from typing import Dict, Any
 
 from bot.telemetry.tracing import get_tracer
 from bot.paths import get_project_root
-from bot.rules.loader import load_all, topic_allowed, load_last_promoted, pareto_gate
+from bot.rules.loader import load_all, topic_allowed, load_last_promoted, save_last_promoted, pareto_gate
 from bot.governance.budget import BudgetEnforcer
 from bot.core.task_graph import validate_path
 from bot.core.phases import Phase
+from bot.context.ace_delta import compute_delta
 from bot.eval.harness import run_all
 
 # RAG + distill + reflexion imports
@@ -1085,7 +1240,10 @@ class Orchestrator:
 
     def run_learn(self) -> int:
         topic = self.info.topic_or_goal
-
+        # Defensive defaults so later DECIDE/logging never sees unbound vars
+        res: Dict[str, Any] = {}
+        root_ok: bool = False
+ 
         # Gate on allowed topics
         if not topic_allowed(topic, self.rules["topics"]):
             decision = {"promote": False, "reason": f"Topic '{topic}' not allowed by ruleset/topics.yaml."}
@@ -1117,7 +1275,6 @@ class Orchestrator:
                         meta = json.loads((rag_dir / "manifest.json").read_text(encoding="utf-8"))
                     else:
                         # first-time bootstrap from ruleset seeds
-                        from bot.rag.pipeline import ingest
                         meta = ingest(seeds, pinned)
                         # also place a copy into this run’s folder for reproducibility
                         for name in ("docs.jsonl", "chunks.parquet", "embeddings.parquet", "index.faiss", "manifest.json"):
@@ -1152,6 +1309,27 @@ class Orchestrator:
                     with open(outp, "w", encoding="utf-8") as fh:
                         for b in bullets:
                             fh.write(json.dumps(b, ensure_ascii=False) + "\n")
+
+                    # ---- ACE-style delta against last promoted bullets ----
+                    # If we have a previous promoted run, diff its bullets vs. current bullets.
+                    # compute_delta is tolerant: try list-of-bullets; fallback to file paths.
+                    last = load_last_promoted()
+                    prev_list = []
+                    if last and last.get("bullets_file"):
+                        try:
+                            prev_list = list(read_jsonl(pathlib.Path(last["bullets_file"])))
+                        except Exception:
+                            prev_list = []
+                    try:
+                        delta = compute_delta(prev_list, bullets)
+                    except TypeError:
+                        # if your compute_delta expects file paths instead of lists
+                        delta = compute_delta(last.get("bullets_file"), str(outp))
+                    (self.info.snapshot_dir / "bullets.delta.json").write_text(
+                        json.dumps(delta, indent=2), encoding="utf-8"
+                    )
+
+                    # ------------------------------------------------------
                     self._log_phase_result(Phase.DISTILL, {
                         "bullets_file": str(outp), "count": len(bullets),
                         "reflexion_bias": (prior_text[:4000] if prior_text else "")
@@ -1195,18 +1373,46 @@ class Orchestrator:
             # ---------------- DECIDE (Pareto gate) ------------------------------------
             with self.tracer.start_as_current_span("phase.decide"):
                 last = load_last_promoted()
+
                 # KPI: combine bullet density and practice success
                 bc = len(bullets)
                 practice_score = json.loads((self.info.snapshot_dir / "practice.json").read_text())["score"]
                 new_topic_score = min(1.0, 0.5 * (bc / 12.0) + 0.5 * practice_score)
-                promote, reason = pareto_gate(new_topic_score, True, self.rules["promotion"], last)
+
+                # Use actual root_ok from EVAL (no hardcoded True)
+                promote, reason = pareto_gate(new_topic_score, root_ok, self.rules["promotion"], last)
+
+                # Resource-limit violations override promotion
                 if budget.exceeded():
                     promote = False
                     reason = "Rejected: run exceeded configured resource limits."
-                decision = {"promote": promote, "reason": reason, "new_topic_score": new_topic_score}
+
+                decision = {
+                    "promote": promote,
+                    "reason": reason,
+                    "new_topic_score": new_topic_score,
+                    "bullets_count": bc,
+                    "practice_score": practice_score,
+                    "root_ok": root_ok,
+                }
                 self._log_phase_result(Phase.DECIDE, decision)
 
-            # Finalize manifest
+                # Persist the latest promoted metrics for next-run comparison
+                if promote:
+                    save_last_promoted({
+                        "ts": int(time.time()),
+                        "topic": topic,
+                        "new_topic_score": new_topic_score,
+                        "bullets_count": bc,
+                        "practice_score": practice_score,
+                        "root_ok": root_ok,
+                        # helpful breadcrumb to the exact eval artifact we just produced
+                        "root_eval_artifact": res.get("artifact") if res else None,
+                        # <-- add this so next run can compute ACE delta
+                        "bullets_file": str(outp),
+                    })
+
+             # Finalize manifest
             man = self.info.snapshot_dir / "manifest.json"
             m = json.loads(man.read_text(encoding="utf-8"))
             order = [e["phase"] for e in m.get("phases", [])]
@@ -1217,6 +1423,8 @@ class Orchestrator:
                 })
             m = json.loads(man.read_text(encoding="utf-8"))
             m["status"] = "complete"
+            # include the final decision object in the manifest for easy inspection
+            m["decision"] = decision
             man.write_text(json.dumps(m, indent=2), encoding="utf-8")
 
         return 0
@@ -1273,6 +1481,33 @@ def _to_name(p: Union[Phase, str]) -> str:
 
 def validate_path(phases: Sequence[Union[Phase, str]]) -> bool:
     return list(map(_to_name, phases)) == PHASE_ORDER
+
+```
+
+context/ace_delta.py:
+```python
+from __future__ import annotations
+import json, pathlib
+from typing import List, Dict, Any
+
+def _read_bullets(path: pathlib.Path) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not path.exists(): return out
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            try: out.append(json.loads(line))
+            except Exception: continue
+    return out
+
+def compute_delta(prev_file: pathlib.Path, new_bullets: List[Dict[str, Any]]) -> Dict[str, Any]:
+    prev = _read_bullets(prev_file) if prev_file else []
+    prev_set = {b.get("text","").strip() for b in prev}
+    new_set  = {b.get("text","").strip() for b in new_bullets}
+    added    = sorted(x for x in (new_set - prev_set) if x)
+    removed  = sorted(x for x in (prev_set - new_set) if x)
+    unchanged= sorted(new_set & prev_set)
+    return {"added": added, "removed": removed, "unchanged": unchanged,
+            "prev_file": str(prev_file) if prev_file else None}
 
 ```
 
@@ -1390,6 +1625,181 @@ def recent(topic: str, limit: int = 5) -> List[Dict[str, Any]]:
             continue
     return list(reversed(out))
 
+
+```
+
+profiling/pyspy_harness.py:
+```python
+from __future__ import annotations
+import os, sys, subprocess, time, pathlib, textwrap
+from typing import Dict, Any, Optional
+
+
+def _resolve_pyspy(exe_override: Optional[str] = None) -> str:
+    """
+    Pick a py-spy binary, preferring:
+      1) explicit exe_override
+      2) $PYSPY_EXE
+      3) 'py-spy' (or 'py-spy.exe' on Windows)
+    """
+    exe = exe_override or os.environ.get("PYSPY_EXE") or "py-spy"
+    if os.name == "nt" and not exe.lower().endswith(".exe"):
+        exe += ".exe"
+    return exe
+
+
+def _out_svg_path(out_dir: pathlib.Path, label: str) -> pathlib.Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time())
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in (label or "profile"))[:40]
+    return out_dir / f"{ts}_{safe}.svg"
+
+
+def _run(cmd: list[str]) -> subprocess.CompletedProcess:
+    # Keep text capture for nice error surfaces
+    return subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", shell=False
+    )
+
+
+def _write_runner(out_dir: pathlib.Path, argv: list[str]) -> pathlib.Path:
+    """
+    Create a tiny Python script that runs your CLI *in process*.
+    This avoids spawning another Python child that py-spy wouldn't profile.
+    Expects argv like: [<py>, "-m", "bot.cli", <mode>, <arg>]
+    """
+    ts = int(time.time())
+    runner = out_dir / f"_pyspy_runner_{ts}.py"
+
+    # Best-effort parse for '-m <module>' style; fallback to run_path
+    if len(argv) >= 3 and argv[1] == "-m":
+        module = argv[2]
+        passthru = argv[3:]
+        code = f"""
+        import sys, runpy
+        sys.argv = { [module, *passthru]!r }
+        runpy.run_module({module!r}, run_name="__main__")
+        """
+    else:
+        script = argv[1] if len(argv) >= 2 else ""
+        passthru = argv[2:]
+        code = f"""
+        import sys, runpy
+        sys.argv = { [script, *passthru]!r }
+        runpy.run_path({script!r}, run_name="__main__")
+        """
+
+    runner.write_text(textwrap.dedent(code).strip() + "\n", encoding="utf-8")
+    return runner
+
+
+def record_pid(
+    pid: int,
+    out_dir: pathlib.Path,
+    label: str,
+    duration_sec: int = 60,
+    rate_hz: int = 100,
+    pyspy_exe: Optional[str] = None,
+) -> pathlib.Path:
+    """
+    Attach by PID. Often flaky on Windows/Conda; prefer record_exec() there.
+    """
+    svg = _out_svg_path(out_dir, label)
+    cmd = [
+        _resolve_pyspy(pyspy_exe),
+        "record",
+        "-r", str(rate_hz),
+        "-d", str(duration_sec),
+        "-f", "flamegraph",
+        "-o", str(svg),
+        "--pid", str(pid),
+    ]
+    r = _run(cmd)
+    if r.returncode != 0:
+        raise RuntimeError(f"py-spy failed: {r.stderr or r.stdout}")
+    return svg
+
+
+def record_child(
+    argv: list[str],
+    out_dir: pathlib.Path,
+    label: str,
+    duration_sec: int = 60,
+    rate_hz: int = 100,
+    pyspy_exe: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Launch child and attach by PID (nicer on Linux/macOS).
+    For Windows, record_exec() is almost always more reliable.
+    """
+    proc = subprocess.Popen(argv, stdout=sys.stdout, stderr=sys.stderr, shell=False)
+    try:
+        svg = record_pid(proc.pid, out_dir, label, duration_sec, rate_hz, pyspy_exe=pyspy_exe)
+        return {"pid": proc.pid, "flamegraph": str(svg)}
+    finally:
+        proc.wait()
+
+
+def record_exec(
+    argv: list[str],
+    out_dir: pathlib.Path,
+    label: str,
+    duration_sec: int = 60,
+    rate_hz: int = 100,
+    pyspy_exe: Optional[str] = None,
+    pyspy_python: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Run the command *under* py-spy (`py-spy record -- <cmd>`).
+    On Windows, if the first attempt fails, retry via a tiny in-process runner
+    launched by an explicit python.org interpreter (pyspy_python).
+    """
+    svg = _out_svg_path(out_dir, label)
+    base = [
+        _resolve_pyspy(pyspy_exe),
+        "record",
+        "-r", str(rate_hz),
+        "-d", str(duration_sec),
+        "-f", "flamegraph",
+        "-o", str(svg),
+        "--",
+        *argv,
+    ]
+    r = _run(base)
+    if r.returncode == 0:
+        return {"flamegraph": str(svg), "mode": "exec"}
+
+    # Windows-specific, common Conda failure path: try a clean interpreter + runner
+    if os.name == "nt":
+        runner = _write_runner(out_dir, argv)
+        launcher = (
+            pyspy_python
+            or os.environ.get("PYSPY_PYTHON")
+            or sys.executable  # last resort
+        )
+        alt = [
+            _resolve_pyspy(pyspy_exe),
+            "record",
+            "-r", str(rate_hz),
+            "-d", str(duration_sec),
+            "-f", "flamegraph",
+            "-o", str(svg),
+            "--",
+            launcher,
+            str(runner),
+        ]
+        r2 = _run(alt)
+        if r2.returncode == 0:
+            return {"flamegraph": str(svg), "mode": "exec(wrapper)"}
+
+        raise RuntimeError(
+            "py-spy failed on Windows.\n"
+            f"first attempt: {r.stderr or r.stdout}\n\n"
+            f"wrapper retry: {r2.stderr or r2.stdout}"
+        )
+
+    # Non-Windows: just surface the error
+    raise RuntimeError(f"py-spy failed: {r.stderr or r.stdout}")
 
 ```
 
@@ -2145,6 +2555,34 @@ def info() -> dict:
 
 ```
 
+rag/chunk_spec.py
+```python
+from __future__ import annotations
+from typing import List, Tuple
+
+def estimate_tokens(s: str) -> int:
+    n = len(s)
+    return max(1, (n + 3) // 4)  # ~4 chars/token
+
+def chunk_text_equiv(doc_id: str, text: str, chunk_tokens: int, overlap_tokens: int):
+    words = text.split()
+    step = max(1, chunk_tokens - overlap_tokens)
+    out = []
+    i = 0
+    ord_ = 0
+    while i < len(words):
+        end = min(len(words), i + chunk_tokens)
+        if i >= end:
+            break
+        body = " ".join(words[i:end])
+        if body:
+            out.append((f"{doc_id}:{ord_}", ord_, body, estimate_tokens(body)))
+            ord_ += 1
+        i += step
+    return out
+
+```
+
 rag/chunk.py
 ```python
 from __future__ import annotations
@@ -2156,22 +2594,34 @@ def estimate_tokens(s: str) -> int:
     return max(1, math.ceil(len(s) / 4))
 
 def chunk_text(doc_id: str, text: str, chunk_tokens: int = 400, overlap_tokens: int = 60):
-    words = text.split()
-    # map "token" to ~word, stable enough for our caps
-    step = max(1, chunk_tokens - overlap_tokens)
-    chunks = []
-    i = 0
-    ord_ = 0
-    while i < len(words):
-        window = words[i:i+chunk_tokens]
-        if not window: break
-        body = " ".join(window).strip()
-        if body:
-            chunks.append((f"{doc_id}:{ord_}", ord_, body, estimate_tokens(body)))
-            ord_ += 1
-        i += step
-    return chunks
+    from bot.accel.gate import selected_accel
+    accel = selected_accel()
+    if accel == "cpp":
+        try:
+            import everabot_chunk_cpp as m
+            return m.chunk_text_equiv(doc_id, text, chunk_tokens, overlap_tokens)
+        except Exception:
+            pass
+    elif accel == "rust":
+        try:
+            import everabot_chunk_rust as m
+            return m.chunk_text_equiv(doc_id, text, chunk_tokens, overlap_tokens)
+        except Exception:
+            pass
+    elif accel == "go":
+        try:
+            from bot.accel.go_client import chunk_text_equiv as go_chunk
+            return go_chunk(doc_id, text, chunk_tokens, overlap_tokens)
+        except Exception:
+            pass
+    # Fallback to the existing Python implementation you already had:
+    return _your_existing_python_chunker(doc_id, text, chunk_tokens, overlap_tokens)
 
+
+try:
+    from .chunk_spec import chunk_text_equiv as chunk_text_equiv
+except Exception:
+    pass
 ```
 
 rag/embeddings.py
@@ -2890,6 +3340,24 @@ def install_guard(deny_dirs: set[str] | set[os.PathLike]):
 
 ```
 
+selfopt/ab.py:
+```python
+from __future__ import annotations
+import time, psutil, contextlib
+
+@contextlib.contextmanager
+def mem_tracker():
+    import os
+    p = psutil.Process(os.getpid())
+    before = p.memory_info().rss
+    t0 = time.perf_counter()
+    yield
+    dt = time.perf_counter() - t0
+    after = p.memory_info().rss
+    print({"rss_delta_bytes": int(after - before), "elapsed_sec": dt})
+
+```
+
 snapshots/delta.py:
 ```python
 from __future__ import annotations
@@ -3330,84 +3798,419 @@ CMD ["eval"]
 
 pyproject.toml:
 ```toml
-# ---- base ----
-FROM python:3.11-slim
+[tool.poetry]
+name = "everabot"
+version = "0.1.0"
+description = "Everabot — self-evolving, test-gated local agent"
+authors = ["Tyler English <tylerhelamanenglish@gmail.com>"]
+readme = "README.md"
+packages = [{ include = "bot" }]
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    POETRY_VERSION=1.8.3 \
-    POETRY_VIRTUALENVS_CREATE=false \
-    PATH="/home/botuser/.local/bin:/usr/local/bin:${PATH}"
+[tool.poetry.dependencies]
+python = ">=3.11,<3.13"
+typer = {extras = ["all"], version = "^0.17.5"}
+click = "^8.2.1"
+fastembed = "^0.3.0"
+onnxruntime = "^1.18.0"
+rich = "^13.7.1"
+pyarrow = "^17.0.0"
+opentelemetry-api = "^1.27.0"
+opentelemetry-sdk = "^1.27.0"
+pyyaml = "^6.0.2"
+psutil = "^5.9.8"
+numpy = "^2.1.0"
+requests = "^2.32.3"
+beautifulsoup4 = "^4.12.3"
+PyPDF2 = "^3.0.1"
+sentence-transformers = "^3.0.1"
+faiss-cpu = "^1.8.0.post1"
+youtube-transcript-api = "^0.6.2"
+llmlingua = "^0.2.2"
+transformers = "^4.43.1"
+huggingface_hub = "^0.23.2"
 
-# OS deps:
-# - build-essential, cmake, pkg-config: build llama-cpp-python from source
-# - libopenblas-dev: fast CPU via OpenBLAS
-# - libgomp1: OpenMP runtime used by BLAS/others
-# - plus your existing minimal tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl ca-certificates git xdelta3 \
-      build-essential cmake pkg-config libopenblas-dev libgomp1 \
-  && rm -rf /var/lib/apt/lists/*
+datasets = "^2.20.0"
+peft = "^0.12.0"
+accelerate = "^0.34.2"
+rank-bm25 = "^0.2.2"
+rapidfuzz = "^3.9.7"
 
-# Non-root user & workdir
-RUN useradd -ms /bin/bash botuser
-WORKDIR /workspace
+# bitsandbytes is optional; only needed for QLoRA when you have CUDA
+bitsandbytes = { version = "^0.43.3", optional = true }
 
-# Poetry
-RUN pip install --no-cache-dir "poetry==${POETRY_VERSION}"
+py-spy = "^0.3.14"        # external profiler (runtime binary)  
+pybind11 = {version="^2.11.0", optional=true}
+scikit-build-core = {version="^0.8.0", optional=true}
+maturin = {version="^1.5.0", optional=true}   # for Rust lane  
 
-# ---------- layer 1: deps only (fast rebuilds) ----------
-# Only files needed to resolve dependencies
-COPY pyproject.toml poetry.lock* README.md ./
+[tool.poetry.extras]
+qlora = ["bitsandbytes","pybind11", "scikit-build-core", "maturin"]
 
-# Install all deps EXCEPT the 'llamacpp' group (we will build it from source with pip)
-RUN poetry install --without llamacpp --no-root --no-interaction --no-ansi
+# Optional group for llama.cpp wheels
+[tool.poetry.group.llamacpp]
+optional = true
 
-# Build and install llama-cpp-python from source (glibc-native) with OpenBLAS
-# Notes:
-# - CMAKE_ARGS toggles BLAS and native CPU optimizations
-# - pin to a recent known-good; adjust as you like
-ENV CMAKE_ARGS="-DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS -DLLAMA_NATIVE=ON"
-RUN pip install --no-cache-dir --no-binary=:all: "llama-cpp-python==0.3.2"
+[tool.poetry.group.llamacpp.dependencies]
+# Let Poetry pick a compatible prebuilt wheel from the CPU index
+llama-cpp-python = { version = "*", source = "llamacpp-cpu" }
 
-# Sanity check key imports so we fail early if anything is off
-RUN python - <<'PY'
-import importlib, sys
-for mod in ("transformers","llama_cpp"):
-    try:
-        importlib.import_module(mod)
-        print(f"OK: imported {mod}")
-    except Exception as e:
-        print(f"FAILED: import {mod}: {e}", file=sys.stderr)
-        raise
-PY
+# Prebuilt wheel indexes (PEP 503 “simple” repos)
+[[tool.poetry.source]]
+name = "llamacpp-cpu"
+url = "https://abetlen.github.io/llama-cpp-python/whl/cpu"
+priority = "explicit"
 
-# optional: bitsandbytes only if GPU image is used; skip on slim CPU
-# RUN poetry add -E qlora bitsandbytes
+[tool.poetry.scripts]
+everabot = "bot.cli:app"
 
-# ---------- layer 2: app code ----------
-COPY bot/ ./bot/
-COPY ruleset/ ./ruleset/
-COPY test/ ./test/
-
-# Install just your package (no dependency resolution now)
-RUN poetry install --only-root --no-interaction --no-ansi
-
-# Harden & ownership
-RUN chmod -R a-w /workspace/ruleset /workspace/test \
- && chown -R botuser:botuser /workspace
-
-USER botuser
-
-# Lightweight healthcheck – meaningful for long-running modes
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
-  CMD python -m bot.cli --help >/dev/null 2>&1 || exit 1
-
-# CLI entrypoint; subcommands become args
-ENTRYPOINT ["python","-m","bot.cli"]
-CMD ["eval"]
+[build-system]
+requires = ["poetry-core>=1.9.0"]
+build-backend = "poetry.core.masonry.api"
 
 ```
 
+bot/accel/cpp/pyproject.toml:
+```toml
+[build-system]
+requires = ["scikit-build-core>=0.8.0", "pybind11>=2.11.0"]
+build-backend = "scikit_build_core.build"
 
+[project]
+name = "everabot_chunk_cpp"
+version = "0.1.0"
+description = "Everabot C++ accelerator for chunk_text (pybind11)"
+requires-python = ">=3.11"
+dependencies = []
+readme = "README.md"
+
+[tool.scikit-build]
+wheel.expand-macos-universal-tags = true
+
+[tool.scikit-build.cmake]
+minimum-version = "3.18"
+build-type = "Release"
+
+
+```
+
+bot/accel/cpp/CMakeLists.txt:
+```
+cmake_minimum_required(VERSION 3.18)
+project(everabot_chunk_cpp LANGUAGES CXX)
+
+# Recommended with scikit-build-core + pybind11
+set(PYBIND11_FINDPYTHON ON)          # let pybind11 use modern FindPython
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+find_package(pybind11 REQUIRED)
+
+pybind11_add_module(everabot_chunk_cpp src/chunk_ext.cpp)
+
+# ⬅️ This is the crucial bit: put the extension at the wheel root
+install(TARGETS everabot_chunk_cpp LIBRARY DESTINATION .)
+
+```
+
+bot/accel/cpp/src/chunk_ext.cpp:
+```cpp
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <algorithm>
+
+namespace py = pybind11;
+
+// ~4 chars per token, identical to the Python heuristic
+static inline int estimate_tokens(const std::string& s) {
+    const int n = static_cast<int>(s.size());
+    return std::max(1, (n + 3) / 4);
+}
+
+// token length of [i, j) from precomputed prefix sums
+static inline int span_tokens(const std::vector<int>& pref, int i, int j) {
+    return pref[j] - pref[i];
+}
+
+static int est_word_tokens(const std::string& w) { return std::max(1, (int)((int)w.size() + 3) / 4); }
+
+static std::vector<std::tuple<std::string,int,std::string,int>>
+chunk_text_equiv(const std::string& doc_id, const std::string& text, int chunk_tokens, int overlap_tokens) {
+    std::istringstream iss(text);
+    std::vector<std::string> words; for (std::string w; iss >> w; ) words.push_back(std::move(w));
+
+    const int stride = std::max(1, chunk_tokens - overlap_tokens);
+    std::vector<std::tuple<std::string,int,std::string,int>> out;
+
+    int start = 0, ord = 0;
+    while (start < (int)words.size()) {
+        int tok = 0;
+        int end = start;
+        std::ostringstream oss;
+        while (end < (int)words.size() && tok < chunk_tokens) {
+            if (end > start) oss << ' ';
+            oss << words[end];
+            tok += est_word_tokens(words[end]);
+            ++end;
+        }
+        if (start >= end) break;
+        const std::string body = oss.str();
+        if (!body.empty()) {
+            const std::string cid = doc_id + ":" + std::to_string(ord);
+            out.emplace_back(cid, ord, body, std::max(1, (int)((int)body.size() + 3) / 4));
+            ++ord;
+        }
+        // advance by token stride, not words
+        int advanced = 0; int i = start;
+        while (i < end && advanced < stride) { advanced += est_word_tokens(words[i]); ++i; }
+        if (i <= start) i = start + 1;
+        start = i;
+    }
+    return out;
+}
+PYBIND11_MODULE(everabot_chunk_cpp, m) {
+    m.def("chunk_text_equiv", &chunk_text_equiv,
+          py::arg("doc_id"), py::arg("text"),
+          py::arg("chunk_tokens"), py::arg("overlap_tokens"));
+}
+
+```
+
+bot/accel/rust/pyproject.toml:
+```toml
+[build-system]
+requires = ["maturin>=1.5"]
+build-backend = "maturin"
+
+[project]
+name = "everabot_chunk_rust"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+
+```
+
+bot/accel/rust/Cargo.toml:
+```toml
+[package]
+name = "everabot_chunk_rust"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "everabot_chunk_rust"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.21", features = ["extension-module"] }
+
+```
+
+bot/accel/rust/src/lib.rs:
+```rs
+use pyo3::prelude::*;
+
+fn estimate_tokens(s: &str) -> i32 {
+    let n = s.len();
+    std::cmp::max(1, ((n as i32) + 3) / 4)
+}
+fn est_word_tokens(w: &str) -> i32 { std::cmp::max(1, ((w.len() as i32) + 3) / 4) }
+
+#[pyfunction]
+fn chunk_text_equiv(doc_id: &str, text: &str, chunk_tokens: i32, overlap_tokens: i32)
+    -> Vec<(String, i32, String, i32)> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let stride = std::cmp::max(1, chunk_tokens - overlap_tokens);
+    let mut out = Vec::new();
+    let mut start: usize = 0;
+    let mut ord: i32 = 0;
+
+    while start < words.len() {
+        let mut tok = 0;
+        let mut end = start;
+        while end < words.len() && tok < chunk_tokens {
+            tok += est_word_tokens(words[end]);
+            end += 1;
+        }
+        if start >= end { break; }
+        let body = words[start..end].join(" ");
+        if !body.is_empty() {
+            out.push((format!("{}:{}", doc_id, ord), ord, body.clone(),
+                std::cmp::max(1, ((body.len() as i32) + 3) / 4)));
+            ord += 1;
+        }
+        // advance by token stride
+        let mut advanced = 0;
+        let mut i = start;
+        while i < end && advanced < stride {
+            advanced += est_word_tokens(words[i]);
+            i += 1;
+        }
+        if i <= start { i = start + 1; }
+        start = i;
+    }
+    out
+}
+#[pymodule]
+fn everabot_chunk_rust(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(chunk_text_equiv, m)?)?;
+    Ok(())
+}
+
+```
+
+accel/gate.py:
+```python
+import os
+
+def selected_accel() -> str | None:
+    v = os.environ.get("EVERABOT_CHUNK_ACCEL", "").strip().lower()
+    return v if v in ("cpp", "rust", "go") else None
+
+def require_equiv() -> bool:
+    return os.environ.get("EVERABOT_CHUNK_REQUIRE_EQUIV", "1") == "1"
+
+```
+
+accel/go/go_client.py:
+```python
+from __future__ import annotations
+import os
+import json, urllib.request
+
+BASE = "http://127.0.0.1:8765"  # override with EVERABOT_GO_CHUNK_URL
+
+def chunk_text_equiv(doc_id: str, text: str, chunk_tokens: int, overlap_tokens: int):
+    url = (os.environ.get("EVERABOT_GO_CHUNK_URL") or BASE).rstrip("/") + "/chunk"
+    payload = {
+        "doc_id": doc_id, "text": text,
+        "chunk_tokens": int(chunk_tokens),
+        "overlap_tokens": int(overlap_tokens),
+    }
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        arr = json.loads(resp.read().decode("utf-8"))
+        # Return the same tuple shape used elsewhere
+        return [(x["chunk_id"], x["ord"], x["body"], x["tokens"]) for x in arr]
+
+```
+
+accel/go/go.mod:
+```mod
+module everabot/chunker
+
+go 1.22
+
+```
+
+accel/go/cmd/chunker/main.go:
+```go
+package main
+
+import (
+	"encoding/json"
+	chunker "everabot/chunker/chunker"
+	"log"
+	"net/http"
+	"os"
+	"time"
+)
+
+func main() {
+	addr := ":8765"
+	if v := os.Getenv("EVERABOT_GO_CHUNK_ADDR"); v != "" {
+		addr = v
+	}
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("POST /chunk", func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var req chunker.Req
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		ch := chunker.ChunkTextEquiv(req)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ch)
+	})
+
+	s := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	log.Printf("everabot-chunk-go listening on %s", addr)
+	log.Fatal(s.ListenAndServe())
+}
+
+```
+
+accel/go/chunker/chunk.go:
+```go
+package chunker
+
+import (
+	"strings"
+	"strconv"
+)
+
+type Req struct {
+	DocID         string `json:"doc_id"`
+	Text          string `json:"text"`
+	ChunkTokens   int    `json:"chunk_tokens"`
+	OverlapTokens int    `json:"overlap_tokens"`
+}
+
+type Chunk struct {
+	ChunkID string `json:"chunk_id"`
+	Ord     int    `json:"ord"`
+	Body    string `json:"body"`
+	Tokens  int    `json:"tokens"`
+}
+
+func estimateTokens(s string) int {
+	n := len(s)
+	t := (n + 3) / 4
+	if t < 1 {
+		return 1
+	}
+	return t
+}
+
+func ChunkTextEquiv(req Req) []Chunk {
+	words := strings.Fields(req.Text)
+	step := req.ChunkTokens - req.OverlapTokens
+	if step < 1 {
+		step = 1
+	}
+	var out []Chunk
+	i := 0
+	ord := 0
+	for i < len(words) {
+		end := i + req.ChunkTokens
+		if end > len(words) {
+			end = len(words)
+		}
+		if i >= end {
+			break
+		}
+		body := strings.Join(words[i:end], " ")
+		if len(body) > 0 {
+			out = append(out, Chunk{
+				ChunkID: req.DocID + ":" + strconv.Itoa(ord),
+				Ord:     ord,
+				Body:    body,
+				Tokens:  estimateTokens(body),
+			})
+			ord++
+		}
+		i += step
+	}
+	return out
+}
+
+```

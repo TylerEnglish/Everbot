@@ -10,32 +10,20 @@ $env:EVERABOT_OLLAMA_MODEL='llama3'
 poetry run everabot eval
 
 
-docker run --rm -it `
-  -e EVERABOT_LLM=transformers `
-  -e EVERABOT_TRANSFORMERS_MODEL=distilgpt2 `
-  everabot:cpu llm selftest --prompt "Say exactly: OK"
+# 1) Apply the C++ token-aware patch and rebuild
+poetry run pip uninstall -y everabot_chunk_cpp
+poetry run pip install -v --no-build-isolation bot/accel/cpp
 
+# 2) Re-check A/B (bigger input)
+poetry run everabot opt ab-chunk --store v1 --n 20000 --chunk-tokens 400 --overlap-tokens 60
 
-docker run --rm -it `
-  --cpus 4 --memory 8g `
-  -e EVERABOT_LLM=transformers `
-  -e EVERABOT_TRANSFORMERS_MODEL=distilgpt2 `
-  everabot:cpu eval
+# 3) (Optional) Unpin py-spy and update
+poetry update py-spy
 
-
-docker run --rm -it `
-  --cpus 4 --memory 8g `
-  -v C:\models:/models `
-  -v $PWD\snapshots:/workspace/snapshots `
-  -e EVERABOT_LLM=llama_cpp `
-  -e EVERABOT_LLAMA_PATH=/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf `
-  everabot:cpu llm selftest --prompt "Say exactly: OK"
-
-
-docker run -d --name everabot `
-  -v $PWD\snapshots:/workspace/snapshots `
-  -e EVERABOT_LLM=transformers -e EVERABOT_TRANSFORMERS_MODEL=distilgpt2 `
-  everabot:cpu
-
-docker inspect --format='{{.State.Health.Status}}' everabot
-# expect: healthy
+# 4) Finish Rust toolchain + build Rust accel
+rustup toolchain install stable-x86_64-pc-windows-msvc
+rustup default stable-x86_64-pc-windows-msvc
+# new PowerShell…
+rustc --version
+poetry run python -m pip install -U maturin
+poetry run python -m maturin develop --release -m bot/accel/rust/pyproject.toml

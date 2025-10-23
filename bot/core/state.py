@@ -8,6 +8,7 @@ from bot.rules.loader import load_all, topic_allowed, load_last_promoted, save_l
 from bot.governance.budget import BudgetEnforcer
 from bot.core.task_graph import validate_path
 from bot.core.phases import Phase
+from bot.context.ace_delta import compute_delta
 from bot.eval.harness import run_all
 
 # RAG + distill + reflexion imports
@@ -59,7 +60,10 @@ class Orchestrator:
 
     def run_learn(self) -> int:
         topic = self.info.topic_or_goal
-
+        # Defensive defaults so later DECIDE/logging never sees unbound vars
+        res: Dict[str, Any] = {}
+        root_ok: bool = False
+ 
         # Gate on allowed topics
         if not topic_allowed(topic, self.rules["topics"]):
             decision = {"promote": False, "reason": f"Topic '{topic}' not allowed by ruleset/topics.yaml."}
@@ -91,7 +95,6 @@ class Orchestrator:
                         meta = json.loads((rag_dir / "manifest.json").read_text(encoding="utf-8"))
                     else:
                         # first-time bootstrap from ruleset seeds
-                        from bot.rag.pipeline import ingest
                         meta = ingest(seeds, pinned)
                         # also place a copy into this run’s folder for reproducibility
                         for name in ("docs.jsonl", "chunks.parquet", "embeddings.parquet", "index.faiss", "manifest.json"):
@@ -126,6 +129,27 @@ class Orchestrator:
                     with open(outp, "w", encoding="utf-8") as fh:
                         for b in bullets:
                             fh.write(json.dumps(b, ensure_ascii=False) + "\n")
+
+                    # ---- ACE-style delta against last promoted bullets ----
+                    # If we have a previous promoted run, diff its bullets vs. current bullets.
+                    # compute_delta is tolerant: try list-of-bullets; fallback to file paths.
+                    last = load_last_promoted()
+                    prev_list = []
+                    if last and last.get("bullets_file"):
+                        try:
+                            prev_list = list(read_jsonl(pathlib.Path(last["bullets_file"])))
+                        except Exception:
+                            prev_list = []
+                    try:
+                        delta = compute_delta(prev_list, bullets)
+                    except TypeError:
+                        # if your compute_delta expects file paths instead of lists
+                        delta = compute_delta(last.get("bullets_file"), str(outp))
+                    (self.info.snapshot_dir / "bullets.delta.json").write_text(
+                        json.dumps(delta, indent=2), encoding="utf-8"
+                    )
+
+                    # ------------------------------------------------------
                     self._log_phase_result(Phase.DISTILL, {
                         "bullets_file": str(outp), "count": len(bullets),
                         "reflexion_bias": (prior_text[:4000] if prior_text else "")
@@ -203,7 +227,9 @@ class Orchestrator:
                         "practice_score": practice_score,
                         "root_ok": root_ok,
                         # helpful breadcrumb to the exact eval artifact we just produced
-                        "root_eval_artifact": res.get("artifact"),
+                        "root_eval_artifact": res.get("artifact") if res else None,
+                        # <-- add this so next run can compute ACE delta
+                        "bullets_file": str(outp),
                     })
 
              # Finalize manifest

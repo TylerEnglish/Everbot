@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import typer, sys, pathlib, subprocess, json
 from rich import print
 from bot.security.guard import install_guard
@@ -13,6 +14,8 @@ rag_app = typer.Typer(help="RAG substrate commands")
 app.add_typer(rag_app, name="rag")
 llm_app = typer.Typer(help="LLM backends utilities")
 app.add_typer(llm_app, name="llm")
+opt_app = typer.Typer(help="Optimization & profiling tools")
+app.add_typer(opt_app, name="opt")
 
 _ROOT = get_project_root()
 _PROTECTED_DIRS = {str(_ROOT / "ruleset"), str(_ROOT / "test")}
@@ -77,6 +80,165 @@ def train(
                   lr=lr, lora_r=r, lora_alpha=alpha, lora_dropout=dropout, qlora=bool(qlora))
     print("[cyan]train[/cyan] complete")
     raise typer.Exit(code=code)
+
+# ---------- opt: profile / build-accel / AB ----------
+@opt_app.command("profile")
+def opt_profile(
+    mode: str = typer.Argument(..., help="learn|build|train|self-improve"),
+    arg: str  = typer.Argument(..., help="topic/goal (passed to subcommand)"),
+    duration: int = typer.Option(60, help="Seconds to record"),
+    rate: int = typer.Option(100, help="Sampling Hz"),
+    label: str = typer.Option(None, help="Label in SVG filename"),
+    attach: bool = typer.Option(False, help="Force attach-by-PID (advanced)"),
+    pyspy_exe: Optional[str] = typer.Option(
+        None, help="Path to py-spy (or py-spy.exe) if not on PATH / to override Conda build"
+    ),
+    pyspy_python: Optional[str] = typer.Option(
+        None,
+        help="On Windows, path to a python.org interpreter for py-spy to launch (e.g. C:\\\\Users\\\\you\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python311\\\\python.exe).",
+    ),
+):
+    """
+    Profile a run with py-spy and save SVG under snapshots/profiles/.
+    Uses short flags for compatibility; on Windows will retry via a clean interpreter if needed.
+    """
+    from bot.profiling.pyspy_harness import record_child, record_exec
+    out_dir = _ROOT / "snapshots" / "profiles"; out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, "-m", "bot.cli", mode, arg]
+
+    try:
+        if os.name == "nt" and not attach:
+            out = record_exec(
+                cmd, out_dir, label or mode, duration, rate,
+                pyspy_exe=pyspy_exe, pyspy_python=pyspy_python
+            )
+        else:
+            out = record_child(
+                cmd, out_dir, label or mode, duration, rate,
+                pyspy_exe=pyspy_exe
+            )
+        print(out)
+    except Exception as e:
+        print("[red]py-spy profiling failed[/red]")
+        # Helpful hints shown only on failure
+        print(str(e))
+        print("\n[dim]Hints:[/dim]")
+        print(" • Try installing the official py-spy (pipx/pip) instead of a Conda build.")
+        print(" • On Windows, pass --pyspy-python to a python.org interpreter.")
+        print(' • Self-test example (avoid pure sleep which has no Python frames):')
+        print('   py-spy record -d 2 -f flamegraph -o test.svg -- python -c "import time; t=time.time()+2\nwhile time.time()<t: pass"')
+        raise typer.Exit(code=1)
+
+@opt_app.command("build-accel")
+def opt_build_accel(
+    target: str = typer.Option("chunk-cpp", help="chunk-cpp|chunk-rust"),
+):
+    """
+    Build an optional accelerator. Kept off by default; see A/B to enable safely.
+    """
+    import subprocess, sys, pathlib
+    if target == "chunk-cpp":
+        pkg_dir = pathlib.Path("bot/accel/cpp")
+        cmd = [sys.executable, "-m", "pip", "install", "-v", "--no-build-isolation", str(pkg_dir)]
+    elif target == "chunk-rust":
+        pkg_dir = pathlib.Path("bot/accel/rust")
+        cmd = [sys.executable, "-m", "maturin", "develop", "--release", "-m", str(pkg_dir/"pyproject.toml")]
+    else:
+        raise typer.BadParameter("Unknown target")
+    subprocess.check_call(cmd)
+    print(f"[green]Built[/green] accelerator: {target}")
+
+@opt_app.command("ab-chunk")
+def opt_ab_chunk(
+    store: str = typer.Option(None, help="If provided, sample texts from snapshots/rag/<store>"),
+    n: int = typer.Option(5000, help="Num sentences to chunk (approx)"),
+    chunk_tokens: int = typer.Option(400),
+    overlap_tokens: int = typer.Option(60),
+    impl: str = typer.Option("auto", help="python|cpp|rust|go|auto"),
+):
+    """
+    A/B + equivalence for accelerated chunker vs Python spec.
+    """
+    import time, json, pyarrow.parquet as pq, pathlib, random, tracemalloc, psutil, os
+    from bot.rag.chunk_spec import chunk_text_equiv as py_spec
+
+    def time_and_mem(fn):
+        proc = psutil.Process()
+        rss0 = proc.memory_info().rss
+        tracemalloc.start()
+        t0 = time.perf_counter()
+        out = fn()
+        t1 = time.perf_counter()
+        cur, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        rss1 = proc.memory_info().rss
+        return out, (t1 - t0), {"rss_delta": int(rss1 - rss0), "py_peak_bytes": int(peak)}
+
+    # texts
+    texts = []
+    if store:
+        sdir = pathlib.Path("snapshots/rag") / store
+        tab = pq.read_table(sdir / "chunks.parquet")
+        pool = [tab["text"][i].as_py() for i in range(tab.num_rows)]
+        random.shuffle(pool)
+        texts = pool[:min(len(pool), n)]
+    else:
+        base = "RAG speeds up retrieval by chunking documents into overlapping windows. "
+        texts = [base * 20 for _ in range(n)]
+
+    # baseline (Python spec)
+    def run_py():
+        return [py_spec("doc", t, chunk_tokens, overlap_tokens) for t in texts]
+    py_out, py_sec, py_mem = time_and_mem(run_py)
+
+    # accelerator selection
+    accel_impl = "python"
+    out_accel, accel_sec, accel_mem = py_out, py_sec, py_mem
+    if impl in ("auto", "cpp"):
+        try:
+            import everabot_chunk_cpp as cpp
+            def run_cpp():
+                return [cpp.chunk_text_equiv("doc", t, chunk_tokens, overlap_tokens) for t in texts]
+            out_accel, accel_sec, accel_mem = time_and_mem(run_cpp)
+            accel_impl = "cpp"
+        except Exception:
+            if impl == "cpp":
+                raise
+    if out_accel is None and impl in ("auto", "rust"):
+        try:
+            import everabot_chunk_rust as r
+            def run_rust():
+                return [r.chunk_text_equiv("doc", t, chunk_tokens, overlap_tokens) for t in texts]
+            out_accel, accel_sec, accel_mem = time_and_mem(run_rust)
+            accel_impl = "rust"
+        except Exception:
+            if impl == "rust":
+                raise
+    if out_accel is None and impl in ("auto", "go"):
+        try:
+            from bot.accel.go.go_client import chunk_text_equiv as go_chunk
+            def run_go():
+                return [go_chunk("doc", t, chunk_tokens, overlap_tokens) for t in texts]
+            out_accel, accel_sec, accel_mem = time_and_mem(run_go)
+            accel_impl = "go"
+        except Exception:
+            if impl == "go":
+                raise
+    if out_accel is None and impl == "auto":
+        accel_impl, accel_sec, accel_mem, out_accel = "python", py_sec, py_mem, py_out
+
+    equivalent = (py_out == out_accel)
+    result = {
+        "equivalent": bool(equivalent),
+        "python_sec": py_sec,
+        "accel_sec": accel_sec,
+        "accel_impl": accel_impl,
+        "speedup_x": (py_sec / accel_sec) if accel_sec > 0 else None,
+        "python_mem": py_mem,
+        "accel_mem": accel_mem,
+    }
+    print(json.dumps(result, indent=2))
+    raise typer.Exit(code=0 if equivalent else 1)
 
 # -------- snapshot subcommands (robust) --------
 snapshot_app = typer.Typer(help="Manage learn/train run snapshots")
@@ -323,7 +485,11 @@ def rag_export(
     print(f"Exported canonical docs/chunks to {out_dir}")
 
 @rag_app.command("prove-equivalence")
-def rag_prove_equivalence(a: str, b: str, k: int = 5):
+def rag_prove_equivalence(
+    a: str,
+    b: str,
+    k: int = typer.Option(5, "--k", "-k", help="Top-k for equivalence check"),
+):
     """
     Prove both: (1) bitwise canonical equality, (2) top-k equivalence on a frozen query set.
     """
