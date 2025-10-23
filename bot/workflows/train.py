@@ -1,6 +1,9 @@
 from __future__ import annotations
-from bot.core.state import Orchestrator
+from bot.train.peft import TrainConfig, train_adapter
 
-def run() -> int:
-    orch = Orchestrator(run_type="train", topic="train")
-    return orch.run_train()
+def run(**kwargs) -> int:
+    cfg = TrainConfig(**kwargs) if kwargs else TrainConfig()
+    res = train_adapter(cfg)
+    print(f"[train] adapter -> {res['out_dir']}")
+    print(f"[train] decision -> {res['decision']}")
+    return 0

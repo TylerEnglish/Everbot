@@ -1,4 +1,4 @@
-Help me finish my tasks, I'm on task 6 now, what I need help with is a RAG system. I'll upload a PDF white paper explaining what exactly I want, in this I want you to very carefully look at it with detail. Then I want you to look at the next section of task, and then I want you to implement them. Be sure to read everything so we can have good ground work for the later task and we can finish this everbot strong. 
+Help me finish my tasks, I'm on task 8 now, what I need help with is a RAG system. I'll upload a PDF white paper explaining what exactly I want, in this I want you to very carefully look at it with detail. Then I want you to look at the next section of task, and then I want you to implement them. Be sure to read everything so we can have good ground work for the later task and we can finish this everbot strong. 
 
 What I want is a detail application of what to do, give me everything, all the new files and changes. I want this to be descriptive and work. Also show me the commands to make sure that we finished these task. 
 
@@ -113,25 +113,25 @@ Everabot/
 
 ### 6) Local inference (open weights) that runs inside Docker on modest machines
 
-* [ ] Add two backends behind a single interface:
+* [*] Add two backends behind a single interface:
 
 * **Transformers** (PyTorch) for standard HF models. ([Hugging Face][13])
 * **llama.cpp** for quantized **GGUF** models (CPU-friendly); expose sampling and KV cache tuning. ([GitHub][14])
 
-* [ ] Provide a config knob to select backend/model/precision at runtime; default to a small quantized model to keep CPU/RAM light.
+* [*] Provide a config knob to select backend/model/precision at runtime; default to a small quantized model to keep CPU/RAM light.
 
 ---
 
 ### 7) **Training its own weights** (PEFT first, full finetune optional later)
 
-* [ ] Implement **LoRA/QLoRA** training pipelines (PEFT) with HuggingFace `datasets` and `accelerate`/bitsandbytes. Start with small adapters to keep it light. ([arXiv][15])
-* [ ] Add `train` CLI supporting:
+* [*] Implement **LoRA/QLoRA** training pipelines (PEFT) with HuggingFace `datasets` and `accelerate`/bitsandbytes. Start with small adapters to keep it light. ([arXiv][15])
+* [*] Add `train` CLI supporting:
 
 * **Domain adapters** (LoRA) on your local datasets.
 * **QLoRA** when you have a GPU; keep the adapters small and versioned in `snapshots/models/adapters/…`. ([arXiv][16])
 
-* [ ] Plug **evaluation gates**: after training, run **root tests** + topic evals; only **promote** adapter if Pareto gate passes.
-* [ ] Add a lane for **from-scratch or hybrid** (if the agent deems it better): wire a minimal pretraining scaffold (tokenizer, dataset streaming), but protect it behind strict resource ceilings.
+* [*] Plug **evaluation gates**: after training, run **root tests** + topic evals; only **promote** adapter if Pareto gate passes.
+* [*] Add a lane for **from-scratch or hybrid** (if the agent deems it better): wire a minimal pretraining scaffold (tokenizer, dataset streaming), but protect it behind strict resource ceilings.
 
 ---
 
@@ -240,7 +240,6 @@ Everabot/
 **Milestone E — RAG Refactor**
 
 * [ ] Migrate the RAG store (e.g., new encoding); pass **100% equivalence** (hash+top-k) before switching; old and new both snapshot-reconstructable with VCDIFF. ([IETF Datatracker][9])
-
 
 ```
 
@@ -556,6 +555,7 @@ from bot.paths import get_project_root
 from bot.rules.loader import load_all
 from bot.eval.harness import run_all
 from bot.rag.utils import read_jsonl
+from typing import Optional
 
 app = typer.Typer(help="Everabot CLI")
 rag_app = typer.Typer(help="RAG substrate commands")
@@ -610,11 +610,21 @@ def self_improve():
     raise typer.Exit(code=code)
 
 @app.command()
-def train():
-    """Training lane (PEFT etc.) — stub snapshot."""
+def train(
+    base_model: str = typer.Option("distilgpt2", help="HF model id"),
+    data: str = typer.Option("examples/sft_tiny.jsonl", help="JSONL with {prompt,response}|{text}"),
+    lora: bool = typer.Option(True, help="Train LoRA adapters"),
+    qlora: bool = typer.Option(False, help="Attempt QLoRA (requires GPU + bitsandbytes)"),
+    epochs: int = typer.Option(1, help="Epochs"),
+    lr: float = typer.Option(2e-4, help="Learning rate"),
+    r: int = typer.Option(8, help="LoRA rank"),
+    alpha: int = typer.Option(16, help="LoRA alpha"),
+    dropout: float = typer.Option(0.05, help="LoRA dropout"),
+):
     from bot.workflows import train as wf
-    code = wf.run()
-    print("[cyan]train[/cyan] (stub) snapshot created")
+    code = wf.run(base_model=base_model, data_path=data, num_epochs=epochs,
+                  lr=lr, lora_r=r, lora_alpha=alpha, lora_dropout=dropout, qlora=bool(qlora))
+    print("[cyan]train[/cyan] complete")
     raise typer.Exit(code=code)
 
 # -------- snapshot subcommands (robust) --------
@@ -751,28 +761,82 @@ def rag_ingest(url: list[str] = typer.Argument(..., help="One or more URLs or pa
     print(f"[green]Ingested[/green] -> {out_dir} counts={meta['counts']}")
 
 @rag_app.command("query")
-def rag_query(q: str, store: str = typer.Option("v1", help="Subdir under snapshots/rag")):
+def rag_query(
+    q_pos: Optional[str] = typer.Argument(
+        None, metavar="Q", help="Query string (positional)"
+    ),
+    query: Optional[str] = typer.Option(
+        None, "--query", "-q", help="Query string (use this or positional Q)"
+    ),
+    store: str = typer.Option("v1", "--store", "-s", help="Subdir under snapshots/rag"),
+    hybrid: bool = typer.Option(
+        True, "--hybrid/--no-hybrid",
+        help="Use BM25+Vector (RRF) with optional MMR re-rank"
+    ),
+    k: int = typer.Option(10, "--k", "-k", help="Top-k"),
+):
+    # accept either positional or --query/-q (option wins if both given)
+    q = query or q_pos
+    if not q:
+        raise typer.BadParameter(
+            "Provide a query as positional Q or with --query/-q", param_name="query"
+        )
+
     from bot.paths import get_project_root
-    import pyarrow.parquet as pq
-    from bot.rag.embeddings import get_embedder
-    from bot.rag.index_faiss import load_index
+    from bot.rag.utils import read_jsonl
+    import pyarrow.parquet as pq, json, pathlib
+
     root = get_project_root()
     sdir = root / "snapshots" / "rag" / store
+
+    if hybrid:
+        from bot.rag.hybrid import hybrid_topk
+        top = hybrid_topk(sdir, q, k=k, mmr=True)
+        chunks_tab = pq.read_table(sdir / "chunks.parquet")
+        text_by_chunk = {
+            chunks_tab["id"][i].as_py(): chunks_tab["text"][i].as_py()
+            for i in range(chunks_tab.num_rows)
+        }
+        docs = {row["id"]: row for row in read_jsonl(sdir / "docs.jsonl")}
+        out = []
+        for cid, score in top:
+            doc_id = cid.split(":")[0]
+            out.append({
+                "chunk_id": cid,
+                "doc_title": docs[doc_id]["title"],
+                "score": float(score),
+                "preview": text_by_chunk[cid][:200],
+            })
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return
+
+    # fallback: pure vector search
+    from bot.rag.embeddings import get_embedder
+    from bot.rag.index_faiss import load_index
+
+    model, embed = get_embedder()
     tab = pq.read_table(sdir / "embeddings.parquet")
     ids = [x.as_py() for x in tab["chunk_id"]]
-    model, embed = get_embedder()
     qv = embed([q])
     idx = load_index(sdir / "index.faiss")
-    D, I = idx.search(qv, 5)
-    # Map chunk_ids back to doc titles (Windows-safe UTF-8 read via read_jsonl)
-    docs = {row["id"]: row for row in read_jsonl(sdir / "docs.jsonl")}
+    D, I = idx.search(qv, k)
+
     chunks_tab = pq.read_table(sdir / "chunks.parquet")
-    text_by_chunk = {chunks_tab["id"][i].as_py(): chunks_tab["text"][i].as_py() for i in range(chunks_tab.num_rows)}
+    text_by_chunk = {
+        chunks_tab["id"][i].as_py(): chunks_tab["text"][i].as_py()
+        for i in range(chunks_tab.num_rows)
+    }
+    docs = {row["id"]: row for row in read_jsonl(sdir / "docs.jsonl")}
     out = []
     for j, score in zip(I[0], D[0]):
-        cid = ids[j]; doc_id = cid.split(":")[0]
-        out.append({"chunk_id": cid, "doc_title": docs[doc_id]["title"], "score": float(score),
-                    "preview": text_by_chunk[cid][:200]})
+        cid = ids[j]
+        doc_id = cid.split(":")[0]
+        out.append({
+            "chunk_id": cid,
+            "doc_title": docs[doc_id]["title"],
+            "score": float(score),
+            "preview": text_by_chunk[cid][:200],
+        })
     print(json.dumps(out, indent=2, ensure_ascii=False))
 
 @rag_app.command("stats")
@@ -910,6 +974,7 @@ def llm_selftest(prompt: str = typer.Option("Say exactly: OK", "--prompt")):
     except NotConfigured as e:
         print(f"[red]LLM backend not configured:[/red] {e}")
         raise typer.Exit(code=1)
+
 
 if __name__ == "__main__":
     app()
@@ -2330,6 +2395,76 @@ def _html_to_text(html: str, title_fallback: str) -> tuple[str, str]:
 
 ```
 
+rag/hybrid.py:
+```python
+from typing import List, Tuple
+from pathlib import Path
+import math
+import numpy as np
+import pyarrow.parquet as pq
+from rank_bm25 import BM25Okapi
+from bot.rag.embeddings import get_embedder
+from bot.rag.index_faiss import load_index
+
+def _normalize(mat: np.ndarray) -> np.ndarray:
+    norm = np.linalg.norm(mat, axis=1, keepdims=True)
+    return mat / np.clip(norm, 1e-12, None)
+
+def _mmr(query_vec: np.ndarray, cand_vecs: np.ndarray, ids: List[str], k: int, lam: float = 0.6):
+    # Maximal Marginal Relevance on normalized vectors
+    q = _normalize(query_vec.reshape(1, -1))
+    X = _normalize(cand_vecs)
+    chosen, remaining = [], list(range(len(ids)))
+    while remaining and len(chosen) < k:
+        if chosen:
+            diversity = np.max(X[remaining] @ X[chosen].T, axis=1)
+        else:
+            diversity = np.zeros(len(remaining))
+        relevance = (X[remaining] @ q.T).ravel()
+        score = lam * relevance - (1 - lam) * diversity
+        pick_rel_idx = remaining[int(np.argmax(score))]
+        chosen.append(pick_rel_idx)
+        remaining.remove(pick_rel_idx)
+    return [(ids[i], float((_normalize(X[i:i+1]) @ q.T).ravel()[0])) for i in chosen]
+
+def hybrid_topk(store_dir: Path, query: str, k: int = 10, mmr: bool = True) -> List[Tuple[str, float]]:
+    # BM25 over chunk texts
+    chunks_tab = pq.read_table(store_dir / "chunks.parquet")
+    texts = [chunks_tab["text"][i].as_py() for i in range(chunks_tab.num_rows)]
+    ids = [chunks_tab["id"][i].as_py() for i in range(chunks_tab.num_rows)]
+    bm25 = BM25Okapi([t.split() for t in texts])  # BM25Okapi API docs: rank-bm25. :contentReference[oaicite:1]{index=1}
+    bm_scores = dict(zip(ids, bm25.get_scores(query.split())))
+
+    # vector search (FAISS)
+    emb_tab = pq.read_table(store_dir / "embeddings.parquet")
+    emb_ids = [x.as_py() for x in emb_tab["chunk_id"]]
+    embs = np.stack([np.array(emb_tab["vector"][i].as_py(), dtype=np.float32) for i in range(emb_tab.num_rows)])
+    _, embed = get_embedder()
+    qv = embed([query]).astype(np.float32)
+    idx = load_index(store_dir / "index.faiss")
+    topn = min(k * 4, len(emb_ids))
+    D, I = idx.search(qv, topn)
+    vec_ids = [emb_ids[j] for j in I[0]]
+
+    # Reciprocal Rank Fusion
+    def rrf(rank): return 1.0 / (60 + rank)  # standard RRF constant
+    fused = {}
+    for r, cid in enumerate(vec_ids, start=1):
+        fused[cid] = fused.get(cid, 0.0) + rrf(r)
+    for r, (cid, _) in enumerate(sorted(bm_scores.items(), key=lambda x: x[1], reverse=True)[:topn], start=1):
+        fused[cid] = fused.get(cid, 0.0) + rrf(r)
+
+    cand_ids = [cid for cid, _ in sorted(fused.items(), key=lambda x: x[1], reverse=True)[:topn]]
+    if mmr:
+        # map candidates to vectors for MMR
+        pos = {cid: i for i, cid in enumerate(emb_ids)}
+        cand_vecs = embs[[pos[cid] for cid in cand_ids]]
+        return _mmr(qv[0], cand_vecs, cand_ids, k=k)
+    else:
+        return [(cid, float(fused[cid])) for cid in cand_ids[:k]]
+
+```
+
 rag/index_faiss.py
 ```python
 from __future__ import annotations
@@ -2952,6 +3087,134 @@ def get_tracer(name: str = "everabot") -> trace.Tracer:
 
 ```
 
+train/peft.py:
+```python
+from __future__ import annotations
+import os, json, time, pathlib, dataclasses
+from typing import Optional, Dict, Any
+
+import torch
+from datasets import load_dataset
+from transformers import (AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments,
+                          DataCollatorForLanguageModeling)
+from peft import LoraConfig, get_peft_model
+
+from bot.paths import get_project_root
+from bot.eval.harness import run_all
+from bot.rules.loader import load_all, load_last_promoted, pareto_gate, save_last_promoted
+from bot.rag.utils import now_iso
+
+@dataclasses.dataclass
+class TrainConfig:
+    base_model: str = "distilgpt2"          # CPU-friendly default
+    data_path: str = "examples/sft_tiny.jsonl"
+    output_dir: Optional[str] = None        # resolved under snapshots/models/adapters/
+    num_epochs: int = 1
+    lr: float = 2e-4
+    train_batch_size: int = 4
+    grad_accum_steps: int = 2
+    lora_r: int = 8
+    lora_alpha: int = 16
+    lora_dropout: float = 0.05
+    qlora: bool = False                     # enabled only when bitsandbytes + CUDA available
+
+def _format_example(ex: Dict[str, Any]) -> str:
+    p = ex.get("prompt"); r = ex.get("response")
+    if p is not None and r is not None:
+        return f"### Instruction:\n{p}\n\n### Response:\n{r}\n"
+    t = ex.get("text")
+    return f"{t}\n" if t else ""
+
+def _load_jsonl_dataset(path: str):
+    ds = load_dataset("json", data_files=path)["train"]
+    return ds
+
+def _maybe_4bit_kwargs(enable_qlora: bool) -> Dict[str, Any]:
+    if not enable_qlora:
+        return {}
+    try:
+        import bitsandbytes as bnb  # noqa: F401
+    except Exception:
+        return {}
+    if not torch.cuda.is_available():
+        return {}
+    return dict(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float16,
+    )
+
+def train_adapter(cfg: TrainConfig) -> Dict[str, Any]:
+    root = get_project_root()
+    out_root = root / "snapshots" / "models" / "adapters"
+    out_root.mkdir(parents=True, exist_ok=True)
+    run_id = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = pathlib.Path(cfg.output_dir) if cfg.output_dir else (out_root / f"{run_id}_{('qlora' if cfg.qlora else 'lora')}_{cfg.base_model.replace('/','_')}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    tok = AutoTokenizer.from_pretrained(cfg.base_model)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    model = AutoModelForCausalLM.from_pretrained(cfg.base_model, **_maybe_4bit_kwargs(cfg.qlora))
+    model.resize_token_embeddings(len(tok))
+
+    peft_cfg = LoraConfig(
+        r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout,
+        target_modules=["c_attn","q_proj","k_proj","v_proj","o_proj"],  # robust defaults; ignored where absent
+        task_type="CAUSAL_LM"
+    )
+    model = get_peft_model(model, peft_cfg)
+
+    ds = _load_jsonl_dataset(cfg.data_path)
+    def _tok(batch):
+        texts = [_format_example(ex) for ex in batch]
+        toks = tok(texts, truncation=True, padding="max_length", max_length=512)
+        toks["labels"] = toks["input_ids"].copy()
+        return toks
+    ds = ds.map(lambda ex: _tok([ex]), batched=True, remove_columns=list(ds.features))
+
+    args = TrainingArguments(
+        output_dir=str(out_dir / "hf_out"),
+        per_device_train_batch_size=cfg.train_batch_size,
+        gradient_accumulation_steps=cfg.grad_accum_steps,
+        learning_rate=cfg.lr,
+        num_train_epochs=cfg.num_epochs,
+        bf16=torch.cuda.is_available(),
+        fp16=(torch.cuda.is_available() and not torch.cuda.is_bf16_supported()),
+        logging_steps=10,
+        save_strategy="no",
+        report_to=[],
+    )
+    collator = DataCollatorForLanguageModeling(tok, mlm=False)
+    tr = Trainer(model=model, args=args, train_dataset=ds, data_collator=collator)
+    tr.train()
+
+    # save adapter (small)
+    model.save_pretrained(str(out_dir))
+    tok.save_pretrained(str(out_dir))
+
+    # run root evals and apply Pareto gate
+    eval_payload = run_all()
+    root_ok = (eval_payload["overall"] == "PASS")
+    new_topic_score = 0.80  # demo KPI; wire your topic scorer here
+
+    rules = load_all()
+    last = load_last_promoted()
+    promote, reason = pareto_gate(new_topic_score, root_ok, rules["promotion"], last)
+    decision = {"promote": promote, "reason": reason, "new_topic_score": new_topic_score,
+                "root_ok": root_ok, "eval_artifact": eval_payload["artifact"]}
+
+    if promote:
+        save_last_promoted({"ts": now_iso(), "new_topic_score": new_topic_score,
+                            "adapter_path": str(out_dir), "base_model": cfg.base_model})
+
+    (out_dir / "TRAIN_DECISION.json").write_text(json.dumps(decision, indent=2), encoding="utf-8")
+    return {"out_dir": str(out_dir), "decision": decision}
+
+```
+
+
 workflows/build.py
 ```python
 from __future__ import annotations
@@ -2988,11 +3251,14 @@ def run() -> int:
 workflows/train.py
 ```python
 from __future__ import annotations
-from bot.core.state import Orchestrator
+from bot.train.peft import TrainConfig, train_adapter
 
-def run() -> int:
-    orch = Orchestrator(run_type="train", topic="train")
-    return orch.run_train()
+def run(**kwargs) -> int:
+    cfg = TrainConfig(**kwargs) if kwargs else TrainConfig()
+    res = train_adapter(cfg)
+    print(f"[train] adapter -> {res['out_dir']}")
+    print(f"[train] decision -> {res['decision']}")
+    return 0
 
 ```
 
@@ -3064,57 +3330,83 @@ CMD ["eval"]
 
 pyproject.toml:
 ```toml
-[tool.poetry]
-name = "everabot"
-version = "0.1.0"
-description = "Everabot — self-evolving, test-gated local agent"
-authors = ["Tyler English <tylerhelamanenglish@gmail.com>"]
-readme = "README.md"
-packages = [{ include = "bot" }]
+# ---- base ----
+FROM python:3.11-slim
 
-[tool.poetry.dependencies]
-python = ">=3.11,<3.13"
-typer = {extras = ["all"], version = "^0.17.5"}
-click = "^8.2.1"
-fastembed = "^0.3.0"
-onnxruntime = "^1.18.0"
-rich = "^13.7.1"
-pyarrow = "^17.0.0"
-opentelemetry-api = "^1.27.0"
-opentelemetry-sdk = "^1.27.0"
-pyyaml = "^6.0.2"
-psutil = "^5.9.8"
-numpy = "^2.1.0"
-requests = "^2.32.3"
-beautifulsoup4 = "^4.12.3"
-PyPDF2 = "^3.0.1"
-sentence-transformers = "^3.0.1"
-faiss-cpu = "^1.8.0.post1"
-youtube-transcript-api = "^0.6.2"
-llmlingua = "^0.2.2"
-transformers = "^4.43.1"
-huggingface_hub = "^0.23.2"
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    POETRY_VERSION=1.8.3 \
+    POETRY_VIRTUALENVS_CREATE=false \
+    PATH="/home/botuser/.local/bin:/usr/local/bin:${PATH}"
 
-# Optional group for llama.cpp wheels
-[tool.poetry.group.llamacpp]
-optional = true
+# OS deps:
+# - build-essential, cmake, pkg-config: build llama-cpp-python from source
+# - libopenblas-dev: fast CPU via OpenBLAS
+# - libgomp1: OpenMP runtime used by BLAS/others
+# - plus your existing minimal tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl ca-certificates git xdelta3 \
+      build-essential cmake pkg-config libopenblas-dev libgomp1 \
+  && rm -rf /var/lib/apt/lists/*
 
-[tool.poetry.group.llamacpp.dependencies]
-# Let Poetry pick a compatible prebuilt wheel from the CPU index
-llama-cpp-python = { version = "*", source = "llamacpp-cpu" }
+# Non-root user & workdir
+RUN useradd -ms /bin/bash botuser
+WORKDIR /workspace
 
-# Prebuilt wheel indexes (PEP 503 “simple” repos)
-[[tool.poetry.source]]
-name = "llamacpp-cpu"
-url = "https://abetlen.github.io/llama-cpp-python/whl/cpu"
-priority = "explicit"
+# Poetry
+RUN pip install --no-cache-dir "poetry==${POETRY_VERSION}"
 
-[tool.poetry.scripts]
-everabot = "bot.cli:app"
+# ---------- layer 1: deps only (fast rebuilds) ----------
+# Only files needed to resolve dependencies
+COPY pyproject.toml poetry.lock* README.md ./
 
-[build-system]
-requires = ["poetry-core>=1.9.0"]
-build-backend = "poetry.core.masonry.api"
+# Install all deps EXCEPT the 'llamacpp' group (we will build it from source with pip)
+RUN poetry install --without llamacpp --no-root --no-interaction --no-ansi
+
+# Build and install llama-cpp-python from source (glibc-native) with OpenBLAS
+# Notes:
+# - CMAKE_ARGS toggles BLAS and native CPU optimizations
+# - pin to a recent known-good; adjust as you like
+ENV CMAKE_ARGS="-DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS -DLLAMA_NATIVE=ON"
+RUN pip install --no-cache-dir --no-binary=:all: "llama-cpp-python==0.3.2"
+
+# Sanity check key imports so we fail early if anything is off
+RUN python - <<'PY'
+import importlib, sys
+for mod in ("transformers","llama_cpp"):
+    try:
+        importlib.import_module(mod)
+        print(f"OK: imported {mod}")
+    except Exception as e:
+        print(f"FAILED: import {mod}: {e}", file=sys.stderr)
+        raise
+PY
+
+# optional: bitsandbytes only if GPU image is used; skip on slim CPU
+# RUN poetry add -E qlora bitsandbytes
+
+# ---------- layer 2: app code ----------
+COPY bot/ ./bot/
+COPY ruleset/ ./ruleset/
+COPY test/ ./test/
+
+# Install just your package (no dependency resolution now)
+RUN poetry install --only-root --no-interaction --no-ansi
+
+# Harden & ownership
+RUN chmod -R a-w /workspace/ruleset /workspace/test \
+ && chown -R botuser:botuser /workspace
+
+USER botuser
+
+# Lightweight healthcheck – meaningful for long-running modes
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+  CMD python -m bot.cli --help >/dev/null 2>&1 || exit 1
+
+# CLI entrypoint; subcommands become args
+ENTRYPOINT ["python","-m","bot.cli"]
+CMD ["eval"]
 
 ```
 

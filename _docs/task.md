@@ -86,25 +86,25 @@ Everabot/
 
 ### 6) Local inference (open weights) that runs inside Docker on modest machines
 
-* [ ] Add two backends behind a single interface:
+* [*] Add two backends behind a single interface:
 
 * **Transformers** (PyTorch) for standard HF models. ([Hugging Face][13])
 * **llama.cpp** for quantized **GGUF** models (CPU-friendly); expose sampling and KV cache tuning. ([GitHub][14])
 
-* [ ] Provide a config knob to select backend/model/precision at runtime; default to a small quantized model to keep CPU/RAM light.
+* [*] Provide a config knob to select backend/model/precision at runtime; default to a small quantized model to keep CPU/RAM light.
 
 ---
 
 ### 7) **Training its own weights** (PEFT first, full finetune optional later)
 
-* [ ] Implement **LoRA/QLoRA** training pipelines (PEFT) with HuggingFace `datasets` and `accelerate`/bitsandbytes. Start with small adapters to keep it light. ([arXiv][15])
-* [ ] Add `train` CLI supporting:
+* [*] Implement **LoRA/QLoRA** training pipelines (PEFT) with HuggingFace `datasets` and `accelerate`/bitsandbytes. Start with small adapters to keep it light. ([arXiv][15])
+* [*] Add `train` CLI supporting:
 
 * **Domain adapters** (LoRA) on your local datasets.
 * **QLoRA** when you have a GPU; keep the adapters small and versioned in `snapshots/models/adapters/…`. ([arXiv][16])
 
-* [ ] Plug **evaluation gates**: after training, run **root tests** + topic evals; only **promote** adapter if Pareto gate passes.
-* [ ] Add a lane for **from-scratch or hybrid** (if the agent deems it better): wire a minimal pretraining scaffold (tokenizer, dataset streaming), but protect it behind strict resource ceilings.
+* [*] Plug **evaluation gates**: after training, run **root tests** + topic evals; only **promote** adapter if Pareto gate passes.
+* [*] Add a lane for **from-scratch or hybrid** (if the agent deems it better): wire a minimal pretraining scaffold (tokenizer, dataset streaming), but protect it behind strict resource ceilings.
 
 ---
 

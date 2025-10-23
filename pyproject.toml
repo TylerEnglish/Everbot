@@ -29,6 +29,18 @@ llmlingua = "^0.2.2"
 transformers = "^4.43.1"
 huggingface_hub = "^0.23.2"
 
+datasets = "^2.20.0"
+peft = "^0.12.0"
+accelerate = "^0.34.2"
+rank-bm25 = "^0.2.2"
+rapidfuzz = "^3.9.7"
+
+# bitsandbytes is optional; only needed for QLoRA when you have CUDA
+bitsandbytes = { version = "^0.43.3", optional = true }
+
+[tool.poetry.extras]
+qlora = ["bitsandbytes"]
+
 # Optional group for llama.cpp wheels
 [tool.poetry.group.llamacpp]
 optional = true

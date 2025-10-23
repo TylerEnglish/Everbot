@@ -6,6 +6,7 @@ from bot.paths import get_project_root
 from bot.rules.loader import load_all
 from bot.eval.harness import run_all
 from bot.rag.utils import read_jsonl
+from typing import Optional
 
 app = typer.Typer(help="Everabot CLI")
 rag_app = typer.Typer(help="RAG substrate commands")
@@ -60,11 +61,21 @@ def self_improve():
     raise typer.Exit(code=code)
 
 @app.command()
-def train():
-    """Training lane (PEFT etc.) — stub snapshot."""
+def train(
+    base_model: str = typer.Option("distilgpt2", help="HF model id"),
+    data: str = typer.Option("examples/sft_tiny.jsonl", help="JSONL with {prompt,response}|{text}"),
+    lora: bool = typer.Option(True, help="Train LoRA adapters"),
+    qlora: bool = typer.Option(False, help="Attempt QLoRA (requires GPU + bitsandbytes)"),
+    epochs: int = typer.Option(1, help="Epochs"),
+    lr: float = typer.Option(2e-4, help="Learning rate"),
+    r: int = typer.Option(8, help="LoRA rank"),
+    alpha: int = typer.Option(16, help="LoRA alpha"),
+    dropout: float = typer.Option(0.05, help="LoRA dropout"),
+):
     from bot.workflows import train as wf
-    code = wf.run()
-    print("[cyan]train[/cyan] (stub) snapshot created")
+    code = wf.run(base_model=base_model, data_path=data, num_epochs=epochs,
+                  lr=lr, lora_r=r, lora_alpha=alpha, lora_dropout=dropout, qlora=bool(qlora))
+    print("[cyan]train[/cyan] complete")
     raise typer.Exit(code=code)
 
 # -------- snapshot subcommands (robust) --------
@@ -201,28 +212,82 @@ def rag_ingest(url: list[str] = typer.Argument(..., help="One or more URLs or pa
     print(f"[green]Ingested[/green] -> {out_dir} counts={meta['counts']}")
 
 @rag_app.command("query")
-def rag_query(q: str, store: str = typer.Option("v1", help="Subdir under snapshots/rag")):
+def rag_query(
+    q_pos: Optional[str] = typer.Argument(
+        None, metavar="Q", help="Query string (positional)"
+    ),
+    query: Optional[str] = typer.Option(
+        None, "--query", "-q", help="Query string (use this or positional Q)"
+    ),
+    store: str = typer.Option("v1", "--store", "-s", help="Subdir under snapshots/rag"),
+    hybrid: bool = typer.Option(
+        True, "--hybrid/--no-hybrid",
+        help="Use BM25+Vector (RRF) with optional MMR re-rank"
+    ),
+    k: int = typer.Option(10, "--k", "-k", help="Top-k"),
+):
+    # accept either positional or --query/-q (option wins if both given)
+    q = query or q_pos
+    if not q:
+        raise typer.BadParameter(
+            "Provide a query as positional Q or with --query/-q", param_name="query"
+        )
+
     from bot.paths import get_project_root
-    import pyarrow.parquet as pq
-    from bot.rag.embeddings import get_embedder
-    from bot.rag.index_faiss import load_index
+    from bot.rag.utils import read_jsonl
+    import pyarrow.parquet as pq, json, pathlib
+
     root = get_project_root()
     sdir = root / "snapshots" / "rag" / store
+
+    if hybrid:
+        from bot.rag.hybrid import hybrid_topk
+        top = hybrid_topk(sdir, q, k=k, mmr=True)
+        chunks_tab = pq.read_table(sdir / "chunks.parquet")
+        text_by_chunk = {
+            chunks_tab["id"][i].as_py(): chunks_tab["text"][i].as_py()
+            for i in range(chunks_tab.num_rows)
+        }
+        docs = {row["id"]: row for row in read_jsonl(sdir / "docs.jsonl")}
+        out = []
+        for cid, score in top:
+            doc_id = cid.split(":")[0]
+            out.append({
+                "chunk_id": cid,
+                "doc_title": docs[doc_id]["title"],
+                "score": float(score),
+                "preview": text_by_chunk[cid][:200],
+            })
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return
+
+    # fallback: pure vector search
+    from bot.rag.embeddings import get_embedder
+    from bot.rag.index_faiss import load_index
+
+    model, embed = get_embedder()
     tab = pq.read_table(sdir / "embeddings.parquet")
     ids = [x.as_py() for x in tab["chunk_id"]]
-    model, embed = get_embedder()
     qv = embed([q])
     idx = load_index(sdir / "index.faiss")
-    D, I = idx.search(qv, 5)
-    # Map chunk_ids back to doc titles (Windows-safe UTF-8 read via read_jsonl)
-    docs = {row["id"]: row for row in read_jsonl(sdir / "docs.jsonl")}
+    D, I = idx.search(qv, k)
+
     chunks_tab = pq.read_table(sdir / "chunks.parquet")
-    text_by_chunk = {chunks_tab["id"][i].as_py(): chunks_tab["text"][i].as_py() for i in range(chunks_tab.num_rows)}
+    text_by_chunk = {
+        chunks_tab["id"][i].as_py(): chunks_tab["text"][i].as_py()
+        for i in range(chunks_tab.num_rows)
+    }
+    docs = {row["id"]: row for row in read_jsonl(sdir / "docs.jsonl")}
     out = []
     for j, score in zip(I[0], D[0]):
-        cid = ids[j]; doc_id = cid.split(":")[0]
-        out.append({"chunk_id": cid, "doc_title": docs[doc_id]["title"], "score": float(score),
-                    "preview": text_by_chunk[cid][:200]})
+        cid = ids[j]
+        doc_id = cid.split(":")[0]
+        out.append({
+            "chunk_id": cid,
+            "doc_title": docs[doc_id]["title"],
+            "score": float(score),
+            "preview": text_by_chunk[cid][:200],
+        })
     print(json.dumps(out, indent=2, ensure_ascii=False))
 
 @rag_app.command("stats")

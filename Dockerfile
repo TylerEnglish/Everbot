@@ -51,6 +51,9 @@ for mod in ("transformers","llama_cpp"):
         raise
 PY
 
+# optional: bitsandbytes only if GPU image is used; skip on slim CPU
+# RUN poetry add -E qlora bitsandbytes
+
 # ---------- layer 2: app code ----------
 COPY bot/ ./bot/
 COPY ruleset/ ./ruleset/
