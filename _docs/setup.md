@@ -43,9 +43,9 @@ $Env:EVERABOT_XDELTA3 = "C:\Tools\xdelta3\xdelta3.exe"
 setx EVERABOT_XDELTA3 "C:\Tools\xdelta3\xdelta3.exe"
 
 # (optional) force 200 caps
-$env:EVERABOT_MMLU_CAP='10'
-$env:EVERABOT_GSM8K_CAP='10'
-$env:EVERABOT_HELLASWAG_CAP='10'
+$env:EVERABOT_MMLU_CAP='200'
+$env:EVERABOT_GSM8K_CAP='200'
+$env:EVERABOT_HELLASWAG_CAP='200'
 
 # if needed ensure Ollama env is set
 $env:EVERABOT_LLM='ollama'

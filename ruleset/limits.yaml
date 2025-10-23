@@ -1,8 +1,8 @@
 version: 1
 tokens_max: 8192
-wall_time_sec_max: 900
-ram_mb_max: 4096
-disk_mb_max: 4096
+wall_time_sec_max: 1800
+ram_mb_max: 8184
+disk_mb_max: 8184
 
 cpu:
   percent_max: 85
@@ -10,11 +10,11 @@ fd_limits:
   soft_max: 512
 
 phases:
-  RESEARCH: { wall_time_sec_max: 240 }
-  DISTILL:  { wall_time_sec_max: 120 }
-  PRACTICE: { wall_time_sec_max: 180 }
-  EVAL:     { wall_time_sec_max: 120 }
-  DECIDE:   { wall_time_sec_max: 30 }
+  RESEARCH: { wall_time_sec_max: 480 }
+  DISTILL:  { wall_time_sec_max: 240 }
+  PRACTICE: { wall_time_sec_max: 360 }
+  EVAL:     { wall_time_sec_max: 240 }
+  DECIDE:   { wall_time_sec_max: 120 }
 
 snapshots:
   binary_delta: ["vcdiff", "xdelta3"]

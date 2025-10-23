@@ -3017,35 +3017,45 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -ms /bin/bash botuser
 WORKDIR /workspace
 
-# poetry (install lightweight)
+# poetry
 RUN pip install --no-cache-dir poetry==1.8.3
 
-# copy project files
-COPY pyproject.toml README.md ./
+# copy only manifests first for better caching
+COPY pyproject.toml poetry.lock* ./
+
+# install python deps to the system site (no virtualenv)
+RUN poetry config virtualenvs.create false && poetry install --no-interaction --no-ansi
+
+# runtime backends (CPU)
+# - llama.cpp python bindings (prebuilt wheel on Linux)
+# - torch CPU for transformers
+RUN pip install --no-cache-dir llama-cpp-python==0.3.2 && \
+    pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.4.1
+
+# copy project sources (after deps so edits don't bust cache)
 COPY bot/ ./bot/
 COPY ruleset/ ./ruleset/
 COPY test/ ./test/
 COPY app/ ./app/
-COPY snapshots/ ./snapshots/
+# don't bake snapshots (mount at runtime instead)
+# COPY snapshots/ ./snapshots/
 
-# install python deps (system site, no venv)
-RUN poetry config virtualenvs.create false && poetry install --no-interaction --no-ansi
-
-# harden: make ruleset/ and test/ read-only inside the image too
+# harden: make ruleset/ and test/ read-only
 RUN chmod -R a-w /workspace/ruleset /workspace/test
 
-# ensure the app user owns ONLY /workspace (writable area)
-RUN chown -R botuser:botuser /workspace
+# model & data mount points
+RUN mkdir -p /models /workspace/snapshots && chown -R botuser:botuser /workspace /models
+VOLUME ["/models", "/workspace/snapshots"]
 
-# wrapper block
+# tiny entrypoint wrapper
 RUN printf '%s\n' '#!/bin/sh' 'set -e' \
-  '[ "${EVERABOT_STARTUP_CHECK:-0}" = "1" ] && everabot selfcheck || true' \
+  '[ "${EVERABOT_STARTUP_CHECK:-0}" = "1" ] && everabot --help >/dev/null || true' \
   'exec "$@"' > /usr/local/bin/entrypoint && chmod +x /usr/local/bin/entrypoint
 
 USER botuser
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
-  CMD python -m bot.cli --help || exit 1
+  CMD everabot --help >/dev/null 2>&1 || exit 1
 
 ENTRYPOINT ["entrypoint","everabot"]
 CMD ["eval"]
