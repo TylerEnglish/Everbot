@@ -138,9 +138,9 @@ Everabot/
 
 ### 10) The learning curriculum & auto-expansion
 
-* [ ] Add a **topic registry** (`ruleset/topics.yaml`) the *agent reads* (not edits) to know allowed domains and safety levels.
-* [ ] Implement **priority selection**: choose next sub-skill by expected gain vs. regression risk, respecting a budget (time/CPU/RAM).
-* [ ] Integrate **context-engineering** patterns (ACE-style memory evolution; recent agentic long-context variants) as optional strategies the agent can pick. ([arXiv][21])
+* [*] Add a **topic registry** (`ruleset/topics.yaml`) the *agent reads* (not edits) to know allowed domains and safety levels.
+* [*] Implement **priority selection**: choose next sub-skill by expected gain vs. regression risk, respecting a budget (time/CPU/RAM).
+* [*] Integrate **context-engineering** patterns (ACE-style memory evolution; recent agentic long-context variants) as optional strategies the agent can pick. ([arXiv][21])
 
 ---
 

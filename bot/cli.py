@@ -17,6 +17,8 @@ llm_app = typer.Typer(help="LLM backends utilities")
 app.add_typer(llm_app, name="llm")
 opt_app = typer.Typer(help="Optimization & profiling tools")
 app.add_typer(opt_app, name="opt")
+curr_app = typer.Typer(help="Curriculum utilities")
+app.add_typer(curr_app, name="curriculum")
 
 _ROOT = get_project_root()
 _PROTECTED_DIRS = {str(_ROOT / "ruleset"), str(_ROOT / "test")}
@@ -45,14 +47,36 @@ def selfcheck():
     raise typer.Exit(code=0 if ok else 1)
 
 @app.command()
-def learn(topic: str):
+def learn(topic: str, auto: bool = typer.Option(False, "--auto", help="Pick next sub-skill automatically"),
+          strategy: str = typer.Option(None, "--strategy", help="Force strategy (ace|long_context|vanilla)")):
     tracer = get_tracer("everabot.cli")
     with tracer.start_as_current_span("cli.learn", attributes={"topic": topic}):
         from bot.workflows import learn as wf
-        code = wf.run(topic)
+        # allow 'auto' topic or --auto switch, plus optional strategy override
+        pick_auto = auto or (topic.strip().lower() == "auto")
+        code = wf.run(topic if not pick_auto else "auto", strategy=strategy)
         print(f"[cyan]learn[/cyan] → {topic} [dim](snapshot created under snapshots/runs)[/dim]")
     force_flush()
     raise typer.Exit(code=code)
+
+@curr_app.command("list")
+def curr_list():
+    from bot.curriculum.registry import load_registry, is_done
+    reg = load_registry()
+    for slug, t in reg.items():
+        print(f"[bold]{t.name}[/bold] (safety={t.safety_level}) strategies={t.default_strategies}")
+        for s in t.skills:
+            status = "✓" if is_done(t.name, s.id) else "•"
+            print(f"  {status} {s.id} – {s.title} (gain≈{s.est_gain:.2f}, risk≈{s.risk_regression:.2f}, {s.time_min}m)")
+
+@curr_app.command("next")
+def curr_next(topic: str = typer.Option(None, "--topic", help="Constrain to a topic slug")):
+    from bot.curriculum.priority import select_next
+    plan = select_next(topic)
+    if not plan:
+        print("No eligible skills under current limits.")
+        return
+    print(json.dumps(plan.__dict__, indent=2))
 
 @app.command()
 def build(goal: str):

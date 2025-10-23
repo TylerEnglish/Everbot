@@ -1,12 +1,100 @@
-version: 1
+version: 2
+
+# Keeps legacy list so tests keep passing
 allowed_topics:
   - problem_solving
   - web_dev
   - game_dev
   - math
   - security_basics
+
 aliases:
   web: web_dev
   security: security_basics
+
 notes:
   - "Topics gate only the 'learn' path; 'build' is free-form but still bound by safety."
+
+# New structured registry for curriculum/auto-expansion
+topics:
+  problem_solving:
+    safety_level: low
+    default_strategies: ["ace", "vanilla"]
+    skills:
+      - id: ps-breakdown
+        title: "Systematic problem decomposition"
+        est_gain: 0.40       # 0..1 expected KPI gain
+        risk_regression: 0.05 # 0..1
+        time_min: 3          # minutes
+        cpu_pct_est: 20
+        ram_mb_est: 64
+        notes: "Chain-of-thought checklists; concise bullets"
+      - id: ps-search
+        title: "Targeted retrieval queries"
+        est_gain: 0.35
+        risk_regression: 0.03
+        time_min: 3
+        cpu_pct_est: 25
+        ram_mb_est: 96
+
+  web_dev:
+    safety_level: medium
+    default_strategies: ["ace", "long_context", "vanilla"]
+    skills:
+      - id: web-auth-basics
+        title: "HTTP auth & sessions basics"
+        est_gain: 0.30
+        risk_regression: 0.08
+        time_min: 5
+        cpu_pct_est: 30
+        ram_mb_est: 128
+      - id: web-rest-design
+        title: "REST resource design patterns"
+        est_gain: 0.28
+        risk_regression: 0.04
+        time_min: 4
+        cpu_pct_est: 25
+        ram_mb_est: 96
+
+  game_dev:
+    safety_level: medium
+    default_strategies: ["long_context", "vanilla"]
+    skills:
+      - id: gd-ecs
+        title: "Entity-Component-System basics"
+        est_gain: 0.25
+        risk_regression: 0.04
+        time_min: 6
+        cpu_pct_est: 35
+        ram_mb_est: 192
+
+  math:
+    safety_level: low
+    default_strategies: ["ace", "vanilla"]
+    skills:
+      - id: m-arithmetic
+        title: "Grade-school arithmetic steps"
+        est_gain: 0.35
+        risk_regression: 0.02
+        time_min: 4
+        cpu_pct_est: 20
+        ram_mb_est: 64
+      - id: m-word-problems
+        title: "Word-problem templates"
+        est_gain: 0.32
+        risk_regression: 0.04
+        time_min: 5
+        cpu_pct_est: 25
+        ram_mb_est: 96
+
+  security_basics:
+    safety_level: high
+    default_strategies: ["ace", "vanilla"]
+    skills:
+      - id: sec-threat-model
+        title: "Threat modeling: STRIDE-lite"
+        est_gain: 0.30
+        risk_regression: 0.06
+        time_min: 6
+        cpu_pct_est: 35
+        ram_mb_est: 128
