@@ -126,13 +126,13 @@ Everabot/
 
 ### 9) Snapshots, rollback, and **evidence logging (XAI)**
 
-* [ ] Every `learn`/`train` run creates a **snapshot**:
+* [*] Every `learn`/`train` run creates a **snapshot**:
 
 * code diff, configs, dataset manifest, RAG store manifest, model refs/adapters, **proof logs** (sources → distilled bullets → attempts → scores → decision rationale).
 
-* [ ] Use **VCDIFF** for large binary deltas to keep snapshot sizes small. ([IETF Datatracker][9])
-* [ ] Implement `snapshot promote|list|checkout|diff` commands.
-* [ ] Use **OpenTelemetry** context to correlate logs/metrics/artifacts; optionally surface runs in **MLflow Tracking** (local filesystem backend). ([OpenTelemetry][3])
+* [*] Use **VCDIFF** for large binary deltas to keep snapshot sizes small. ([IETF Datatracker][9])
+* [*] Implement `snapshot promote|list|checkout|diff` commands.
+* [*] Use **OpenTelemetry** context to correlate logs/metrics/artifacts; optionally surface runs in **MLflow Tracking** (local filesystem backend). ([OpenTelemetry][3])
 
 ---
 

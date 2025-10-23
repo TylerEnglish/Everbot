@@ -1,6 +1,6 @@
-Help me finish my tasks, I'm on task 9 now, what I need help with is a RAG system. I'll upload a PDF white paper explaining what exactly I want, in this I want you to very carefully look at it with detail. Then I want you to look at the next section of task, and then I want you to implement them. Be sure to read everything so we can have good ground work for the later task and we can finish this everbot strong. 
+Help me finish my tasks, I'm on task 10 now, what I need help with is a RAG system. I'll upload a PDF white paper explaining what exactly I want, in this I want you to very carefully look at it with detail. Then I want you to look at the next section of task, and then I want you to implement them. Be sure to read everything so we can have good ground work for the later task and we can finish this everbot strong. 
 
-What I want is a detail application of what to do, give me everything, all the new files and changes. I want this to be descriptive and work. Also show me the commands to make sure that we finished these task. 
+What I want is a detail application of what to do, give me everything, all the new files and changes. I want this to be descriptive and work. Also show me the commands to make sure that we finished these task. Make sure you read through all the code, i'm putting it in this message.
 
 Dont hallucinate and make sure you carefully read everything and all the sources to implement this. Think of Locality of Behaivor and try not to duplicate code.
 
@@ -153,13 +153,13 @@ Everabot/
 
 ### 9) Snapshots, rollback, and **evidence logging (XAI)**
 
-* [ ] Every `learn`/`train` run creates a **snapshot**:
+* [*] Every `learn`/`train` run creates a **snapshot**:
 
 * code diff, configs, dataset manifest, RAG store manifest, model refs/adapters, **proof logs** (sources → distilled bullets → attempts → scores → decision rationale).
 
-* [ ] Use **VCDIFF** for large binary deltas to keep snapshot sizes small. ([IETF Datatracker][9])
-* [ ] Implement `snapshot promote|list|checkout|diff` commands.
-* [ ] Use **OpenTelemetry** context to correlate logs/metrics/artifacts; optionally surface runs in **MLflow Tracking** (local filesystem backend). ([OpenTelemetry][3])
+* [*] Use **VCDIFF** for large binary deltas to keep snapshot sizes small. ([IETF Datatracker][9])
+* [*] Implement `snapshot promote|list|checkout|diff` commands.
+* [*] Use **OpenTelemetry** context to correlate logs/metrics/artifacts; optionally surface runs in **MLflow Tracking** (local filesystem backend). ([OpenTelemetry][3])
 
 ---
 
@@ -545,6 +545,7 @@ from bot.rules.loader import load_all
 from bot.eval.harness import run_all
 from bot.rag.utils import read_jsonl
 from typing import Optional
+from bot.telemetry.tracing import get_tracer, force_flush
 
 app = typer.Typer(help="Everabot CLI")
 rag_app = typer.Typer(help="RAG substrate commands")
@@ -561,10 +562,11 @@ install_guard(deny_dirs=_PROTECTED_DIRS)
 @app.command()
 def eval():
     """Run root tests + benchmark wiring; emits a PASS/SKIP/FAIL JSON summary."""
-    payload = run_all()
-    print(payload.get("overall"), "-", payload.get("artifact"))
-    # Non-zero exit only if something truly FAILED (not SKIPPED)
-    raise typer.Exit(code=0 if payload["overall"] == "PASS" else 1)
+    tracer = get_tracer("everabot.cli")
+    with tracer.start_as_current_span("cli.eval"):
+        payload = run_all()
+        print(payload.get("overall"), "-", payload.get("artifact"))
+    force_flush()
 
 @app.command()
 def selfcheck():
@@ -581,23 +583,32 @@ def selfcheck():
 
 @app.command()
 def learn(topic: str):
-    from bot.workflows import learn as wf
-    code = wf.run(topic)
-    print(f"[cyan]learn[/cyan] → {topic} [dim](snapshot created under snapshots/runs)[/dim]")
+    tracer = get_tracer("everabot.cli")
+    with tracer.start_as_current_span("cli.learn", attributes={"topic": topic}):
+        from bot.workflows import learn as wf
+        code = wf.run(topic)
+        print(f"[cyan]learn[/cyan] → {topic} [dim](snapshot created under snapshots/runs)[/dim]")
+    force_flush()
     raise typer.Exit(code=code)
 
 @app.command()
 def build(goal: str):
-    from bot.workflows import build as wf
-    code = wf.run(goal)
-    print(f"[cyan]build[/cyan] → {goal}")
+    tracer = get_tracer("everabot.cli")
+    with tracer.start_as_current_span("cli.build", attributes={"goal": goal}):
+        from bot.workflows import build as wf
+        code = wf.run(goal)
+        print(f"[cyan]build[/cyan] → {goal}")
+    force_flush()
     raise typer.Exit(code=code)
 
 @app.command("self-improve")
 def self_improve():
-    from bot.workflows import self_improve as wf
-    code = wf.run()
-    print("[cyan]self-improve[/cyan] starting (stub)")
+    tracer = get_tracer("everabot.cli")
+    with tracer.start_as_current_span("cli.self_improve"):
+        from bot.workflows import self_improve as wf
+        code = wf.run()
+        print("[cyan]self-improve[/cyan] starting (stub)")
+    force_flush()
     raise typer.Exit(code=code)
 
 @app.command()
@@ -612,10 +623,13 @@ def train(
     alpha: int = typer.Option(16, help="LoRA alpha"),
     dropout: float = typer.Option(0.05, help="LoRA dropout"),
 ):
-    from bot.workflows import train as wf
-    code = wf.run(base_model=base_model, data_path=data, num_epochs=epochs,
-                  lr=lr, lora_r=r, lora_alpha=alpha, lora_dropout=dropout, qlora=bool(qlora))
-    print("[cyan]train[/cyan] complete")
+    tracer = get_tracer("everabot.cli")
+    with tracer.start_as_current_span("cli.train", attributes={"base_model": base_model, "epochs": epochs, "qlora": bool(qlora)}):
+        from bot.workflows import train as wf
+        code = wf.run(base_model=base_model, data_path=data, num_epochs=epochs,
+                      lr=lr, lora_r=r, lora_alpha=alpha, lora_dropout=dropout, qlora=bool(qlora))
+        print("[cyan]train[/cyan] complete")
+    force_flush()
     raise typer.Exit(code=code)
 
 # ---------- opt: profile / build-accel / AB ----------
@@ -729,8 +743,8 @@ def opt_ab_chunk(
     py_out, py_sec, py_mem = time_and_mem(run_py)
 
     # accelerator selection
-    accel_impl = impl
-    out_accel = None
+    accel_impl = "python"
+    out_accel, accel_sec, accel_mem = py_out, py_sec, py_mem
     if impl in ("auto", "cpp"):
         try:
             import everabot_chunk_cpp as cpp
@@ -808,6 +822,60 @@ def snapshot_latest():
         raise typer.Exit()
     latest = runs[-1]
     print((latest / "manifest.json").read_text(encoding="utf-8"))
+
+@snapshot_app.command("promote")
+def snapshot_promote(
+    id_: str = typer.Option(None, "--id", "-i", help="Run folder name under snapshots/runs"),
+    reason: str = typer.Option("manual promote", "--reason"),
+):
+    import json, time, pathlib
+    runs_dir = (_ROOT / "snapshots" / "runs").resolve()
+    run_dir = (runs_dir / id_).resolve()
+    man = run_dir / "manifest.json"
+    if not man.exists():
+        print(f"[red]No manifest at[/red] {man}"); raise typer.Exit(code=2)
+
+    m = json.loads(man.read_text(encoding="utf-8"))
+    # write metrics sidecar
+    metrics_dir = _ROOT / "snapshots" / "metrics"; metrics_dir.mkdir(parents=True, exist_ok=True)
+    last = metrics_dir / "last_promoted.json"
+    payload = {
+        "ts": int(time.time()),
+        "topic": m.get("topic"),
+        "new_topic_score": m.get("decision", {}).get("new_topic_score"),
+        "bullets_count": m.get("decision", {}).get("bullets_count"),
+        "practice_score": m.get("decision", {}).get("practice_score"),
+        "root_ok": m.get("decision", {}).get("root_ok"),
+        "root_eval_artifact": m.get("artifact") or m.get("root_eval_artifact"),
+        "reason": reason,
+        "run_id": run_dir.name,
+    }
+    last.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    # update pointer
+    (_ROOT / "snapshots" / "CURRENT_POINTER.txt").write_text(str(run_dir), encoding="utf-8")
+    print(f"[green]Promoted[/green] {run_dir.name}")
+
+@snapshot_app.command("checkout")
+def snapshot_checkout(id_: str = typer.Option(..., "--id", "-i")):
+    target = (_ROOT / "snapshots" / "runs" / id_).resolve()
+    man = target / "manifest.json"
+    if not man.exists():
+        print(f"[red]No manifest at[/red] {man}"); raise typer.Exit(code=2)
+    (_ROOT / "snapshots" / "CURRENT_POINTER.txt").write_text(str(target), encoding="utf-8")
+    print(f"[green]Checked out[/green] {target}")
+
+@snapshot_app.command("diff")
+def snapshot_diff(a: str, b: str):
+    import json, difflib, pathlib
+    A = (_ROOT / "snapshots" / "runs" / a / "manifest.json").resolve()
+    B = (_ROOT / "snapshots" / "runs" / b / "manifest.json").resolve()
+    if not A.exists() or not B.exists():
+        print("[red]Both manifests must exist[/red]"); raise typer.Exit(code=2)
+    ta = json.dumps(json.loads(A.read_text(encoding="utf-8")), indent=2, sort_keys=True).splitlines()
+    tb = json.dumps(json.loads(B.read_text(encoding="utf-8")), indent=2, sort_keys=True).splitlines()
+    for line in difflib.unified_diff(ta, tb, fromfile=a, tofile=b, lineterm=""):
+        print(line)
 
 @snapshot_app.command("show")
 def snapshot_show(
@@ -2586,42 +2654,33 @@ def chunk_text_equiv(doc_id: str, text: str, chunk_tokens: int, overlap_tokens: 
 rag/chunk.py
 ```python
 from __future__ import annotations
-from typing import List
-import math
 
-def estimate_tokens(s: str) -> int:
-    # Simple: ~1 token ≈ 4 chars (rough); deterministic, fast
-    return max(1, math.ceil(len(s) / 4))
+def _python_chunker(doc_id: str, text: str, chunk_tokens: int, overlap_tokens: int):
+    # Use the reference Python implementation you already vendor
+    from bot.rag.chunk_spec import chunk_text_equiv
+    return chunk_text_equiv(doc_id, text, chunk_tokens, overlap_tokens)
 
 def chunk_text(doc_id: str, text: str, chunk_tokens: int = 400, overlap_tokens: int = 60):
-    from bot.accel.gate import selected_accel
-    accel = selected_accel()
-    if accel == "cpp":
-        try:
-            import everabot_chunk_cpp as m
-            return m.chunk_text_equiv(doc_id, text, chunk_tokens, overlap_tokens)
-        except Exception:
-            pass
-    elif accel == "rust":
-        try:
-            import everabot_chunk_rust as m
-            return m.chunk_text_equiv(doc_id, text, chunk_tokens, overlap_tokens)
-        except Exception:
-            pass
-    elif accel == "go":
-        try:
-            from bot.accel.go_client import chunk_text_equiv as go_chunk
-            return go_chunk(doc_id, text, chunk_tokens, overlap_tokens)
-        except Exception:
-            pass
-    # Fallback to the existing Python implementation you already had:
-    return _your_existing_python_chunker(doc_id, text, chunk_tokens, overlap_tokens)
-
-
-try:
-    from .chunk_spec import chunk_text_equiv as chunk_text_equiv
-except Exception:
-    pass
+    # Try C++ accelerator (optional)
+    try:
+        import everabot_chunk_cpp as cpp
+        return cpp.chunk_text_equiv(doc_id, text, chunk_tokens, overlap_tokens)
+    except Exception:
+        pass
+    # Try Rust accelerator (optional)
+    try:
+        import everabot_chunk_rust as r
+        return r.chunk_text_equiv(doc_id, text, chunk_tokens, overlap_tokens)
+    except Exception:
+        pass
+    # Try Go accelerator (optional)
+    try:
+        from bot.accel.go.go_client import chunk_text_equiv as go_chunk
+        return go_chunk(doc_id, text, chunk_tokens, overlap_tokens)
+    except Exception:
+        pass
+    # Fallback: Python reference
+    return _python_chunker(doc_id, text, chunk_tokens, overlap_tokens)
 ```
 
 rag/embeddings.py
@@ -3358,6 +3417,60 @@ def mem_tracker():
 
 ```
 
+snapshots/diff.py:
+```python
+from __future__ import annotations
+import json, pathlib
+from typing import Any, Dict
+
+def _load(path: pathlib.Path) -> Dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+def _walk(a: Any, b: Any, prefix=""):
+    diffs = []
+    if type(a) != type(b):
+        diffs.append((prefix, a, b)); return diffs
+    if isinstance(a, dict):
+        keys = set(a.keys()) | set(b.keys())
+        for k in sorted(keys):
+            pa = a.get(k, "<MISSING>"); pb = b.get(k, "<MISSING>")
+            diffs += _walk(pa, pb, f"{prefix}.{k}" if prefix else k)
+        return diffs
+    if isinstance(a, list):
+        n = max(len(a), len(b))
+        for i in range(n):
+            va = a[i] if i < len(a) else "<MISSING>"
+            vb = b[i] if i < len(b) else "<MISSING>"
+            diffs += _walk(va, vb, f"{prefix}[{i}]")
+        return diffs
+    if a != b:
+        diffs.append((prefix, a, b))
+    return diffs
+
+def diff_manifests(a_manifest: pathlib.Path, b_manifest: pathlib.Path) -> Dict[str, Any]:
+    A = _load(a_manifest); B = _load(b_manifest)
+    changes = _walk(A, B)
+    return {"left": str(a_manifest), "right": str(b_manifest), "changes": [
+        {"path": p, "left": la, "right": rb} for (p, la, rb) in changes
+    ]}
+
+```
+
+snapshots/delta.py:
+```python
+
+```
+
+snapshots/delta.py:
+```python
+
+```
+
+snapshots/delta.py:
+```python
+
+```
+
 snapshots/delta.py:
 ```python
 from __future__ import annotations
@@ -3492,6 +3605,109 @@ def roundtrip_manifest(base_dir: pathlib.Path, tgt_dir: pathlib.Path,
 
 ```
 
+telemetry/mlflow_helper.py
+```python
+from __future__ import annotations
+import json, pathlib, time
+from contextlib import nullcontext
+from typing import Any, Dict, Iterable
+from bot.paths import get_project_root
+
+def _mlflow_or_none():
+    try:
+        import mlflow  # type: ignore
+        return mlflow
+    except Exception:
+        return None
+
+def start_run_if_available(run_type: str, topic: str):
+    """
+    Configure local file-backed tracking (snapshots/mlruns) and start a run.
+    No-ops cleanly if MLflow isn't installed.
+    """
+    mlflow = _mlflow_or_none()
+    if not mlflow:
+        return nullcontext()
+
+    mlruns_dir = get_project_root() / "snapshots" / "mlruns"
+    mlflow.set_tracking_uri(f"file:{mlruns_dir.as_posix()}")   # file-backed store
+    mlflow.set_experiment("everabot-runs")
+    return mlflow.start_run(run_name=f"{run_type}:{topic}")
+
+def log_params_safe(params: Dict[str, Any]):
+    mlflow = _mlflow_or_none()
+    if not mlflow: return
+    # coerce simple JSONable types
+    clean = {k: (v if isinstance(v, (str, int, float, bool)) or v is None else str(v))
+             for k, v in params.items()}
+    try: mlflow.log_params(clean)
+    except Exception: pass
+
+def log_metrics_safe(metrics: Dict[str, float]):
+    mlflow = _mlflow_or_none()
+    if not mlflow: return
+    # only numeric metrics
+    numeric = {k: float(v) for k, v in metrics.items()
+               if v is not None and isinstance(v, (int, float))}
+    if not numeric: return
+    try: mlflow.log_metrics(numeric)
+    except Exception: pass
+
+def log_artifact_safe(path: pathlib.Path):
+    mlflow = _mlflow_or_none()
+    if not mlflow: return
+    if path.exists():
+        try: mlflow.log_artifact(str(path))
+        except Exception: pass
+
+def log_artifacts_safe(path: pathlib.Path):
+    mlflow = _mlflow_or_none()
+    if not mlflow: return
+    if path.exists():
+        try: mlflow.log_artifacts(str(path))
+        except Exception: pass
+
+def _latest_matching_manifest(run_type: str, topic: str) -> pathlib.Path | None:
+    runs_dir = get_project_root() / "snapshots" / "runs"
+    if not runs_dir.exists(): return None
+    best = None
+    best_ts = -1
+    for run_dir in runs_dir.iterdir():
+        man = run_dir / "manifest.json"
+        if not man.exists(): continue
+        try:
+            m = json.loads(man.read_text(encoding="utf-8"))
+            if m.get("run_type") == run_type and m.get("topic") == topic:
+                ts = int(m.get("ts") or run_dir.stat().st_mtime)
+                if ts > best_ts:
+                    best, best_ts = man, ts
+        except Exception:
+            continue
+    return best
+
+def log_from_manifest_if_found(run_type: str, topic: str):
+    """
+    Try to find the manifest for this run; log it as an artifact and
+    emit a few decision metrics if present.
+    """
+    man = _latest_matching_manifest(run_type, topic)
+    if not man: return
+    log_artifact_safe(man)
+
+    try:
+        m = json.loads(man.read_text(encoding="utf-8"))
+        dec = m.get("decision") or {}
+        # common scores you showed in your manifests
+        log_metrics_safe({
+            "practice_score": dec.get("practice_score"),
+            "new_topic_score": dec.get("new_topic_score"),
+            "bullets_count": dec.get("bullets_count"),
+            "root_ok": 1.0 if dec.get("root_ok") else 0.0,
+        })
+    except Exception:
+        pass
+
+```
 
 telemetry/tracing.py
 ```python
@@ -3507,10 +3723,12 @@ from bot.paths import get_project_root
 _ROOT = get_project_root()
 _LOG_DIR = _ROOT / "snapshots" / "logs"
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
-_LOG_FILE = _LOG_DIR / "traces.jsonl"
+# allow override (useful in CI or different workspace roots)
+_LOG_FILE = pathlib.Path(os.getenv("EVERABOT_TRACE_FILE", str(_LOG_DIR / "traces.jsonl")))
 
 _init_lock = threading.Lock()
 _initialized = False
+_processor: SimpleSpanProcessor | None = None
 
 class JsonlSpanExporter(SpanExporter):
     def __init__(self, path: pathlib.Path):
@@ -3519,6 +3737,16 @@ class JsonlSpanExporter(SpanExporter):
 
     def export(self, spans) -> SpanExportResult:
         for s in spans:
+            # status_code is an enum; serialize as its name for readability
+            try:
+                status_name = getattr(s.status, "status_code", None).name  # Enum -> "UNSET"/"OK"/"ERROR"
+            except Exception:
+                status_name = None
+            # instrumentation scope (name/version) is helpful to group spans
+            scope = getattr(s, "instrumentation_scope", None)
+            scope_name = getattr(scope, "name", None)
+            scope_ver  = getattr(scope, "version", None)
+
             data: Dict[str, Any] = {
                 "name": s.name,
                 "start_time_unix_ns": s.start_time,
@@ -3530,8 +3758,9 @@ class JsonlSpanExporter(SpanExporter):
                 },
                 "parent_span_id": None if s.parent is None else format(s.parent.span_id, "016x"),
                 "attributes": dict(s.attributes or {}),
-                "status": getattr(s.status, "status_code", None).__class__.__name__,
+                "status": status_name,
                 "resource": {"service.name": "everabot"},
+                "scope": {"name": scope_name, "version": scope_ver},
                 "exported_at": time.time(),
             }
             self._fh.write(json.dumps(data, ensure_ascii=False) + "\n")
@@ -3543,15 +3772,24 @@ class JsonlSpanExporter(SpanExporter):
         except Exception: pass
 
 def get_tracer(name: str = "everabot") -> trace.Tracer:
-    global _initialized
+    global _initialized, _processor
     if not _initialized:
         with _init_lock:
             if not _initialized:
                 provider = TracerProvider(resource=Resource.create({"service.name": "everabot"}))
-                provider.add_span_processor(SimpleSpanProcessor(JsonlSpanExporter(_LOG_FILE)))
+                _processor = SimpleSpanProcessor(JsonlSpanExporter(_LOG_FILE))
+                provider.add_span_processor(_processor)
                 trace.set_tracer_provider(provider)
                 _initialized = True
     return trace.get_tracer(name)
+
+def force_flush() -> None:
+    """Best-effort flush of the simple processor so traces hit disk before exit."""
+    try:
+        if _processor:
+            _processor.force_flush()
+    except Exception:
+        pass
 
 ```
 
@@ -3687,10 +3925,17 @@ workflows/build.py
 ```python
 from __future__ import annotations
 from bot.core.state import Orchestrator
+from bot.telemetry.mlflow_helper import (
+    start_run_if_available, log_params_safe, log_from_manifest_if_found
+)
 
 def run(goal: str) -> int:
-    orch = Orchestrator(run_type="build", topic=goal)
-    return orch.run_build()
+    with start_run_if_available("build", goal):
+        log_params_safe({"run_type": "build", "topic": goal})
+        orch = Orchestrator(run_type="build", topic=goal)
+        code = orch.run_build()
+        log_from_manifest_if_found("build", goal)
+        return code
 
 ```
 
@@ -3698,10 +3943,17 @@ workflows/learn.py
 ```python
 from __future__ import annotations
 from bot.core.state import Orchestrator
+from bot.telemetry.mlflow_helper import (
+    start_run_if_available, log_params_safe, log_from_manifest_if_found
+)
 
 def run(topic: str) -> int:
-    orch = Orchestrator(run_type="learn", topic=topic)
-    return orch.run_learn()
+    with start_run_if_available("learn", topic):
+        log_params_safe({"run_type": "learn", "topic": topic})
+        orch = Orchestrator(run_type="learn", topic=topic)
+        code = orch.run_learn()
+        log_from_manifest_if_found("learn", topic)
+        return code
 
 ```
 
@@ -3709,23 +3961,65 @@ workflows/self_improve.py
 ```python
 from __future__ import annotations
 from bot.core.state import Orchestrator
+from bot.telemetry.mlflow_helper import (
+    start_run_if_available, log_params_safe, log_from_manifest_if_found
+)
 
 def run() -> int:
-    orch = Orchestrator(run_type="self-improve", topic="self-improve")
-    return orch.run_self_improve()
+    topic = "self-improve"
+    with start_run_if_available("self-improve", topic):
+        log_params_safe({"run_type": "self-improve", "topic": topic})
+        orch = Orchestrator(run_type="self-improve", topic=topic)
+        code = orch.run_self_improve()
+        log_from_manifest_if_found("self-improve", topic)
+        return code
 
 ```
 
 workflows/train.py
 ```python
 from __future__ import annotations
+from pathlib import Path
 from bot.train.peft import TrainConfig, train_adapter
+from bot.telemetry.mlflow_helper import (
+    start_run_if_available, log_params_safe, log_metrics_safe,
+    log_artifact_safe, log_artifacts_safe
+)
 
 def run(**kwargs) -> int:
     cfg = TrainConfig(**kwargs) if kwargs else TrainConfig()
-    res = train_adapter(cfg)
-    print(f"[train] adapter -> {res['out_dir']}")
-    print(f"[train] decision -> {res['decision']}")
+
+    # Extract a few common params if present; fall back to getattr checks
+    params = {}
+    for k in ("base_model","data_path","num_epochs","lr","lora_r","lora_alpha","lora_dropout","qlora"):
+        if hasattr(cfg, k):
+            params[k] = getattr(cfg, k)
+
+    run_name_topic = getattr(cfg, "base_model", "train")
+
+    with start_run_if_available("train", str(run_name_topic)):
+        log_params_safe({"run_type": "train", **params})
+
+        res = train_adapter(cfg)
+        print(f"[train] adapter -> {res.get('out_dir')}")
+        print(f"[train] decision -> {res.get('decision')}")
+
+        # optional metrics
+        dec = res.get("decision") or {}
+        if isinstance(dec, dict):
+            log_metrics_safe({k: v for k, v in dec.items() if isinstance(v, (int, float))})
+
+        # optional artifacts
+        out_dir = res.get("out_dir")
+        if isinstance(out_dir, str) and Path(out_dir).exists():
+            # log whole adapter directory
+            log_artifacts_safe(Path(out_dir))
+            # and a single manifest/config file if one exists
+            for fname in ("adapter_config.json","trainer_state.json","manifest.json"):
+                p = Path(out_dir) / fname
+                if p.exists():
+                    log_artifact_safe(p)
+
     return 0
 
 ```

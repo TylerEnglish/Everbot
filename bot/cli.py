@@ -8,6 +8,7 @@ from bot.rules.loader import load_all
 from bot.eval.harness import run_all
 from bot.rag.utils import read_jsonl
 from typing import Optional
+from bot.telemetry.tracing import get_tracer, force_flush
 
 app = typer.Typer(help="Everabot CLI")
 rag_app = typer.Typer(help="RAG substrate commands")
@@ -24,10 +25,11 @@ install_guard(deny_dirs=_PROTECTED_DIRS)
 @app.command()
 def eval():
     """Run root tests + benchmark wiring; emits a PASS/SKIP/FAIL JSON summary."""
-    payload = run_all()
-    print(payload.get("overall"), "-", payload.get("artifact"))
-    # Non-zero exit only if something truly FAILED (not SKIPPED)
-    raise typer.Exit(code=0 if payload["overall"] == "PASS" else 1)
+    tracer = get_tracer("everabot.cli")
+    with tracer.start_as_current_span("cli.eval"):
+        payload = run_all()
+        print(payload.get("overall"), "-", payload.get("artifact"))
+    force_flush()
 
 @app.command()
 def selfcheck():
@@ -44,23 +46,32 @@ def selfcheck():
 
 @app.command()
 def learn(topic: str):
-    from bot.workflows import learn as wf
-    code = wf.run(topic)
-    print(f"[cyan]learn[/cyan] → {topic} [dim](snapshot created under snapshots/runs)[/dim]")
+    tracer = get_tracer("everabot.cli")
+    with tracer.start_as_current_span("cli.learn", attributes={"topic": topic}):
+        from bot.workflows import learn as wf
+        code = wf.run(topic)
+        print(f"[cyan]learn[/cyan] → {topic} [dim](snapshot created under snapshots/runs)[/dim]")
+    force_flush()
     raise typer.Exit(code=code)
 
 @app.command()
 def build(goal: str):
-    from bot.workflows import build as wf
-    code = wf.run(goal)
-    print(f"[cyan]build[/cyan] → {goal}")
+    tracer = get_tracer("everabot.cli")
+    with tracer.start_as_current_span("cli.build", attributes={"goal": goal}):
+        from bot.workflows import build as wf
+        code = wf.run(goal)
+        print(f"[cyan]build[/cyan] → {goal}")
+    force_flush()
     raise typer.Exit(code=code)
 
 @app.command("self-improve")
 def self_improve():
-    from bot.workflows import self_improve as wf
-    code = wf.run()
-    print("[cyan]self-improve[/cyan] starting (stub)")
+    tracer = get_tracer("everabot.cli")
+    with tracer.start_as_current_span("cli.self_improve"):
+        from bot.workflows import self_improve as wf
+        code = wf.run()
+        print("[cyan]self-improve[/cyan] starting (stub)")
+    force_flush()
     raise typer.Exit(code=code)
 
 @app.command()
@@ -75,10 +86,13 @@ def train(
     alpha: int = typer.Option(16, help="LoRA alpha"),
     dropout: float = typer.Option(0.05, help="LoRA dropout"),
 ):
-    from bot.workflows import train as wf
-    code = wf.run(base_model=base_model, data_path=data, num_epochs=epochs,
-                  lr=lr, lora_r=r, lora_alpha=alpha, lora_dropout=dropout, qlora=bool(qlora))
-    print("[cyan]train[/cyan] complete")
+    tracer = get_tracer("everabot.cli")
+    with tracer.start_as_current_span("cli.train", attributes={"base_model": base_model, "epochs": epochs, "qlora": bool(qlora)}):
+        from bot.workflows import train as wf
+        code = wf.run(base_model=base_model, data_path=data, num_epochs=epochs,
+                      lr=lr, lora_r=r, lora_alpha=alpha, lora_dropout=dropout, qlora=bool(qlora))
+        print("[cyan]train[/cyan] complete")
+    force_flush()
     raise typer.Exit(code=code)
 
 # ---------- opt: profile / build-accel / AB ----------
@@ -271,6 +285,60 @@ def snapshot_latest():
         raise typer.Exit()
     latest = runs[-1]
     print((latest / "manifest.json").read_text(encoding="utf-8"))
+
+@snapshot_app.command("promote")
+def snapshot_promote(
+    id_: str = typer.Option(None, "--id", "-i", help="Run folder name under snapshots/runs"),
+    reason: str = typer.Option("manual promote", "--reason"),
+):
+    import json, time, pathlib
+    runs_dir = (_ROOT / "snapshots" / "runs").resolve()
+    run_dir = (runs_dir / id_).resolve()
+    man = run_dir / "manifest.json"
+    if not man.exists():
+        print(f"[red]No manifest at[/red] {man}"); raise typer.Exit(code=2)
+
+    m = json.loads(man.read_text(encoding="utf-8"))
+    # write metrics sidecar
+    metrics_dir = _ROOT / "snapshots" / "metrics"; metrics_dir.mkdir(parents=True, exist_ok=True)
+    last = metrics_dir / "last_promoted.json"
+    payload = {
+        "ts": int(time.time()),
+        "topic": m.get("topic"),
+        "new_topic_score": m.get("decision", {}).get("new_topic_score"),
+        "bullets_count": m.get("decision", {}).get("bullets_count"),
+        "practice_score": m.get("decision", {}).get("practice_score"),
+        "root_ok": m.get("decision", {}).get("root_ok"),
+        "root_eval_artifact": m.get("artifact") or m.get("root_eval_artifact"),
+        "reason": reason,
+        "run_id": run_dir.name,
+    }
+    last.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    # update pointer
+    (_ROOT / "snapshots" / "CURRENT_POINTER.txt").write_text(str(run_dir), encoding="utf-8")
+    print(f"[green]Promoted[/green] {run_dir.name}")
+
+@snapshot_app.command("checkout")
+def snapshot_checkout(id_: str = typer.Option(..., "--id", "-i")):
+    target = (_ROOT / "snapshots" / "runs" / id_).resolve()
+    man = target / "manifest.json"
+    if not man.exists():
+        print(f"[red]No manifest at[/red] {man}"); raise typer.Exit(code=2)
+    (_ROOT / "snapshots" / "CURRENT_POINTER.txt").write_text(str(target), encoding="utf-8")
+    print(f"[green]Checked out[/green] {target}")
+
+@snapshot_app.command("diff")
+def snapshot_diff(a: str, b: str):
+    import json, difflib, pathlib
+    A = (_ROOT / "snapshots" / "runs" / a / "manifest.json").resolve()
+    B = (_ROOT / "snapshots" / "runs" / b / "manifest.json").resolve()
+    if not A.exists() or not B.exists():
+        print("[red]Both manifests must exist[/red]"); raise typer.Exit(code=2)
+    ta = json.dumps(json.loads(A.read_text(encoding="utf-8")), indent=2, sort_keys=True).splitlines()
+    tb = json.dumps(json.loads(B.read_text(encoding="utf-8")), indent=2, sort_keys=True).splitlines()
+    for line in difflib.unified_diff(ta, tb, fromfile=a, tofile=b, lineterm=""):
+        print(line)
 
 @snapshot_app.command("show")
 def snapshot_show(

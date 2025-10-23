@@ -10,10 +10,12 @@ from bot.paths import get_project_root
 _ROOT = get_project_root()
 _LOG_DIR = _ROOT / "snapshots" / "logs"
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
-_LOG_FILE = _LOG_DIR / "traces.jsonl"
+# allow override (useful in CI or different workspace roots)
+_LOG_FILE = pathlib.Path(os.getenv("EVERABOT_TRACE_FILE", str(_LOG_DIR / "traces.jsonl")))
 
 _init_lock = threading.Lock()
 _initialized = False
+_processor: SimpleSpanProcessor | None = None
 
 class JsonlSpanExporter(SpanExporter):
     def __init__(self, path: pathlib.Path):
@@ -22,6 +24,16 @@ class JsonlSpanExporter(SpanExporter):
 
     def export(self, spans) -> SpanExportResult:
         for s in spans:
+            # status_code is an enum; serialize as its name for readability
+            try:
+                status_name = getattr(s.status, "status_code", None).name  # Enum -> "UNSET"/"OK"/"ERROR"
+            except Exception:
+                status_name = None
+            # instrumentation scope (name/version) is helpful to group spans
+            scope = getattr(s, "instrumentation_scope", None)
+            scope_name = getattr(scope, "name", None)
+            scope_ver  = getattr(scope, "version", None)
+
             data: Dict[str, Any] = {
                 "name": s.name,
                 "start_time_unix_ns": s.start_time,
@@ -33,8 +45,9 @@ class JsonlSpanExporter(SpanExporter):
                 },
                 "parent_span_id": None if s.parent is None else format(s.parent.span_id, "016x"),
                 "attributes": dict(s.attributes or {}),
-                "status": getattr(s.status, "status_code", None).__class__.__name__,
+                "status": status_name,
                 "resource": {"service.name": "everabot"},
+                "scope": {"name": scope_name, "version": scope_ver},
                 "exported_at": time.time(),
             }
             self._fh.write(json.dumps(data, ensure_ascii=False) + "\n")
@@ -46,12 +59,21 @@ class JsonlSpanExporter(SpanExporter):
         except Exception: pass
 
 def get_tracer(name: str = "everabot") -> trace.Tracer:
-    global _initialized
+    global _initialized, _processor
     if not _initialized:
         with _init_lock:
             if not _initialized:
                 provider = TracerProvider(resource=Resource.create({"service.name": "everabot"}))
-                provider.add_span_processor(SimpleSpanProcessor(JsonlSpanExporter(_LOG_FILE)))
+                _processor = SimpleSpanProcessor(JsonlSpanExporter(_LOG_FILE))
+                provider.add_span_processor(_processor)
                 trace.set_tracer_provider(provider)
                 _initialized = True
     return trace.get_tracer(name)
+
+def force_flush() -> None:
+    """Best-effort flush of the simple processor so traces hit disk before exit."""
+    try:
+        if _processor:
+            _processor.force_flush()
+    except Exception:
+        pass
