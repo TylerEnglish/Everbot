@@ -13,7 +13,12 @@ def ingest(urls: List[str], out_dir: pathlib.Path) -> dict:
     docs: List[Document] = []
     chunks: List[Chunk] = []
     for u in urls:
-        title, text = fetch(u)
+        try:
+            title, text = fetch(u)
+        except PermissionError as e:
+            # log and continue
+            print(f"[skip] {u} → {e}")
+            continue
         did = sha256_str(u)
         doc = Document(id=did, source=u, title=title, text=text, sha256=sha256_str(text))
         docs.append(doc)
