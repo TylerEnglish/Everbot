@@ -5,8 +5,6 @@ from bot.eval.harness import run_all
 from bot.selfopt.ab import ab_chunk
 from bot.accel.gate import set_chunk_preference
 from bot.paths import get_project_root
-
-# NEW: safe auto-refactorer (writes and adopts patches gated by tests)
 from bot.selfopt.autocoder import propose_and_apply_refactor, AutoCodeResult
 
 
@@ -18,7 +16,6 @@ def _git_safe_commit(msg: str, paths: list[str]) -> None:
         # not a git repo or nothing changed
         pass
 
-
 def _git_safe_revert() -> None:
     try:
         subprocess.check_call(["git", "reset", "--hard", "HEAD"])
@@ -26,29 +23,26 @@ def _git_safe_revert() -> None:
     except Exception:
         pass
 
-
 def _write_note(p: pathlib.Path, payload: dict) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-
 def _adopted_engine_marker() -> pathlib.Path:
     return get_project_root() / "snapshots" / "selfopt" / "ADOPTED_ENGINE.txt"
-
 
 def _record_adopted_engine(engine: str) -> None:
     m = _adopted_engine_marker()
     m.parent.mkdir(parents=True, exist_ok=True)
     m.write_text(engine.strip(), encoding="utf-8")
 
-
 def run() -> int:
     """
     1) A/B the chunker (python vs {cpp|rust|go}) with equivalence checks.
        If equivalent and >=1.5x faster, adopt via gate and record marker.
     2) Run root eval to ensure we didn't regress.
-    3) Auto-refactor pass (optional; only if LLM configured). Proposes a unified diff,
-       applies behind the guard, runs tests; if PASS, commits; else reverts.
+    3) Auto-refactor pass:
+       - Always writes artifacts (prompt/raw/diff) under snapshots/selfopt/autocode/<ts>/
+       - Applies patch if possible; runs tests; if PASS -> commit, else revert.
     """
     tracer = get_tracer("everabot.self_improve")
     with tracer.start_as_current_span("self_improve.entry"):
@@ -99,25 +93,35 @@ def run() -> int:
         # --- 3) Auto-refactor & code improvement (guarded + gated)
         auto_result: AutoCodeResult | None = None
         try:
-            auto_result = propose_and_apply_refactor(max_files=3)
+            auto_result = propose_and_apply_refactor(max_files=3, retries=2)
         except Exception as e:
-            print(f"[yellow]autocoder skipped[/yellow]: {e}")
+            print(f"[yellow]autocoder crashed[/yellow]: {e}")
 
-        if auto_result and auto_result.patch_applied:
-            # re-run root eval after code change
-            print("[cyan]autocoder[/cyan] → patch applied; running root eval...")
-            root2 = run_all()
-            ok2 = bool(root2.get("overall") in ("PASS", "OK"))
-            print(f"[cyan]autocoder[/cyan] root eval: {root2.get('overall')}")
+        if not auto_result:
+            print("[dim]autocoder[/dim]: skipped (no LLM or no hotspots)")
+            return 0 if ok_root else 1
 
-            if ok2:
-                _git_safe_commit(
-                    f"selfopt: autocode patch '{auto_result.title}' (tests PASS)",
-                    [str(p) for p in auto_result.touched_paths] + [auto_result.patch_path]
-                )
-            else:
-                print("[red]autocoder change failed tests; reverting[/red]")
-                _git_safe_revert()
-                # keep the patch artifact for inspection; commit only the patch file if desired
+        # Always report what happened and where artifacts live
+        print(f"[cyan]autocoder[/cyan]: {auto_result.note}")
+        print(f"[dim]artifacts:[/dim] {auto_result.artifacts_dir}")
 
-        return 0 if ok_root else 1
+        if not auto_result.patch_applied:
+            # Nothing applied; we still keep artifacts for inspection
+            return 0 if ok_root else 1
+
+        # re-run root eval after code change
+        print("[cyan]autocoder[/cyan] → patch applied; running root eval...")
+        root2 = run_all()
+        ok2 = bool(root2.get("overall") in ("PASS", "OK"))
+        print(f"[cyan]autocoder[/cyan] root eval: {root2.get('overall')}")
+
+        if ok2:
+            _git_safe_commit(
+                f"selfopt: autocode patch '{auto_result.title}' (tests PASS)",
+                [str(p) for p in auto_result.touched_paths if p] + [auto_result.patch_path]
+            )
+        else:
+            print("[red]autocoder change failed tests; reverting[/red]")
+            _git_safe_revert()
+
+        return 0 if (ok_root and ok2) else 1
