@@ -1,23 +1,88 @@
 version: 1
 seeds:
-  # Agentic / memory / RAG / reflection
+  # ---------------- Core agentic / LLM / RAG (kept + a few adds) ----------------
   - https://arxiv.org/pdf/2510.04618           # ACE
   - https://arxiv.org/pdf/2303.11366           # Reflexion
   - https://arxiv.org/pdf/2005.11401           # RAG (Lewis et al.)
   - https://arxiv.org/pdf/1702.08734           # FAISS
   - https://arxiv.org/pdf/2310.03051           # LLMLingua
-
-  # Parquet/Arrow & data engineering
   - https://arrow.apache.org/overview/         # Apache Arrow overview
   - https://parquet.apache.org/docs/overview/  # Parquet overview
-
-  # Perf & profiling
   - https://github.com/benfred/py-spy/blob/master/README.md
-
-  # API & framework docs
   - https://fastapi.tiangolo.com/tutorial/
   - https://pytorch.org/tutorials/
   - https://huggingface.co/docs/transformers/index
-
-  # Standards / deltas
   - https://datatracker.ietf.org/doc/html/rfc3284   # VCDIFF (HTML canonical)
+
+  # ---------------- Systems programming: C / C++ / Rust / Erlang / Assembly ----------------
+  - https://en.cppreference.com/w/                      # C/C++ language + stdlib reference
+  - https://gcc.gnu.org/onlinedocs/                     # GCC manuals
+  - https://sourceware.org/glibc/manual/                # glibc manual
+  - https://llvm.org/docs/LangRef.html                  # LLVM IR reference
+  - https://doc.rust-lang.org/book/                     # The Rust Programming Language
+  - https://doc.rust-lang.org/nomicon/                  # Rustonomicon (unsafe Rust)
+  - https://www.erlang.org/doc/                         # Erlang docs
+  - https://www.agner.org/optimize/                     # Agner Fog optimization manuals
+  - https://uops.info/                                  # x86 µarch latency/throughput tables
+  - https://man7.org/linux/man-pages/                   # Linux man-pages (syscalls, POSIX)
+  - https://pubs.opengroup.org/onlinepubs/9699919799/   # POSIX/SUS specification
+  - https://github.com/riscv/riscv-isa-manual           # RISC-V ISA (unpriv + priv spec)
+  - https://www.valgrind.org/docs/                      # Valgrind docs
+  - https://www.brendangregg.com/linuxperf.html         # Linux perf & eBPF guides
+  - https://htmx.org/docs/                              # HTMX docs (for your FastAPI/HTMX lane)
+
+  # ---------------- Binary interfaces / ABIs / File formats ----------------
+  - https://refspecs.linuxfoundation.org/elf/elf.pdf    # System V ELF gABI
+  - https://cs61.seas.harvard.edu/site/2022/pdf/x86-64-abi-20210928.pdf  # x86-64 psABI (AMD64)
+  - https://itanium-cxx-abi.github.io/cxx-abi/abi.html  # Itanium C++ ABI (exceptions, RTTI)
+
+  # ---------------- Software architecture / OOP / Design ----------------
+  - https://refactoring.guru/design-patterns            # Design patterns & refactoring
+  - https://martinfowler.com/articles/microservices.html#     # Microservices essay
+  - https://c4model.com/introduction                    # C4 model overview
+
+  # ---------------- Problem solving: kids → advanced (math/CS) ----------------
+  - https://nrich.maths.org/home                        # NRICH rich tasks (all ages)
+  - https://artofproblemsolving.com/resources           # AoPS problem solving resources
+  - https://cp-algorithms.com/                          # CP-Algorithms (algorithms encyclopedia)
+  - https://www.redblobgames.com/pathfinding/a-star/introduction.html  # Pathfinding explainers
+  - https://projecteuler.net/                           # Project Euler
+
+  # ---------------- Math / Calculus / Physics / Chemistry ----------------
+  - https://openstax.org/details/books/calculus-volume-1    # OpenStax Calculus Vol. 1
+  - https://phys.libretexts.org/                            # LibreTexts Physics library
+  - https://webbook.nist.gov/chemistry/                     # NIST Chemistry WebBook
+  - https://goldbook.iupac.org/                             # IUPAC Gold Book (terminology)
+  - https://pubchem.ncbi.nlm.nih.gov/                       # PubChem chemical database
+
+  # ---------------- Neuroscience / Physiology / Biology / Evolution ----------------
+  - https://portal.brain-map.org/                           # Allen Brain Map (brain atlases, data)
+  - https://www.humanconnectome.org/                        # Human Connectome Project
+  - https://braininitiative.nih.gov/                         # NIH BRAIN Initiative
+  - https://openstax.org/details/books/anatomy-and-physiology-2e  # OpenStax A&P
+  - https://medlineplus.gov/healthtopics.html               # MedlinePlus health topics hub
+  - https://evolution.berkeley.edu/                         # UCMP Understanding Evolution
+  - https://opentreeoflife.org/                             # Open Tree of Life
+
+  # ---------------- Computer architecture (teaching/refs) ----------------
+  - https://csapp.cs.cmu.edu/                               # CS:APP resources (systems/arch)
+  - https://cs61c.org/                                      # Berkeley CS61C (Great Ideas in Comp Arch)
+  - https://developer.arm.com/documentation/                # Arm architecture docs
+  - https://docs.nvidia.com/cuda/                           # CUDA programming guide (GPU arch)
+
+  # ---------------- Construction architecture / codes / resilience ----------------
+  - https://www.energycodes.gov/                            # DOE Building Energy Codes Program
+  - https://www.ashrae.org/technical-resources/bookstore/standard-90-1   # ASHRAE 90.1 overview
+  - https://www.wbdg.org/                                   # Whole Building Design Guide (NIBS)
+  - https://www.aisc.org/publications/steel-construction-manual-resources/  # AISC Steel Manual resources
+  - https://www.iccsafe.org/                                # International Code Council (IBC/IRC)
+  - https://www.fema.gov/emergency-managers/risk-management/building-science   # FEMA Building Science
+
+  # ---------------- Personal finance / Business finance / Markets & macro ----------------
+  - https://www.consumerfinance.gov/consumer-tools/         # CFPB consumer tools & answers
+  - https://www.finra.org/investors                         # FINRA investor education/tools
+  - https://www.irs.gov/publications/p17                    # IRS Pub 17 (individual tax guide)
+  - https://www.sec.gov/edgar/search/                       # SEC EDGAR full-text filings
+  - https://fred.stlouisfed.org/                            # FRED (macro time series)
+  - https://www.bls.gov/cpi/                                # CPI homepage (BLS)
+  - https://apps.bea.gov/iTable/?reqid=19&step=2            # BEA NIPA tables (GDP, PCE)
