@@ -116,27 +116,38 @@ def learn(
     topic: str,
     strategy: str = typer.Option("ace", help="Strategy override"),
     auto: bool = typer.Option(False, "--auto", help="Pick topic automatically"),
-    loop: bool = typer.Option(
-        False, "--loop", help="Run continuous learn cycles until stopped"
-    ),
-    autopromote: bool = typer.Option(
-        False,
-        "--autopromote",
-        help="After each learn, rebuild v2 from canon v1, prove equivalence, and flip pointer on pass",
-    ),
+    loop: bool = typer.Option(False, "--loop", help="Run continuous learn cycles until stopped"),
+    autopromote: bool = typer.Option(False, "--autopromote", help="After each learn, rebuild v2 from canon v1, prove equivalence, and flip pointer on pass")
 ):
     tracer = get_tracer("everabot.cli")
-    with tracer.start_as_current_span("cli.learn", attributes={"topic": topic}):
-        from bot.workflows import learn as wf
+    from bot.workflows import learn as wf
+    import time, subprocess, sys
+    pick_auto = auto or (topic.strip().lower() == "auto")
 
-        pick_auto = auto or (topic.strip().lower() == "auto")
-        code = wf.run(topic if not pick_auto else "auto", strategy=strategy)
-        print(
-            f"[cyan]learn[/cyan] → {topic} [dim](snapshot created under snapshots/runs)[/dim]"
-        )
-    force_flush()
-    raise typer.Exit(code=code)
+    def once():
+        with tracer.start_as_current_span("cli.learn", attributes={"topic": topic}):
+            code = wf.run(topic if not pick_auto else "auto", strategy=strategy)
+            print(f"[cyan]learn[/cyan] → {topic} [dim](snapshot created under snapshots/runs)[/dim]")
+        if autopromote:
+            # reuse the built-in canary equivalence + pointer flip
+            subprocess.run([sys.executable, "-m", "bot.cli", "rag", "canary-migrate", "--from", "v1", "--to", "v2", "--flip"], check=False)
+        return code
 
+    if not loop:
+        code = once()
+        force_flush()
+        raise typer.Exit(code=code)
+
+    # continuous mode
+    backoff = 30  # seconds between cycles (tweak as you like)
+    try:
+        while True:
+            code = once()
+            force_flush()
+            time.sleep(backoff)
+    except KeyboardInterrupt:
+        print("\n[dim]Exiting loop.[/dim]")
+        raise typer.Exit(code=0)
 
 @curr_app.command("list")
 def curr_list():
