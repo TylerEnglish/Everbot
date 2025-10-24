@@ -1,0 +1,11 @@
+{
+  "type": "record",
+  "name": "RagDoc",
+  "namespace": "everabot.rag",
+  "fields": [
+    {"name": "id", "type": "string"},
+    {"name": "title", "type": ["null","string"], "default": null},
+    {"name": "url", "type": ["null","string"], "default": null},
+    {"name": "text", "type": "string"}
+  ]
+}

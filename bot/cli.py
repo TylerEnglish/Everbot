@@ -47,8 +47,13 @@ def selfcheck():
     raise typer.Exit(code=0 if ok else 1)
 
 @app.command()
-def learn(topic: str, auto: bool = typer.Option(False, "--auto", help="Pick next sub-skill automatically"),
-          strategy: str = typer.Option(None, "--strategy", help="Force strategy (ace|long_context|vanilla)")):
+def learn(
+    topic: str,
+    strategy: str = typer.Option("ace", help="Strategy override"),
+    auto: bool = typer.Option(False, "--auto", help="Pick topic automatically"),
+    loop: bool = typer.Option(False, "--loop", help="Run continuous learn cycles until stopped"),
+    autopromote: bool = typer.Option(False, "--autopromote", help="After each learn, rebuild v2 from canon v1, prove equivalence, and flip pointer on pass")
+):
     tracer = get_tracer("everabot.cli")
     with tracer.start_as_current_span("cli.learn", attributes={"topic": topic}):
         from bot.workflows import learn as wf

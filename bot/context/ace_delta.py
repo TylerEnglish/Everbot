@@ -1,6 +1,6 @@
 from __future__ import annotations
 import json, pathlib
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Union, Sequence
 
 def _read_bullets(path: pathlib.Path) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -11,12 +11,20 @@ def _read_bullets(path: pathlib.Path) -> List[Dict[str, Any]]:
             except Exception: continue
     return out
 
-def compute_delta(prev_file: pathlib.Path, new_bullets: List[Dict[str, Any]]) -> Dict[str, Any]:
-    prev = _read_bullets(prev_file) if prev_file else []
+PrevType = Union[pathlib.Path, Sequence[Dict[str, Any]], None]
+def compute_delta(prev_source: PrevType, new_bullets: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if isinstance(prev_source, (list, tuple)):
+        prev = list(prev_source)
+    elif isinstance(prev_source, pathlib.Path):
+        prev = _read_bullets(prev_source)
+    elif prev_source is None:
+        prev = []
+    else:
+        # Be defensive but never crash the run
+        prev = []
     prev_set = {b.get("text","").strip() for b in prev}
     new_set  = {b.get("text","").strip() for b in new_bullets}
     added    = sorted(x for x in (new_set - prev_set) if x)
     removed  = sorted(x for x in (prev_set - new_set) if x)
-    unchanged= sorted(new_set & prev_set)
-    return {"added": added, "removed": removed, "unchanged": unchanged,
-            "prev_file": str(prev_file) if prev_file else None}
+    unchanged = sorted(x for x in (new_set & prev_set) if x)
+    return {"added": added, "removed": removed, "unchanged": unchanged}

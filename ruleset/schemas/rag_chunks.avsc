@@ -1,0 +1,11 @@
+{
+  "type": "record",
+  "name": "RagChunk",
+  "namespace": "everabot.rag",
+  "fields": [
+    {"name": "id", "type": "string"},
+    {"name": "doc_id", "type": "string"},
+    {"name": "order", "type": "int"},
+    {"name": "text", "type": "string"}
+  ]
+}

@@ -1641,6 +1641,13 @@ class Orchestrator:
                     cfg = self.rules
                     seeds = (cfg.get("seeds", {}) or {}).get("seeds", []) or []
                     pinned = _ROOT / "snapshots" / "rag" / "v1"
+                    # Optional pointer switch for canary migration (Task 13)
+                    ptr = _ROOT / "snapshots" / "rag" / "CURRENT_STORE.txt"
+                    try:
+                        if ptr.exists():
+                            cand = pathlib.Path(ptr.read_text(encoding="utf-8").strip())
+                            if cand.exists(): pinned = cand
+                    except Exception: pass
                     rag_dir = self.info.snapshot_dir / "rag_store"
 
                     rag_dir.mkdir(parents=True, exist_ok=True)
