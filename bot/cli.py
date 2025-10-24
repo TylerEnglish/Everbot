@@ -1,6 +1,8 @@
 from __future__ import annotations
 import os
 import typer, sys, pathlib, subprocess, json
+import shutil
+from typing import Optional
 from rich import print
 from bot.security.guard import install_guard
 from bot.paths import get_project_root
@@ -580,6 +582,90 @@ def rag_export(
     canon_chunks = canonicalize_json_rows(rows)
     (out_dir / "chunks.canon.jsonl").write_bytes(canon_chunks)
     print(f"Exported canonical docs/chunks to {out_dir}")
+
+@rag_app.command("rebuild-from-docs")
+def rag_rebuild_from_docs(
+    source: str = typer.Option(..., "--source", "-i", help="Path to docs.canon.jsonl (or docs.jsonl)"),
+    target: str = typer.Option(..., "--target", "-o", help="Target store dir (e.g., snapshots/rag/v2)"),
+    chunk_toks: int = typer.Option(400, "--chunk-toks"),
+    overlap: int = typer.Option(60, "--overlap"),
+):
+    """
+    Build a candidate store from canonical docs with identical chunking.
+    PowerShell-friendly wrapper around the internal helper.
+    """
+    from bot.core.state import _rebuild_store_from_docs
+    src = pathlib.Path(source)
+    tgt = pathlib.Path(target)
+    tgt.mkdir(parents=True, exist_ok=True)
+    _rebuild_store_from_docs(src, tgt, chunk_toks, overlap)
+    print(f"[green]Rebuilt candidate store at[/green] {tgt}")
+
+def _copy_schema_registry(to_dir: pathlib.Path) -> None:
+    """Copy Avro schemas + capture Arrow schema snapshot for chunks to guard drift."""
+    to_schemas = to_dir / "schemas"
+    to_schemas.mkdir(parents=True, exist_ok=True)
+    root = pathlib.Path(__file__).resolve().parents[1]
+    avro_src = root / "ruleset" / "schemas"
+    for f in avro_src.glob("*.avsc"):
+        shutil.copy2(f, to_schemas / f.name)
+    # optional: capture the live Parquet (Arrow) schema if present
+    try:
+        import pyarrow.parquet as pq
+        chunks = (to_dir / "chunks.parquet")
+        if chunks.exists():
+            schema = pq.read_table(chunks).schema
+            (to_schemas / "chunks.arrow.json").write_text(schema.to_string(show_field_metadata=True))
+    except Exception:
+        # non-fatal; Avro files are still copied
+        pass
+
+@rag_app.command("canary-migrate")
+def rag_canary_migrate(
+    src: str = typer.Option("v1", "--from"),
+    dst: str = typer.Option("v2", "--to"),
+    chunk_toks: int = typer.Option(400, "--chunk-toks"),
+    overlap: int = typer.Option(60, "--overlap"),
+    flip_on_pass: bool = typer.Option(True, "--flip/--no-flip"),
+):
+    """
+    Full canary: export golden → rebuild candidate → equivalence (hash+top-k) → flip pointer.
+    Uses existing subcommands to avoid duplication.
+    """
+    root = get_project_root()
+    canon = root / "snapshots" / "rag" / f"canon_{src}"
+    # 1) export golden dumps
+    canon.mkdir(parents=True, exist_ok=True)
+    print("[cyan]Exporting golden dumps...[/cyan]")
+    subprocess.run(
+        ["python", "-m", "bot.cli", "rag", "export", "-s", src, "-o", str(canon)],
+        check=True
+    )
+    # 2) rebuild candidate from golden docs (identical chunking)
+    v2_dir = root / "snapshots" / "rag" / dst
+    print("[cyan]Rebuilding candidate store from canonical docs...[/cyan]")
+    rag_rebuild_from_docs(
+        source=str(canon / "docs.canon.jsonl"),
+        target=str(v2_dir),
+        chunk_toks=chunk_toks,
+        overlap=overlap,
+    )
+    _copy_schema_registry(v2_dir)
+    # 3) prove equivalence
+    print("[cyan]Proving equivalence (bitwise + top-k)...[/cyan]")
+    res = subprocess.run(
+        ["python", "-m", "bot.cli", "rag", "prove-equivalence", src, dst],
+        check=False
+    )
+    if res.returncode != 0:
+        print("[red]Equivalence FAILED — pointer not flipped.[/red]")
+        raise typer.Exit(code=1)
+    # 4) flip pointer on full pass
+    if flip_on_pass:
+        cur = root / "snapshots" / "rag" / "CURRENT_STORE.txt"
+        cur.write_text(str(v2_dir.resolve()))
+        print(f"[green]Pointer flipped →[/green] {cur} = {v2_dir}")
+    print("[green]Canary migration complete.[/green]")
 
 @rag_app.command("prove-equivalence")
 def rag_prove_equivalence(
