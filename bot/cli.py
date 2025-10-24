@@ -9,6 +9,7 @@ from bot.paths import get_project_root
 from bot.rules.loader import load_all
 from bot.eval.harness import run_all
 from bot.rag.utils import read_jsonl
+from bot.rag.utils import write_jsonl
 from typing import Optional
 from bot.telemetry.tracing import get_tracer, force_flush
 
@@ -591,34 +592,42 @@ def rag_rebuild_from_docs(
     overlap: int = typer.Option(60, "--overlap"),
 ):
     """
-    Build a candidate store from canonical docs with identical chunking.
-    PowerShell-friendly wrapper around the internal helper.
+    Rebuild a candidate store (chunks/embeddings/index) *and* ensure docs.jsonl exists
+    so downstream export/equivalence/delta steps can run.
     """
     from bot.core.state import _rebuild_store_from_docs
-    src = pathlib.Path(source)
-    tgt = pathlib.Path(target)
-    tgt.mkdir(parents=True, exist_ok=True)
-    _rebuild_store_from_docs(src, tgt, chunk_toks, overlap)
-    print(f"[green]Rebuilt candidate store at[/green] {tgt}")
 
-def _copy_schema_registry(to_dir: pathlib.Path) -> None:
-    """Copy Avro schemas + capture Arrow schema snapshot for chunks to guard drift."""
-    to_schemas = to_dir / "schemas"
-    to_schemas.mkdir(parents=True, exist_ok=True)
-    root = pathlib.Path(__file__).resolve().parents[1]
-    avro_src = root / "ruleset" / "schemas"
-    for f in avro_src.glob("*.avsc"):
-        shutil.copy2(f, to_schemas / f.name)
-    # optional: capture the live Parquet (Arrow) schema if present
-    try:
-        import pyarrow.parquet as pq
-        chunks = (to_dir / "chunks.parquet")
-        if chunks.exists():
-            schema = pq.read_table(chunks).schema
-            (to_schemas / "chunks.arrow.json").write_text(schema.to_string(show_field_metadata=True))
-    except Exception:
-        # non-fatal; Avro files are still copied
-        pass
+    src = pathlib.Path(source).resolve()
+    out = pathlib.Path(target)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # 1) Always materialize docs.jsonl in the target (source may be docs.canon.jsonl).
+    docs_out = out / "docs.jsonl"
+    if not docs_out.exists():
+        rows = list(read_jsonl(src))
+        write_jsonl(docs_out, rows)
+
+    # 2) Build chunks/embeddings/index using the provided docs.
+    _rebuild_store_from_docs(src, out, chunk_toks, overlap)
+
+    # 3) Drop schema registry alongside the candidate.
+    _copy_schema_registry(out)
+
+    print(f"Rebuilt candidate store at {out}")
+
+def _copy_schema_registry(dst: pathlib.Path) -> None:
+    """
+    Copy Avro/Arrow schema files into the candidate store to make schema drift explicit.
+    """
+    root = get_project_root()
+    src = root / "ruleset" / "schemas"
+    out = dst / "schemas"
+    out.mkdir(parents=True, exist_ok=True)
+    if src.exists():
+        for f in src.iterdir():
+            if f.is_file():
+                (out / f.name).write_bytes(f.read_bytes())
+
 
 @rag_app.command("canary-migrate")
 def rag_canary_migrate(
