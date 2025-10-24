@@ -17,7 +17,7 @@ _CT_ALLOW = set(_TOOLS.get("content_types_allowlist") or [])
 _MAX_BYTES = int(_TOOLS.get("max_bytes_per_doc") or 0) or None
 
 # Allowed hosts with optional suffix matching
-_ALLOWED = {h.lower() for h in (_NET.get("allowed_hosts") or [])}
+_ALLOWED = set(policy.get("net", {}).get("allowed_hosts", []) or [])
 _ALLOW_SUFFIX = bool(_NET.get("allow_suffix", True))  # default True if not set
 
 # RFC PDF path typo helper (rfcXXXX.pdf)
