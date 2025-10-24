@@ -1,6 +1,8 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+from .types import Skill, TopicCfg  # whatever you already import today
+from bot.rules.loader import load_all
 import json, pathlib, re
 from bot.rules.loader import load_all
 from bot.paths import get_project_root
@@ -52,24 +54,40 @@ def is_done(topic: str, skill_id: str) -> bool:
 
 def load_registry() -> Dict[str, TopicCfg]:
     cfg = load_all().get("topics", {})
-    topics = cfg.get("topics", {}) or {}
+    raw = cfg.get("topics") or {}
+
+    # Normalize: support both dict (legacy) and list (new)
+    if isinstance(raw, list):
+        topics_iter = [(t.get("id") or t.get("name"), t) for t in raw]
+    elif isinstance(raw, dict):
+        topics_iter = raw.items()
+    else:
+        topics_iter = []
+
     out: Dict[str, TopicCfg] = {}
-    for tname, tcfg in topics.items():
-        skills_raw = tcfg.get("skills", []) or []
-        skills = []
+    for tname, tcfg in topics_iter:
+        if not tname or not isinstance(tcfg, dict):
+            continue
+        skills_raw = (tcfg.get("skills") or [])
+        skills: List[Skill] = []
         for s in skills_raw:
+            # Be permissive with missing fields
             skills.append(Skill(
-                topic=tname, id=s["id"], title=s["title"],
+                id=s["id"],
+                title=s.get("title", s["id"]),
                 est_gain=float(s.get("est_gain", 0.0)),
                 risk_regression=float(s.get("risk_regression", 0.0)),
-                time_min=int(s.get("time_min", 1)),
-                cpu_pct_est=int(s.get("cpu_pct_est", 10)),
-                ram_mb_est=int(s.get("ram_mb_est", 64)),
+                time_min=int(s.get("time_min", 0)),
+                cpu_pct_est=int(s.get("cpu_pct_est", 0)),
+                ram_mb_est=int(s.get("ram_mb_est", 0)),
+                notes=s.get("notes", None),
             ))
-        out[_slug(tname)] = TopicCfg(
-            name=tname,
-            safety_level=str(tcfg.get("safety_level", "low")),
-            default_strategies=list(tcfg.get("default_strategies", ["vanilla"])),
+        out[tname] = TopicCfg(
+            id=tcfg.get("id", tname),
+            name=tcfg.get("name", tname),
+            safety_level=tcfg.get("safety_level", "low"),
+            default_strategies=list(tcfg.get("default_strategies", [])),
+            notes=tcfg.get("notes", None),
             skills=skills,
         )
     return out
