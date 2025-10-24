@@ -9,18 +9,19 @@ from bot.rules.loader import load_all
 
 _UA = {"User-Agent": "Everabot/0.1 (+https://example.invalid)"}
 
-# allow-list pulled from ruleset/tools.yaml
-_ALLOWED = {h.lower() for h in (load_all().get("tools", {}).get("net", {}).get("allowed_hosts", []) or [])}
-
-# match mistaken RFC PDF paths like https://www.rfc-editor.org/rfc/rfc3284.pdf
-_RFC_PDF_MISPATH = re.compile(r"^https?://(?:www\.)?rfc-editor\.org/rfc/rfc(\d+)\.pdf$", re.I)
-
-_TOOLS   = load_all().get("tools", {}) or {}
-_RL_CFG  = (_TOOLS.get("internet", {}) or {}).get("rate_limit", {}) or {}
-_CT_ALLOW = set((_TOOLS.get("content_types_allowlist") or []))
+# ----- Load policy once -----
+_TOOLS    = load_all().get("tools", {}) or {}
+_NET      = (_TOOLS.get("net") or {})
+_RL_CFG   = (_TOOLS.get("internet", {}) or {}).get("rate_limit", {}) or {}
+_CT_ALLOW = set(_TOOLS.get("content_types_allowlist") or [])
 _MAX_BYTES = int(_TOOLS.get("max_bytes_per_doc") or 0) or None
-_ALLOWED = set(policy.get("net", {}).get("allowed_hosts", []) or [])
-_ALLOW_SUFFIX = True  # or read a flag from tools.yaml
+
+# Allowed hosts with optional suffix matching
+_ALLOWED = {h.lower() for h in (_NET.get("allowed_hosts") or [])}
+_ALLOW_SUFFIX = bool(_NET.get("allow_suffix", True))  # default True if not set
+
+# RFC PDF path typo helper (rfcXXXX.pdf)
+_RFC_PDF_MISPATH = re.compile(r"^https?://(?:www\.)?rfc-editor\.org/rfc/rfc(\d+)\.pdf$", re.I)
 
 def _host_allowed(host: str) -> bool:
     if not _ALLOWED:
@@ -39,6 +40,7 @@ class _TokenBucket:
         self.window = max(1, int(window_ms))
         self.lock = threading.Lock()
         self.last = time.time()
+
     def take(self, n: int = 1):
         if self.rate <= 0 or self.capacity <= 0:
             return
@@ -65,6 +67,7 @@ _BUCKET = _TokenBucket(
     int(_RL_CFG.get("burst_max") or 0),
     int(_RL_CFG.get("window_ms") or 1000),
 )
+
 
 def _req(url: str) -> requests.Response:
     _BUCKET.take()
