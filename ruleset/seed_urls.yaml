@@ -1,6 +1,23 @@
 version: 1
 seeds:
-  - https://arxiv.org/pdf/2510.04618        # ACE
-  - https://arxiv.org/pdf/2303.11366        # Reflexion
-  - https://arxiv.org/pdf/2005.11401        # RAG (Lewis et al.)
-  - https://datatracker.ietf.org/doc/html/rfc3284  # VCDIFF (HTML canonical)
+  # Agentic / memory / RAG / reflection
+  - https://arxiv.org/pdf/2510.04618           # ACE
+  - https://arxiv.org/pdf/2303.11366           # Reflexion
+  - https://arxiv.org/pdf/2005.11401           # RAG (Lewis et al.)
+  - https://arxiv.org/pdf/1702.08734           # FAISS
+  - https://arxiv.org/pdf/2310.03051           # LLMLingua
+
+  # Parquet/Arrow & data engineering
+  - https://arrow.apache.org/overview/         # Apache Arrow overview
+  - https://parquet.apache.org/docs/overview/  # Parquet overview
+
+  # Perf & profiling
+  - https://github.com/benfred/py-spy/blob/master/README.md
+
+  # API & framework docs
+  - https://fastapi.tiangolo.com/tutorial/
+  - https://pytorch.org/tutorials/
+  - https://huggingface.co/docs/transformers/index
+
+  # Standards / deltas
+  - https://datatracker.ietf.org/doc/html/rfc3284   # VCDIFF (HTML canonical)
