@@ -25,3 +25,5 @@ repos:
         entry: python bin/precommit_block_protected.py
         language: system
         pass_filenames: false
+        always_run: true
+        files: ""   # force run
