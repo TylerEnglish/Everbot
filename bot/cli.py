@@ -117,24 +117,49 @@ def learn(
     strategy: str = typer.Option("ace", help="Strategy override"),
     auto: bool = typer.Option(False, "--auto", help="Pick topic automatically"),
     loop: bool = typer.Option(False, "--loop", help="Run continuous learn cycles until stopped"),
-    autopromote: bool = typer.Option(False, "--autopromote", help="After each learn, rebuild v2 from canon v1, prove equivalence, and flip pointer on pass")
+    autopromote: bool = typer.Option(
+        False,
+        "--autopromote",
+        help="After each learn, rebuild v2 from canon v1, prove equivalence, and flip pointer on pass",
+    ),
 ):
+    """
+    Run one (or continuous) learn + self-eval + self-improve cycle.
+    If --autopromote is set, runs a canary migration (docs-bitwise + top-k) and flips pointer on pass.
+    """
     tracer = get_tracer("everabot.cli")
-    from bot.workflows import learn as wf
-    import time, subprocess, sys
     pick_auto = auto or (topic.strip().lower() == "auto")
+    chosen = topic if not pick_auto else "auto"
 
-    def once():
-        with tracer.start_as_current_span("cli.learn", attributes={"topic": topic}):
-            code = wf.run(topic if not pick_auto else "auto", strategy=strategy)
+    def once() -> int:
+        # 1) learn
+        with tracer.start_as_current_span("cli.learn", attributes={"topic": chosen}):
+            from bot.workflows import learn as wf
+            code = wf.run(chosen, strategy=strategy)
+            print(f"[cyan]learn[/cyan] → {chosen} [dim](snapshot created under snapshots/runs)[/dim]")
+
+        # 2) root eval (explicitly)
+        payload = run_all()
+        print(f"[dim]root eval[/dim]: {payload.get('overall')}  artifact={payload.get('artifact')}")
+
+        # 3) self-improve (A/B + adopt if equivalent & ≥1.5x)
+        try:
             from bot.workflows import self_improve as wsi
-            # e.g., if code != 0 or a manifest shows low scores
             wsi.run()
+        except Exception as e:
+            print(f"[yellow]self-improve skipped[/yellow]: {e}")
 
-            print(f"[cyan]learn[/cyan] → {topic} [dim](snapshot created under snapshots/runs)[/dim]")
+        # 4) (optional) canary + flip
         if autopromote:
-            # reuse the built-in canary equivalence + pointer flip
-            subprocess.run([sys.executable, "-m", "bot.cli", "rag", "canary-migrate", "--from", "v1", "--to", "v2", "--flip"], check=False)
+            try:
+                # Reuse our own CLI command for a full canary migration
+                subprocess.run(
+                    [sys.executable, "-m", "bot.cli", "rag", "canary-migrate", "--from", "v1", "--to", "v2", "--flip"],
+                    check=False,
+                )
+            except Exception as e:
+                print(f"[yellow]autopromote skipped[/yellow]: {e}")
+
         return code
 
     if not loop:
@@ -142,8 +167,8 @@ def learn(
         force_flush()
         raise typer.Exit(code=code)
 
-    # continuous mode
-    backoff = 30  # seconds between cycles (tweak as you like)
+    # Continuous loop
+    backoff = 30  # seconds between cycles; tweak as desired
     try:
         while True:
             code = once()
