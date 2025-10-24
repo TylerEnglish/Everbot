@@ -467,6 +467,7 @@ def opt_ab_chunk(
         "speedup_x": (py_sec / accel_sec) if accel_sec > 0 else None,
         "python_mem": py_mem,
         "accel_mem": accel_mem,
+        "sample_diffs": sample_diffs if not equivalent else None,
     }
     print(json.dumps(result, indent=2))
     raise typer.Exit(code=0 if equivalent else 1)
