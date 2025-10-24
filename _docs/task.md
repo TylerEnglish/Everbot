@@ -4,20 +4,6 @@
 ### 0) Initialize the repo exactly as you want it
 
 * [*] Create the skeleton you specified:
-
-
-Everabot/
-├─ ruleset/                 # Immutable runtime rules & governance
-├─ test/                    # Immutable root tests (Turing-style + standard LLM evals)
-├─ app/                     # Optional UI the agent can build later
-├─ bot/                     # Agent core, tools, skills, trainers, evaluators
-├─ snapshots/               # Versioned state (code, data, models, indices)
-├─ Dockerfile
-├─ pyproject.toml
-├─ poetry.lock
-└─ README.md
-
-
 * [*] Initialize `poetry`, add core deps (Python 3.11+), and commit the empty scaffold.
 
 ---
