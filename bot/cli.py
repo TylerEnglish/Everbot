@@ -145,7 +145,7 @@ def self_improve():
     with tracer.start_as_current_span("cli.self_improve"):
         from bot.workflows import self_improve as wf
         code = wf.run()
-        print("[cyan]self-improve[/cyan] starting (stub)")
+        print("[cyan]self-improve[/cyan] ran A/B optimization (chunker). See JSON output above.")
     force_flush()
     raise typer.Exit(code=code)
 
