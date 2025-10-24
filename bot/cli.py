@@ -24,7 +24,11 @@ app.add_typer(curr_app, name="curriculum")
 _ROOT = get_project_root()
 _PROTECTED_DIRS = {str(_ROOT / "ruleset"), str(_ROOT / "test")}
 install_guard(deny_dirs=_PROTECTED_DIRS)
-
+try:
+    from bot.accel.gate import set_default_env_from_gate
+    set_default_env_from_gate()
+except Exception:
+    pass
 ENGINE_CHOICES = ("python", "go", "rust", "cpp")
 
 # ------------- helpers
