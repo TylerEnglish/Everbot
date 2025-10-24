@@ -447,7 +447,18 @@ def opt_ab_chunk(
     if out_accel is None and impl == "auto":
         accel_impl, accel_sec, accel_mem, out_accel = "python", py_sec, py_mem, py_out
 
-    equivalent = py_out == out_accel
+    equivalent = (py_out == out_accel)
+    sample_diffs = []
+    if not equivalent:
+        # show the first few mismatches to debug accelerator parity
+        for i, (p, a) in enumerate(zip(py_out, out_accel)):
+            if p != a:
+                # Both are lists of chunks; show the first chunk that differs
+                pp = p[0] if p else None
+                aa = a[0] if a else None
+                sample_diffs.append({"i": i, "py_first": pp, "acc_first": aa})
+                if len(sample_diffs) >= 3:
+                    break
     result = {
         "equivalent": bool(equivalent),
         "python_sec": py_sec,
