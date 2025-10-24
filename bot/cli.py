@@ -121,8 +121,6 @@ def learn(
     autopromote: bool = typer.Option(False, "--autopromote", help="After each learn, rebuild v2 from canon v1, prove equivalence, and flip pointer on pass")
 ):
     tracer = get_tracer("everabot.cli")
-    import time, subprocess, sys
-
     pick_auto = auto or (topic.strip().lower() == "auto")
 
     from bot.curriculum.priority import select_next
@@ -132,7 +130,7 @@ def learn(
             if not plan:
                 print("[yellow]No eligible skills under current limits.[/yellow]")
                 return None
-            print(f"[magenta]auto[/magenta] → selected topic: [bold]{plan.slug}[/bold]")
+            print(f"[magenta]auto[/magenta] → selected topic: [bold]{plan.slug}[/bold]  ({plan.reason})")
             return plan.slug
         return topic
 
@@ -140,13 +138,12 @@ def learn(
         chosen = _resolve_topic()
         if not chosen:
             return 2
+
         # Preflight: LLM must be configured
-        from bot.llm.provider import NotConfigured
+        from bot.llm.provider import NotConfigured, info
         try:
-            # a lightweight call inside workflows will still raise if not configured,
-            # but surfacing it here gives a clearer CLI message:
-            pass
-        except NotConfigured as e:
+            _ = info()
+        except NotConfigured:
             print(f"[red]No LLM backend configured[/red] — set EVERABOT_LLM/model and re-run.")
             return 2
 
@@ -160,21 +157,23 @@ def learn(
         root = run_all()
         print(f"root eval: {root.get('overall')}  artifact={root.get('artifact')}")
 
-        # 3) self-improve
+        # 3) self-improve (A/B accelerators + autocode)
         from bot.workflows import self_improve as wsi
         wsi.run()
 
-        ok = (root.get("results", {}).get("benchmarks", {})
-         .get("mmlu", {}).get("detail", "").find("model_acc=") >= 0)
-        # Parse the numbers if you want, but at least don’t autopromote when there is no backend:
-        if root.get("results", {}).get("performance", {}).get("speed", {}).get("status") == "SKIP":
-            print("[yellow]Benchmarks skipped (no LLM). Skipping autopromote.[/yellow]")
-            return code
-
-        
-        # 4) canary (optional)
+        # 4) canary migrate (optional) — if a new engine was adopted, rechunk with that engine
         if autopromote:
-            # If v1 and v2 already equivalent, skip heavy migrate/flip.
+            adopted_engine_file = _ROOT / "snapshots" / "selfopt" / "ADOPTED_ENGINE.txt"
+            engine_arg = None
+            if adopted_engine_file.exists():
+                try:
+                    engine_arg = adopted_engine_file.read_text(encoding="utf-8").strip()
+                    if engine_arg not in ENGINE_CHOICES:
+                        engine_arg = None
+                except Exception:
+                    engine_arg = None
+
+            # If v1 and v2 already equivalent, skip heavy migrate/flip to save time.
             res = subprocess.run(
                 [sys.executable, "-m", "bot.cli", "rag", "prove-equivalence", "v1", "v2"],
                 capture_output=True, text=True, check=False
@@ -188,11 +187,12 @@ def learn(
             if eq:
                 print("[dim]RAG v1 ≡ v2 (bitwise+top-k). Skipping canary migrate/flip.[/dim]")
             else:
-                print("Exporting golden dumps...")
-                subprocess.run(
-                    [sys.executable, "-m", "bot.cli", "rag", "canary-migrate", "--from", "v1", "--to", "v2", "--flip"],
-                    check=False
-                )
+                print("[cyan]Canary migrate[/cyan] — rebuilding v2 from canon docs...")
+                cmd = [sys.executable, "-m", "bot.cli", "rag", "canary-migrate", "--from", "v1", "--to", "v2"]
+                if engine_arg:
+                    cmd += ["--engine", engine_arg]  # forces rechunk with adopted engine
+                subprocess.run(cmd, check=False)
+
         return code
 
     if not loop:
@@ -985,7 +985,7 @@ def rag_canary_migrate(
     require_chunk_bits: bool = typer.Option(False, "--require-chunk-bits", help="Require chunks.canon equivalence in addition to docs."),
     flip_on_pass: bool = typer.Option(True, "--flip/--no-flip"),
 ):
-    import json, os, time, pyarrow.parquet as pq
+    import json, os, time, pyarrow.parquet as pq, shutil, subprocess, sys
     root = get_project_root()
     canon = root / "snapshots" / "rag" / f"canon_{src}"
     canon.mkdir(parents=True, exist_ok=True)
@@ -995,24 +995,26 @@ def rag_canary_migrate(
 
     v2_dir = root / "snapshots" / "rag" / dst
 
+    # Rebuild candidate store from canonical docs (unless explicitly told not to)
     if not no_rechunk:
         print("[cyan]Rebuilding candidate store from canonical docs...[/cyan]")
-        rag_rebuild_from_docs(
-            source=str(canon / "docs.canon.jsonl"),
-            target=str(v2_dir),
-            chunk_toks=chunk_toks,
-            overlap=overlap,
-            engine=engine,
-            prefer_canon_chunks=True,
-            from_store=src,
-        )
+        # Use the common helper (respects engine preference and copies heavy artifacts when possible)
+        subprocess.run([
+            sys.executable, "-m", "bot.cli", "rag", "rebuild-from-docs",
+            "--source", str(canon / "docs.canon.jsonl"),
+            "--target", str(v2_dir),
+            "--chunk-toks", str(chunk_toks),
+            "--overlap", str(overlap),
+            *(["--engine", engine] if engine else []),
+            "--prefer-canon-chunks",  # avoids drift when possible
+            "--from-store", src,
+        ], check=True)
 
     # Ensure manifest exists even if we skipped rebuild
     man = v2_dir / "manifest.json"
     if not man.exists():
         try:
             docs = v2_dir / "docs.jsonl"
-            import pyarrow.parquet as pq
             chunks_rows = 0
             try:
                 chunks_rows = pq.read_table(v2_dir / "chunks.parquet").num_rows
@@ -1039,8 +1041,13 @@ def rag_canary_migrate(
         except Exception as e:
             print(f"[yellow]Warning:[/yellow] could not synthesize manifest.json: {e}")
 
+    # Prove docs-bitwise (+ optional chunks) + top-k equivalence
     print(f"[cyan]Proving equivalence ({'docs-bitwise + chunks-bitwise + ' if require_chunk_bits else 'docs-bitwise + ' }top-k)...[/cyan]")
-    res = subprocess.run([sys.executable, "-m", "bot.cli", "rag", "prove-equivalence", src, dst] + (["--require-chunk-bits"] if require_chunk_bits else []), check=False)
+    res = subprocess.run(
+        [sys.executable, "-m", "bot.cli", "rag", "prove-equivalence", src, dst]
+        + (["--require-chunk-bits"] if require_chunk_bits else []),
+        check=False
+    )
     if res.returncode != 0:
         print("[red]Equivalence FAILED — pointer not flipped.[/red]")
         raise typer.Exit(code=1)
@@ -1050,6 +1057,7 @@ def rag_canary_migrate(
         cur.write_text(str(v2_dir.resolve()))
         print(f"[green]Pointer flipped →[/green] {cur} = {v2_dir}")
     print("[green]Canary migration complete.[/green]")
+
 
 @rag_app.command("prove-equivalence")
 def rag_prove_equivalence(
