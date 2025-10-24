@@ -4,9 +4,7 @@ from typing import List, Optional
 import os, sys, pathlib, subprocess, time, json
 
 from bot.paths import get_project_root
-from bot.security.guard import GuardDenied  # will be raised by the guard if we touch deny-listed dirs
-from bot.llm.provider import ask, info, NotConfigured
-
+from bot.llm.provider import ask, info, NotConfigured  # LLM interface
 
 @dataclass
 class AutoCodeResult:
@@ -15,7 +13,6 @@ class AutoCodeResult:
     patch_applied: bool
     touched_paths: List[str]
 
-
 def _llm_ok() -> bool:
     try:
         _ = info()  # raises NotConfigured if missing
@@ -23,15 +20,13 @@ def _llm_ok() -> bool:
     except NotConfigured:
         return False
 
-
 def _scan_hotspots(root: pathlib.Path, max_files: int = 3) -> List[pathlib.Path]:
     """
-    Ultra-light heuristic: prefer longer files with TODO markers.
+    Ultra-light heuristic: prefer longer files with TODO markers; skip noisy/guarded dirs.
     """
     bot_dir = root / "bot"
     files: list[tuple[int, int, pathlib.Path]] = []
     for p in bot_dir.rglob("*.py"):
-        # skip guard-sensitive or noisy dirs
         parts = set(p.parts)
         if "test" in parts or "ruleset" in parts or "snapshots" in parts or "accel" in parts:
             continue
@@ -45,7 +40,6 @@ def _scan_hotspots(root: pathlib.Path, max_files: int = 3) -> List[pathlib.Path]
         files.append((score, length, p))
     files.sort(reverse=True)
     return [p for _, __, p in files[:max_files]]
-
 
 def _build_prompt(file_paths: List[pathlib.Path]) -> str:
     header = (
@@ -68,14 +62,12 @@ def _build_prompt(file_paths: List[pathlib.Path]) -> str:
             pass
     return header + "\n".join(context)
 
-
 def _write_patch(diff_text: str) -> pathlib.Path:
     out_dir = get_project_root() / "snapshots" / "selfopt" / "patches"
     out_dir.mkdir(parents=True, exist_ok=True)
     p = out_dir / f"autocode_{int(time.time())}.diff"
     p.write_text(diff_text, encoding="utf-8")
     return p
-
 
 def _git_apply(patch_path: pathlib.Path) -> bool:
     try:
@@ -84,20 +76,24 @@ def _git_apply(patch_path: pathlib.Path) -> bool:
     except Exception:
         return False
 
-
 def _touch_list_from_diff(diff_text: str) -> List[str]:
     touched = []
     for line in diff_text.splitlines():
         if line.startswith("+++ "):
-            # '+++ b/bot/xxx.py' or '+++ bot/xxx.py'
             path = line.split(" ", 1)[1].strip()
             if path.startswith("b/"):
                 path = path[2:]
             touched.append(path)
     return [t for t in touched if t and not t.startswith("/dev/null")]
 
-
 def propose_and_apply_refactor(max_files: int = 3) -> Optional[AutoCodeResult]:
+    """
+    1) Pick a few hotspot files under bot/
+    2) Ask the LLM for a single unified diff
+    3) Save the diff under snapshots/selfopt/patches
+    4) Try to `git apply` it (guard will block writes to protected dirs at write-time)
+    5) Return result (caller gates adoption behind tests/evals)
+    """
     if not _llm_ok():
         return None
 
@@ -107,36 +103,22 @@ def propose_and_apply_refactor(max_files: int = 3) -> Optional[AutoCodeResult]:
         return None
 
     prompt = _build_prompt(hotspots)
-
-    # Ask the LLM for a unified diff (ONLY the diff)
     diff = ask(prompt, max_tokens=2500, temperature=0.2)
 
-    # Basic sanity check: must look like a unified diff
+    # Must look like a unified diff
     if ("+++ " not in diff) or ("--- " not in diff) or ("@@ " not in diff):
-        # model didn't follow format; skip
         return None
 
     patch_path = _write_patch(diff)
     touched = _touch_list_from_diff(diff)
 
-    # Let the project guard raise if we try to touch deny-listed paths
-    for rel in touched:
-        abs_p = (root / rel).resolve()
-        # if the guard is installed, touching deny paths will be blocked at write-time
-        _ = abs_p  # access triggers no write here; write happens in git apply
-
+    # Let the FS guard enforce deny-listing at write time (raises PermissionError if we ever tried).
+    # We don't write here; we just attempt to apply via git which will write if allowed.
     applied = _git_apply(patch_path)
-    if not applied:
-        return AutoCodeResult(
-            title="autocode-refactor",
-            patch_path=str(patch_path),
-            patch_applied=False,
-            touched_paths=touched,
-        )
 
     return AutoCodeResult(
         title="autocode-refactor",
         patch_path=str(patch_path),
-        patch_applied=True,
+        patch_applied=bool(applied),
         touched_paths=touched,
     )
