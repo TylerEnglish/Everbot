@@ -32,7 +32,15 @@ function connect(id){
   const out = document.getElementById('out'); out.textContent = '';
   if (es) es.close();
   es = new EventSource(`/stream/logs/${id}`);
-  es.onmessage = (e)=>{ out.textContent += e.data + "\n"; out.scrollTop = out.scrollHeight; };
+  es.onmessage = (e)=>{
+    try {
+      const obj = JSON.parse(e.data);
+      out.textContent += JSON.stringify(obj, null, 2) + "\n";
+    } catch {
+      out.textContent += e.data + "\n";
+    }
+    out.scrollTop = out.scrollHeight;
+  };
   es.onerror = ()=>{ out.textContent += "[stream closed]\n"; es.close(); };
 }
 loadRuns();

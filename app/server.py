@@ -99,9 +99,12 @@ def _pick_log_file(run_dir: Path) -> Optional[Path]:
             return f
     return None
 
+def _sse_json(obj) -> str:
+    """Encode a single SSE event carrying compact JSON on one line."""
+    return f"data: {json.dumps(obj, ensure_ascii=False, separators=(',', ':'))}\n\n"
+
 async def _sse_file_tail(path: Path) -> AsyncIterator[str]:
-    """SSE stream of a JSONL file; yields each new line as an SSE `data:` frame."""
-    # Ensure file exists before opening (if not, we'll just end with a 404 upstream)
+    """SSE stream of a JSONL file; yields each new line as one JSON event."""
     last_pos = 0
     with path.open("rb") as f:
         f.seek(0, os.SEEK_END)  # start tailing at end
@@ -115,17 +118,25 @@ async def _sse_file_tail(path: Path) -> AsyncIterator[str]:
                 continue
             last_pos = f.tell()
         for line in chunk.splitlines():
+            if not line.strip():
+                continue
             try:
                 payload = json.loads(line.decode("utf-8", errors="replace"))
             except Exception:
                 payload = {"raw": line.decode("utf-8", errors="replace")}
-            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            yield _sse_json(payload)   # <- one clean SSE event per JSON
 
 async def _sse_manifest_watch(man: Path) -> AsyncIterator[str]:
-    """SSE stream: push manifest whenever it changes (fallback if no events.jsonl)."""
+    """SSE stream: push manifest whenever it changes (compact JSON per event)."""
+    def _read_manifest_obj():
+        try:
+            return json.loads(man.read_text(encoding="utf-8"))
+        except Exception as e:
+            return {"error": "manifest-parse", "detail": str(e)}
+
     last_mtime = man.stat().st_mtime
-    # Send initial state
-    yield f"data: {man.read_text(encoding='utf-8')}\n\n"
+    # Send initial state as one JSON event (single line)
+    yield _sse_json(_read_manifest_obj())
     while True:
         await asyncio.sleep(1.0)
         try:
@@ -134,7 +145,7 @@ async def _sse_manifest_watch(man: Path) -> AsyncIterator[str]:
             break
         if mt != last_mtime:
             last_mtime = mt
-            yield f"data: {man.read_text(encoding='utf-8')}\n\n"
+            yield _sse_json(_read_manifest_obj())
 
 @app.get("/stream/logs/{run_id}")
 async def stream_logs(run_id: str):
@@ -152,4 +163,9 @@ async def stream_logs(run_id: str):
             raise HTTPException(404, f"manifest for {run_id} not found")
         gen = _sse_manifest_watch(man)
 
-    return StreamingResponse(gen, media_type="text/event-stream")
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        # (CORS headers if you later serve the page from another origin)
+    }
+    return StreamingResponse(gen, media_type="text/event-stream", headers=headers)
