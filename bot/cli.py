@@ -164,6 +164,14 @@ def learn(
         from bot.workflows import self_improve as wsi
         wsi.run()
 
+        ok = (root.get("results", {}).get("benchmarks", {})
+         .get("mmlu", {}).get("detail", "").find("model_acc=") >= 0)
+        # Parse the numbers if you want, but at least don’t autopromote when there is no backend:
+        if root.get("results", {}).get("performance", {}).get("speed", {}).get("status") == "SKIP":
+            print("[yellow]Benchmarks skipped (no LLM). Skipping autopromote.[/yellow]")
+            return code
+
+        
         # 4) canary (optional)
         if autopromote:
             # If v1 and v2 already equivalent, skip heavy migrate/flip.
