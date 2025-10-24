@@ -8,6 +8,7 @@ from bot.rag.schemas import Document, Chunk
 from bot.rag.utils import sha256_str
 from bot.rag.store import save_store
 from bot.rag.index_faiss import build_index, save_index
+import requests
 
 def ingest(urls: List[str], out_dir: pathlib.Path) -> dict:
     docs: List[Document] = []
