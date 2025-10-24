@@ -1,4 +1,5 @@
 from __future__ import annotations
+import certifi
 import requests, pathlib, re, time, threading
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
@@ -75,7 +76,7 @@ def _req(url: str) -> requests.Response:
     if _MAX_BYTES:
         try:
             _BUCKET.take()
-            h = requests.head(url, headers=_UA, timeout=15, allow_redirects=True)
+            h = requests.head(url, headers=_UA, timeout=15, allow_redirects=True, verify=certifi.where())
             if h.ok:
                 cl = h.headers.get("Content-Length")
                 if cl and cl.isdigit() and int(cl) > _MAX_BYTES:
@@ -83,7 +84,7 @@ def _req(url: str) -> requests.Response:
         except Exception:
             # HEAD might be blocked; continue to GET and stream-guard.
             pass
-    r = requests.get(url, headers=_UA, timeout=30, stream=bool(_MAX_BYTES))
+    r = requests.get(url, headers=_UA, timeout=30, stream=bool(_MAX_BYTES), verify=certifi.where())
     if _MAX_BYTES and r.ok and r.raw:
         # stream read up to _MAX_BYTES+1, then abort if exceeded
         content = b""
