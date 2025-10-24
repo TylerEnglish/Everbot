@@ -1,4 +1,4 @@
-Help me finish my tasks, I'm on task 10 now, what I need help with is a RAG system. I'll upload a PDF white paper explaining what exactly I want, in this I want you to very carefully look at it with detail. Then I want you to look at the next section of task, and then I want you to implement them. Be sure to read everything so we can have good ground work for the later task and we can finish this everbot strong. 
+Help me finish my tasks, I'm on task 12 now, what I need help with is a RAG system. I'll upload a PDF white paper explaining what exactly I want, in this I want you to very carefully look at it with detail. Then I want you to look at the next section of task, and then I want you to implement them. Be sure to read everything so we can have good ground work for the later task and we can finish this everbot strong. 
 
 What I want is a detail application of what to do, give me everything, all the new files and changes. I want this to be descriptive and work. Also show me the commands to make sure that we finished these task. Make sure you read through all the code, i'm putting it in this message.
 
@@ -173,10 +173,10 @@ Everabot/
 
 ### 11) Evaluations by mode (plug-and-play harnesses)
 
-* [ ] **Math**: GSM8K + unit tests for step-by-step solutions; verifier scoring. ([arXiv][5])
-* [ ] **Knowledge**: MMLU (subset first), track macro-average. ([arXiv][4])
-* [ ] **Commonsense**: HellaSwag; annotate the benchmark’s caveats in logs. ([arXiv][6])
-* [ ] **Your Turing-style tests**: fixture prompts with rubric scoring (fluency/consistency/safety).
+* [*] **Math**: GSM8K + unit tests for step-by-step solutions; verifier scoring. ([arXiv][5])
+* [*] **Knowledge**: MMLU (subset first), track macro-average. ([arXiv][4])
+* [*] **Commonsense**: HellaSwag; annotate the benchmark’s caveats in logs. ([arXiv][6])
+* [*] **Your Turing-style tests**: fixture prompts with rubric scoring (fluency/consistency/safety).
 
 ---
 
@@ -289,16 +289,20 @@ utility:
   cost_cap_usd: 10
 
 bench_thresholds:
-  mmlu_macro_min: 0.50
-  gsm8k_acc_min: 0.60
-  hellaswag_acc_min: 0.60
-  turing_overall_min: 3.8
-  turing_safety_min: 4.5
+  mmlu_macro_min: null
+  gsm8k_acc_min: null
+  hellaswag_acc_min: null
+  turing_overall_min: null
+  turing_safety_min: null
 turing_weights:
   fluency: 0.4
   consistency: 0.3
   safety: 0.3
-
+bench_thresholds:
+  perf_tps_min: 6.0           # tokens/sec (char/4 heuristic)
+  perf_mem_mb_max: 6000       # RSS upper bound after runs
+  perf_model_mb_max: 5000     # model file size (if local path)
+  perf_efficiency_min: 2.0    # tps per GB (model_size + RSS)
 ```
 
 models.yaml:

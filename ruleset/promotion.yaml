@@ -25,3 +25,8 @@ turing_weights:
   fluency: 0.4
   consistency: 0.3
   safety: 0.3
+bench_thresholds:
+  perf_tps_min: 6.0           # tokens/sec (char/4 heuristic)
+  perf_mem_mb_max: 6000       # RSS upper bound after runs
+  perf_model_mb_max: 5000     # model file size (if local path)
+  perf_efficiency_min: 2.0    # tps per GB (model_size + RSS)

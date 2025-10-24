@@ -4,7 +4,7 @@ from typing import Dict, Any, List, Tuple
 from bot.paths import get_project_root
 from bot.rules.loader import load_all
 from bot.llm.provider import ask as llm_ask, NotConfigured
-
+import time, statistics as stats, psutil, tracemalloc
 ROOT = get_project_root()
 
 # ---------- small utils ----------
@@ -79,6 +79,33 @@ def _extract_final_number(txt: str) -> str | None:
     m = re.findall(r"-?\d+(?:\.\d+)?", txt or "")
     return m[-1] if m else None
 
+def _suite_cfg_limit(suite: str, env_var: str, default_cap: int) -> int:
+    """
+    Priority: env var -> test/eval/config.yaml -> default_cap
+    """
+    cap = _cap(env_var, default_cap)
+    cfg_path = ROOT / "test" / "eval" / "config.yaml"
+    if cfg_path.exists():
+        try:
+            cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+            cap = int(cfg.get("suites", {}).get(suite, {}).get("limit", cap))
+        except Exception:
+            pass
+    return cap
+
+def _estimate_tokens(s: str) -> int:
+    # ~4 chars/token heuristic, matches your chunker spec
+    n = len(s or "")
+    return max(1, (n + 3) // 4)
+
+def _pct(xs: List[float], q: float) -> float:
+    # simple percentile (no numpy)
+    if not xs:
+        return 0.0
+    xs = sorted(xs)
+    k = max(0, min(len(xs)-1, int(round(q*(len(xs)-1)))))
+    return float(xs[k])
+
 # ---------- security ----------
 def test_guard_write_blocked() -> Dict[str, Any]:
     errors: List[str] = []
@@ -125,7 +152,7 @@ def test_mmlu_wired() -> Dict[str, Any]:
     if not csvs:
         return _skip("MMLU found but no CSVs under data/**")
 
-    cap_rows = _cap("EVERABOT_MMLU_CAP", 200)
+    cap_rows = _suite_cfg_limit("mmlu", "EVERABOT_MMLU_CAP", 200)
     cache = _load_cache("mmlu")
     used = total = correct = 0
     used_backend = True
@@ -192,7 +219,7 @@ def test_gsm8k_wired() -> Dict[str, Any]:
     if not test_file:
         return _skip("Found GSM8K folder but no test*.jsonl.")
 
-    cap_rows = _cap("EVERABOT_GSM8K_CAP", 200)
+    cap_rows = _suite_cfg_limit("gsm8k", "EVERABOT_GSM8K_CAP", 200)
     cache = _load_cache("gsm8k")
     total = correct = used = 0
     used_backend = True
@@ -273,7 +300,7 @@ def test_hellaswag_wired() -> Dict[str, Any]:
 
     is_test_like = "test" in path.name.lower()
 
-    cap_rows = _cap("EVERABOT_HELLASWAG_CAP", 200)
+    cap_rows = _suite_cfg_limit("hellaswag", "EVERABOT_HELLASWAG_CAP", 200)
     cache = _load_cache("hellaswag")
     total = correct = used = 0
     used_backend = True
@@ -400,14 +427,15 @@ def test_turing_rubric() -> Dict[str, Any]:
 
     if not items:
         return _skip("Turing fixtures empty.")
-
+    cap = _suite_cfg_limit("turing", "EVERABOT_TURING_CAP", 10**9)
     weights = _rubric_weights()
     cache = _load_cache("turing")
     if not isinstance(cache, dict): cache = {}
 
     scores: List[Dict[str, float]] = []
     try:
-        for it in items:
+        for idx, it in enumerate(items):
+            if idx >= cap: break
             pid = str(it.get("id") or it.get("prompt") or "")[:80]
             entry = cache.get(pid)
             if entry is None:
@@ -441,6 +469,155 @@ def test_turing_rubric() -> Dict[str, Any]:
     return {"status": status,
             "detail": f"rubric_avg overall={overall:.2f} (fluency={flu:.2f}, consistency={cons:.2f}, safety={safe:.2f}); "
                       f"thr: overall>={thr.get('turing_overall_min')}, safety>={thr.get('turing_safety_min')}; n={n}"}
+
+# ---------- performance: speed / memory / size / efficiency ----------
+
+_PERF_CACHE: Dict[str, Any] | None = None
+
+def _resolve_model_path() -> pathlib.Path | None:
+    # Prefer env (EVERABOT_LLAMA_PATH), fallback to ruleset.models.default.llama_cpp.model_path
+    p = os.getenv("EVERABOT_LLAMA_PATH", "").strip()
+    if not p:
+        try:
+            cfg = load_all().get("models", {}).get("default", {}).get("llama_cpp", {})
+            p = (cfg or {}).get("model_path", "")
+        except Exception:
+            p = ""
+    return pathlib.Path(p) if p else None
+
+def _perf_measure() -> Dict[str, Any]:
+    global _PERF_CACHE
+    if _PERF_CACHE is not None:
+        return _PERF_CACHE
+
+    backend = os.getenv("EVERABOT_LLM") or ""
+    if not backend:
+        raise NotConfigured("No LLM backend configured")
+
+    runs = _cap("EVERABOT_PERF_RUNS", 5)  # set with env, defaults to 5
+    proc = psutil.Process()
+    rss0 = proc.memory_info().rss
+
+    # Warmup (don’t time)
+    try:
+        llm_ask("Warm up for performance measurement. Reply 'ok'.", max_tokens=8, temperature=0.0)
+    except Exception:
+        pass
+
+    lat_ms: List[float] = []
+    tps: List[float] = []
+    tracemalloc.start()
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        out = llm_ask(
+            "Write a short, self-contained paragraph about testing. Keep it under 120 words.",
+            max_tokens=256, temperature=0.0
+        )
+        dt = time.perf_counter() - t0
+        lat_ms.append(dt * 1000.0)
+        toks = _estimate_tokens(out)
+        tps.append(toks / max(dt, 1e-9))
+    cur, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    rss1 = proc.memory_info().rss
+
+    model_size_mb = None
+    mp = _resolve_model_path()
+    if mp and mp.exists():
+        try:
+            model_size_mb = round(mp.stat().st_size / (1024*1024), 2)
+        except Exception:
+            model_size_mb = None
+
+    metrics = {
+        "backend": backend,
+        "runs": runs,
+        "latency_ms_p50": _pct(lat_ms, 0.50),
+        "latency_ms_p95": _pct(lat_ms, 0.95),
+        "tps_avg": sum(tps)/len(tps) if tps else 0.0,
+        "tps_p50": _pct(tps, 0.50),
+        "rss_mb_start": round(rss0 / (1024*1024), 2),
+        "rss_mb_end": round(rss1 / (1024*1024), 2),
+        "rss_mb_delta": round((rss1 - rss0) / (1024*1024), 2),
+        "py_peak_mb": round(peak / (1024*1024), 2),
+        "model_size_mb": model_size_mb,
+    }
+
+    # simple efficiency: throughput normalized by (model_size + final RSS)
+    denom_gb = 1e-6  # avoid div by zero if both are None
+    if model_size_mb is not None:
+        denom_gb += model_size_mb / 1024.0
+    denom_gb += metrics["rss_mb_end"] / 1024.0
+    metrics["efficiency"] = metrics["tps_avg"] / denom_gb if denom_gb > 0 else 0.0
+
+    _PERF_CACHE = metrics
+    return metrics
+
+def test_perf_speed() -> Dict[str, Any]:
+    thr = _promotion_thresholds().get("perf_tps_min")
+    try:
+        m = _perf_measure()
+    except NotConfigured:
+        return _skip("No LLM backend configured (set EVERABOT_LLM)")
+    except Exception as e:
+        return _fail(f"perf speed error: {e}")
+    ok = _meets_threshold(m["tps_avg"], thr)
+    return {"status": "PASS" if ok else "FAIL",
+            "detail": f"tps_avg={m['tps_avg']:.2f}, p50={m['latency_ms_p50']:.0f}ms, runs={m['runs']}, thr={thr}, backend={m['backend']}"}
+
+def test_perf_memory() -> Dict[str, Any]:
+    thr = _promotion_thresholds().get("perf_mem_mb_max")
+    try:
+        m = _perf_measure()
+    except NotConfigured:
+        return _skip("No LLM backend configured (set EVERABOT_LLM)")
+    except Exception as e:
+        return _fail(f"perf memory error: {e}")
+    # If no threshold, just PASS and report numbers
+    if thr is None:
+        return _pass(f"rss_end={m['rss_mb_end']} MB, delta={m['rss_mb_delta']} MB, py_peak={m['py_peak_mb']} MB (no threshold)")
+    ok = (m["rss_mb_end"] <= float(thr))
+    return {"status": "PASS" if ok else "FAIL",
+            "detail": f"rss_end={m['rss_mb_end']} MB (delta={m['rss_mb_delta']} MB, py_peak={m['py_peak_mb']} MB), thr_end<={thr} MB"}
+
+def test_model_size() -> Dict[str, Any]:
+    thr = _promotion_thresholds().get("perf_model_mb_max")
+    try:
+        m = _perf_measure()
+    except NotConfigured:
+        # model size still useful even if backend not configured
+        mp = _resolve_model_path()
+        if not (mp and mp.exists()):
+            return _skip("No local model path resolved for size check.")
+        sz = round(mp.stat().st_size / (1024*1024), 2)
+        if thr is None:
+            return _pass(f"model_size={sz} MB (no threshold)")
+        return {"status": "PASS" if sz <= float(thr) else "FAIL",
+                "detail": f"model_size={sz} MB, thr<={thr} MB"}
+    except Exception as e:
+        return _fail(f"model size error: {e}")
+
+    sz = m["model_size_mb"]
+    if sz is None:
+        return _skip("Model size unknown for this backend (e.g., remote Ollama model).")
+    if thr is None:
+        return _pass(f"model_size={sz} MB (no threshold)")
+    return {"status": "PASS" if sz <= float(thr) else "FAIL",
+            "detail": f"model_size={sz} MB, thr<={thr} MB"}
+
+def test_perf_efficiency() -> Dict[str, Any]:
+    thr = _promotion_thresholds().get("perf_efficiency_min")
+    try:
+        m = _perf_measure()
+    except NotConfigured:
+        return _skip("No LLM backend configured (set EVERABOT_LLM)")
+    except Exception as e:
+        return _fail(f"perf efficiency error: {e}")
+    if thr is None:
+        return _pass(f"efficiency={m['efficiency']:.2f} tps/(GB) (no threshold)")
+    ok = _meets_threshold(m["efficiency"], float(thr))
+    return {"status": "PASS" if ok else "FAIL",
+            "detail": f"efficiency={m['efficiency']:.2f} tps/(GB), thr>={thr}; tps_avg={m['tps_avg']:.2f}, rss_end={m['rss_mb_end']} MB, model_size={m['model_size_mb']} MB"}
 
 # ---------- sanity set ----------
 def test_conversation_sanity() -> Dict[str, Any]:
@@ -477,12 +654,20 @@ def run_all() -> Dict[str, Any]:
             "hellaswag": test_hellaswag_wired(),
             "turing": test_turing_rubric(),
         },
+        "performance": {
+            "speed": test_perf_speed(),
+            "memory": test_perf_memory(),
+            "model_size": test_model_size(),
+            "efficiency": test_perf_efficiency(),
+        },
     }
     def ok(entry): return entry["status"] in ("PASS", "SKIP")
     overall = (
         ok(results["security"]["guard_write_blocked"])
         and ok(results["root"]["legacy_stub"])
         and all(ok(v) for v in results["benchmarks"].values())
+        # performance not gating overall by default — change here if you want it enforced:
+        # and all(ok(v) for v in results["performance"].values())
     )
     payload = {
         "ts": datetime.datetime.utcnow().isoformat() + "Z",
