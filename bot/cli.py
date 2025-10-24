@@ -590,7 +590,6 @@ def rag_export(
     canon_docs = canonicalize_json_rows(docs_rows)
     (out_dir / "docs.canon.jsonl").write_bytes(canon_docs)
     tab = pq.read_table(sdir / "chunks.parquet")
-    rows = [{c: tab[c][i].as_py() for i in range(tab.num_rows) for c in tab.column_names}]
     # The above is O(n*c); expand correctly:
     rows = []
     for i in range(tab.num_rows):
