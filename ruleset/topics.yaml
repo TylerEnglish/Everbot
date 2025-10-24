@@ -23,6 +23,47 @@ aliases:
   cv: vision
   bio: biology/reading
 
+  # New aliases (languages / systems / science / finance / architecture)
+  c: languages/c
+  c_language: languages/c
+  cpp: languages/cpp
+  cxx: languages/cpp
+  asm: languages/asm
+  assembly: languages/asm
+  erlang: languages/erlang
+  rust: languages/rust
+  binary: systems/binary
+  binaries: systems/binary
+  compilers: systems/compilers
+  toolchains: systems/compilers
+  arch: systems/arch
+  cpu_arch: systems/arch
+  computer_architecture: systems/arch
+  oop: sw-eng/oop
+  abstraction: sw-eng/abstraction
+  lob: sw-eng/lob
+  software_architecture: sw-eng/architecture
+  calc: science/math/calculus
+  calculus: science/math/calculus
+  physics: science/physics
+  chem: science/chemistry
+  chemistry: science/chemistry
+  neuro: science/neuroscience
+  neuroscience: science/neuroscience
+  evo: science/evolution
+  evolution: science/evolution
+  physiology: science/physiology
+  k12_ps: problem_solving/k12
+  advanced_ps: problem_solving/advanced
+  personal_finance: finance/personal
+  pf: finance/personal
+  business_finance: finance/business
+  corp_finance: finance/business
+  markets: finance/markets
+  stocks: finance/markets
+  construction_architecture: architecture/construction
+  built_env: architecture/construction
+
 notes:
   - "Topics gate only the 'learn' path; 'build' is free-form but still bound by safety."
 
@@ -120,7 +161,177 @@ topics:
         cpu_pct_est: 35
         ram_mb_est: 96
 
-  # ---- App domains ----
+  # ---- New: Languages (C, C++, ASM, Erlang, Rust) ----
+  - id: languages/c
+    name: C Language (systems & interfaces)
+    safety_level: medium
+    default_strategies: [ace]
+    notes: "Pointers, UB awareness, ABI/FFI, build systems."
+    skills:
+      - id: c-pointers
+        title: "Pointer/ownership audit (UB traps)"
+        est_gain: 0.28
+        risk_regression: 0.06
+        time_min: 8
+        cpu_pct_est: 20
+        ram_mb_est: 64
+      - id: c-abi
+        title: "C ABI surface for FFI (stable headers)"
+        est_gain: 0.22
+        risk_regression: 0.04
+        time_min: 6
+        cpu_pct_est: 15
+        ram_mb_est: 64
+
+  - id: languages/cpp
+    name: C++ (modern core + perf)
+    safety_level: medium
+    default_strategies: [ace]
+    notes: "RAII, value semantics, templates, Core Guidelines."
+    skills:
+      - id: cpp-raii
+        title: "RAII refactor to eliminate leaks"
+        est_gain: 0.26
+        risk_regression: 0.05
+        time_min: 8
+        cpu_pct_est: 25
+        ram_mb_est: 128
+      - id: cpp-templates
+        title: "Template → concept constraints (clarity & perf)"
+        est_gain: 0.20
+        risk_regression: 0.04
+        time_min: 7
+        cpu_pct_est: 30
+        ram_mb_est: 128
+
+  - id: languages/asm
+    name: Assembly & Calling Conventions
+    safety_level: medium
+    default_strategies: [ace]
+    notes: "x86-64/ARM64, SysV/Windows ABIs, SIMD intrinsics vs hand-ASM."
+    skills:
+      - id: asm-call
+        title: "Hand-check calling convention & prolog/epilog"
+        est_gain: 0.22
+        risk_regression: 0.05
+        time_min: 7
+        cpu_pct_est: 40
+        ram_mb_est: 64
+      - id: asm-simd
+        title: "SIMD rewrite of tight loop"
+        est_gain: 0.24
+        risk_regression: 0.06
+        time_min: 9
+        cpu_pct_est: 60
+        ram_mb_est: 96
+
+  - id: languages/erlang
+    name: Erlang/OTP (concurrency & reliability)
+    safety_level: low
+    default_strategies: [ace]
+    notes: "Processes/mailboxes, supervision trees, OTP behaviors."
+    skills:
+      - id: erl-otp
+        title: "Supervision tree & restart strategy review"
+        est_gain: 0.25
+        risk_regression: 0.03
+        time_min: 7
+        cpu_pct_est: 20
+        ram_mb_est: 96
+      - id: erl-dist
+        title: "Distributed nodes & message contract"
+        est_gain: 0.20
+        risk_regression: 0.03
+        time_min: 6
+        cpu_pct_est: 25
+        ram_mb_est: 128
+
+  - id: languages/rust
+    name: Rust (safety, perf, FFI)
+    safety_level: low
+    default_strategies: [ace]
+    notes: "Ownership/borrowing, unsafe islands, FFI to C/C++."
+    skills:
+      - id: rs-borrow
+        title: "Borrow checker diagnostics & fix"
+        est_gain: 0.25
+        risk_regression: 0.03
+        time_min: 6
+        cpu_pct_est: 20
+        ram_mb_est: 96
+      - id: rs-unsafe
+        title: "Minimize unsafe surface with proofs"
+        est_gain: 0.22
+        risk_regression: 0.04
+        time_min: 8
+        cpu_pct_est: 25
+        ram_mb_est: 128
+
+  # ---- Systems deep-dive ----
+  - id: systems/binary
+    name: Binary Layout, Endianness & Tooling
+    safety_level: low
+    default_strategies: [ace]
+    notes: "ELF/PE/Mach-O basics, objdump/llvm-objdump, nm, readelf."
+    skills:
+      - id: bin-endian
+        title: "Endianness audit & adapter"
+        est_gain: 0.18
+        risk_regression: 0.02
+        time_min: 5
+        cpu_pct_est: 15
+        ram_mb_est: 64
+      - id: bin-symbols
+        title: "Symbol map & size attribution"
+        est_gain: 0.20
+        risk_regression: 0.03
+        time_min: 6
+        cpu_pct_est: 20
+        ram_mb_est: 96
+
+  - id: systems/compilers
+    name: Compilers, IRs & Toolchains
+    safety_level: low
+    default_strategies: [ace]
+    notes: "GCC/LLVM pipelines, IR inspection, LTO, PGO."
+    skills:
+      - id: comp-ir
+        title: "Dump & reason about LLVM IR"
+        est_gain: 0.22
+        risk_regression: 0.03
+        time_min: 7
+        cpu_pct_est: 30
+        ram_mb_est: 128
+      - id: comp-pgo
+        title: "Add PGO to build & measure"
+        est_gain: 0.24
+        risk_regression: 0.04
+        time_min: 9
+        cpu_pct_est: 40
+        ram_mb_est: 192
+
+  - id: systems/arch
+    name: Computer Architecture (CPU/memory/ISA)
+    safety_level: low
+    default_strategies: [ace]
+    notes: "Pipelines, caches, vector units, ISA docs (x86-64/ARM/RISC-V)."
+    skills:
+      - id: arch-cache
+        title: "Cache-aware layout & stride tuning"
+        est_gain: 0.24
+        risk_regression: 0.03
+        time_min: 7
+        cpu_pct_est: 35
+        ram_mb_est: 128
+      - id: arch-isa
+        title: "ISA feature gating (SSE/AVX/NEON/RVV)"
+        est_gain: 0.20
+        risk_regression: 0.03
+        time_min: 6
+        cpu_pct_est: 40
+        ram_mb_est: 128
+
+  # ---- App domains (existing) ----
   - id: web_dev
     name: Web Development (FastAPI/HTMX)
     safety_level: medium
@@ -283,6 +494,48 @@ topics:
         cpu_pct_est: 25
         ram_mb_est: 96
 
+  - id: problem_solving/k12
+    name: K-12 Problem Solving (pattern spotting, multi-step)
+    safety_level: low
+    default_strategies: [ace, vanilla]
+    notes: "Kid-friendly scaffolds; arithmetic patterns → word problems."
+    skills:
+      - id: k12-patterns
+        title: "Pattern spotting & operations selection"
+        est_gain: 0.30
+        risk_regression: 0.02
+        time_min: 4
+        cpu_pct_est: 10
+        ram_mb_est: 32
+      - id: k12-multistep
+        title: "Two-step word-problem templates"
+        est_gain: 0.28
+        risk_regression: 0.02
+        time_min: 5
+        cpu_pct_est: 15
+        ram_mb_est: 48
+
+  - id: problem_solving/advanced
+    name: Advanced Problem Solving (algorithms & math)
+    safety_level: low
+    default_strategies: [ace]
+    notes: "Olympiad/Euler-style reasoning; invariants; DP; number theory."
+    skills:
+      - id: adv-invariants
+        title: "Invariants & monovariants"
+        est_gain: 0.26
+        risk_regression: 0.03
+        time_min: 7
+        cpu_pct_est: 25
+        ram_mb_est: 96
+      - id: adv-numbertheory
+        title: "Number-theory toolkit (CRT, modular)"
+        est_gain: 0.24
+        risk_regression: 0.03
+        time_min: 8
+        cpu_pct_est: 30
+        ram_mb_est: 128
+
   - id: math
     name: Math Reasoning
     safety_level: low
@@ -303,6 +556,304 @@ topics:
         time_min: 5
         cpu_pct_est: 25
         ram_mb_est: 96
+
+  # ---- Science blocks ----
+  - id: science/math/calculus
+    name: Calculus (limits, derivatives, integrals)
+    safety_level: low
+    default_strategies: [ace]
+    notes: "Emphasis on problem templates and geometric intuition."
+    skills:
+      - id: calc-deriv
+        title: "Derivative cheat-sheet & practice set"
+        est_gain: 0.22
+        risk_regression: 0.02
+        time_min: 6
+        cpu_pct_est: 15
+        ram_mb_est: 64
+      - id: calc-integral
+        title: "Integral techniques (u-sub, parts)"
+        est_gain: 0.22
+        risk_regression: 0.02
+        time_min: 7
+        cpu_pct_est: 15
+        ram_mb_est: 64
+
+  - id: science/physics
+    name: Physics (mechanics → EM → thermo)
+    safety_level: low
+    default_strategies: [ace]
+    notes: "Units, FBDs, conservation laws; experiment-style reasoning."
+    skills:
+      - id: phy-kinematics
+        title: "Kinematics & Newton’s laws drills"
+        est_gain: 0.20
+        risk_regression: 0.02
+        time_min: 6
+        cpu_pct_est: 15
+        ram_mb_est: 64
+      - id: phy-em
+        title: "Circuit & EM problem templates"
+        est_gain: 0.18
+        risk_regression: 0.02
+        time_min: 6
+        cpu_pct_est: 15
+        ram_mb_est: 64
+
+  - id: science/chemistry
+    name: Chemistry (general → physical/organic)
+    safety_level: low
+    default_strategies: [ace]
+    notes: "Stoichiometry, equilibria, thermochemistry, spectra."
+    skills:
+      - id: chem-stoich
+        title: "Stoichiometry & limiting reagent drills"
+        est_gain: 0.20
+        risk_regression: 0.02
+        time_min: 6
+        cpu_pct_est: 15
+        ram_mb_est: 64
+      - id: chem-thermo
+        title: "Thermochem lookups & Hess’s law"
+        est_gain: 0.18
+        risk_regression: 0.02
+        time_min: 6
+        cpu_pct_est: 15
+        ram_mb_est: 64
+
+  - id: science/neuroscience
+    name: Neuroscience (cellular → systems)
+    safety_level: low
+    default_strategies: [ace]
+    notes: "Membrane potentials, synapses, circuits, imaging."
+    skills:
+      - id: neuro-ap
+        title: "Action potentials & ion channels"
+        est_gain: 0.18
+        risk_regression: 0.02
+        time_min: 7
+        cpu_pct_est: 20
+        ram_mb_est: 96
+      - id: neuro-circuits
+        title: "Circuit motifs & mapping (atlas)"
+        est_gain: 0.16
+        risk_regression: 0.02
+        time_min: 7
+        cpu_pct_est: 25
+        ram_mb_est: 128
+
+  - id: science/evolution
+    name: Evolution & Population Genetics
+    safety_level: low
+    default_strategies: [ace]
+    notes: "Selection, drift, gene flow, phylogenies."
+    skills:
+      - id: evo-selection
+        title: "Selection vs drift scenarios"
+        est_gain: 0.16
+        risk_regression: 0.02
+        time_min: 6
+        cpu_pct_est: 15
+        ram_mb_est: 64
+      - id: evo-tree
+        title: "Build & read simple phylogenies"
+        est_gain: 0.14
+        risk_regression: 0.02
+        time_min: 6
+        cpu_pct_est: 15
+        ram_mb_est: 64
+
+  - id: science/physiology
+    name: Physiology (systems & homeostasis)
+    safety_level: low
+    default_strategies: [ace]
+    notes: "Organ systems, feedback control, integration."
+    skills:
+      - id: physio-homeo
+        title: "Homeostasis & feedback loops"
+        est_gain: 0.16
+        risk_regression: 0.02
+        time_min: 6
+        cpu_pct_est: 15
+        ram_mb_est: 64
+      - id: physio-cv
+        title: "Cardiovascular flows & pressures"
+        est_gain: 0.14
+        risk_regression: 0.02
+        time_min: 6
+        cpu_pct_est: 15
+        ram_mb_est: 64
+
+  # ---- Software architecture & craft ----
+  - id: sw-eng/oop
+    name: Object-Oriented Design & Patterns
+    safety_level: low
+    default_strategies: [ace]
+    notes: "SOLID, GoF patterns, refactoring to deeper insight."
+    skills:
+      - id: oop-solid
+        title: "Map smells → SOLID refactors"
+        est_gain: 0.22
+        risk_regression: 0.03
+        time_min: 6
+        cpu_pct_est: 20
+        ram_mb_est: 96
+      - id: oop-patterns
+        title: "Pick/apply 3 patterns w/ rationale"
+        est_gain: 0.20
+        risk_regression: 0.03
+        time_min: 7
+        cpu_pct_est: 25
+        ram_mb_est: 96
+
+  - id: sw-eng/abstraction
+    name: Abstraction & API Design
+    safety_level: low
+    default_strategies: [ace]
+    notes: "Interfaces, dependency inversion, stability vs flexibility."
+    skills:
+      - id: abs-surface
+        title: "Stabilize API surfaces (breaking change audit)"
+        est_gain: 0.22
+        risk_regression: 0.03
+        time_min: 6
+        cpu_pct_est: 20
+        ram_mb_est: 96
+      - id: abs-adapters
+        title: "Adapter/Facade for legacy interop"
+        est_gain: 0.18
+        risk_regression: 0.03
+        time_min: 6
+        cpu_pct_est: 20
+        ram_mb_est: 96
+
+  - id: sw-eng/lob
+    name: Locality of Behavior (LoB)
+    safety_level: low
+    default_strategies: [ace]
+    notes: "Co-locate code/data that change together; align with cache/ownership."
+    skills:
+      - id: lob-mod
+        title: "Module re-layout for LoB"
+        est_gain: 0.20
+        risk_regression: 0.03
+        time_min: 7
+        cpu_pct_est: 25
+        ram_mb_est: 96
+      - id: lob-ecs
+        title: "LoB in ECS/system boundaries"
+        est_gain: 0.18
+        risk_regression: 0.03
+        time_min: 6
+        cpu_pct_est: 25
+        ram_mb_est: 96
+
+  - id: sw-eng/architecture
+    name: Software Architecture (C4 + views)
+    safety_level: low
+    default_strategies: [ace]
+    notes: "C4 model, system/container/component/code; deployment & runtime views."
+    skills:
+      - id: arch-c4
+        title: "C4 set (Context→Container→Component)"
+        est_gain: 0.20
+        risk_regression: 0.02
+        time_min: 6
+        cpu_pct_est: 15
+        ram_mb_est: 64
+      - id: arch-deploy
+        title: "Deployment & runtime diagrams"
+        est_gain: 0.16
+        risk_regression: 0.02
+        time_min: 6
+        cpu_pct_est: 15
+        ram_mb_est: 64
+
+  # ---- Finance ----
+  - id: finance/personal
+    name: Personal Finance (budgeting, indexing)
+    safety_level: low
+    default_strategies: [ace]
+    notes: "Budgets, emergency funds, diversified index approach, fee awareness."
+    skills:
+      - id: pf-budget
+        title: "Zero-based budget + sinking funds"
+        est_gain: 0.18
+        risk_regression: 0.02
+        time_min: 5
+        cpu_pct_est: 10
+        ram_mb_est: 32
+      - id: pf-index
+        title: "Build a 3-fund portfolio plan"
+        est_gain: 0.18
+        risk_regression: 0.02
+        time_min: 6
+        cpu_pct_est: 10
+        ram_mb_est: 32
+
+  - id: finance/business
+    name: Business Finance (valuation & capital)
+    safety_level: low
+    default_strategies: [ace]
+    notes: "DCF, multiples, WACC, capital structure, ROIC."
+    skills:
+      - id: bf-wacc
+        title: "Compute WACC inputs & cross-check"
+        est_gain: 0.20
+        risk_regression: 0.03
+        time_min: 7
+        cpu_pct_est: 15
+        ram_mb_est: 64
+      - id: bf-dcf
+        title: "Build a simple DCF w/ scenarios"
+        est_gain: 0.22
+        risk_regression: 0.03
+        time_min: 8
+        cpu_pct_est: 20
+        ram_mb_est: 96
+
+  - id: finance/markets
+    name: Markets & Macro (rates, indices, microstructure)
+    safety_level: low
+    default_strategies: [ace]
+    notes: "Risk premiums, rate curves, market data sanity."
+    skills:
+      - id: mk-rates
+        title: "Read rate moves vs FRED series"
+        est_gain: 0.16
+        risk_regression: 0.02
+        time_min: 6
+        cpu_pct_est: 10
+        ram_mb_est: 32
+      - id: mk-liquidity
+        title: "Order book & spread reasoning"
+        est_gain: 0.16
+        risk_regression: 0.02
+        time_min: 6
+        cpu_pct_est: 10
+        ram_mb_est: 32
+
+  # ---- Built environment ----
+  - id: architecture/construction
+    name: Construction Architecture (codes & sustainability)
+    safety_level: low
+    default_strategies: [ace]
+    notes: "ICC codes, AIA guidance, WBDG patterns, LEED/USGBC."
+    skills:
+      - id: constr-code
+        title: "Code path: occupancy, egress, fire"
+        est_gain: 0.16
+        risk_regression: 0.03
+        time_min: 7
+        cpu_pct_est: 10
+        ram_mb_est: 32
+      - id: constr-leed
+        title: "LEED credit pre-assessment"
+        est_gain: 0.14
+        risk_regression: 0.03
+        time_min: 7
+        cpu_pct_est: 10
+        ram_mb_est: 32
 
   - id: security_basics
     name: Security Basics (defensive)
