@@ -1,17 +1,25 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Optional
-import os, sys, pathlib, subprocess, time, json
+from typing import List, Optional, Tuple
+import os, sys, pathlib, subprocess, time, json, re
 
 from bot.paths import get_project_root
 from bot.llm.provider import ask, info, NotConfigured  # LLM interface
 
+
 @dataclass
 class AutoCodeResult:
     title: str
-    patch_path: str
+    patch_path: str               # path to saved .diff (or raw output if no diff)
     patch_applied: bool
     touched_paths: List[str]
+    artifacts_dir: str            # folder with prompt/raw/diff for this attempt
+    note: str                     # human-readable status
+
+
+# ---------------- internals ----------------
+
+_ALLOWED_DIFF_PREFIXES = ("diff --git", "index ", "--- ", "+++ ", "@@ ")
 
 def _llm_ok() -> bool:
     try:
@@ -62,19 +70,93 @@ def _build_prompt(file_paths: List[pathlib.Path]) -> str:
             pass
     return header + "\n".join(context)
 
-def _write_patch(diff_text: str) -> pathlib.Path:
-    out_dir = get_project_root() / "snapshots" / "selfopt" / "patches"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    p = out_dir / f"autocode_{int(time.time())}.diff"
-    p.write_text(diff_text, encoding="utf-8")
-    return p
+def _strip_code_fences(s: str) -> str:
+    # remove ```...``` fences if present
+    return re.sub(r"```(?:diff|patch)?\\n|```", "", s, flags=re.IGNORECASE)
+
+def _sanitize_to_diff(raw: str) -> str:
+    """
+    Keep only diff-looking lines and valid hunk bodies; fix a/b prefixes if missing.
+    """
+    raw = _strip_code_fences(raw).replace("\r\n", "\n")
+    lines = raw.splitlines()
+    out: list[str] = []
+    in_hunk = False
+
+    def _ensure_ab(line: str) -> str:
+        # normalize ---/+++ headers to have a/ b/ prefixes when paths look relative
+        if line.startswith("--- "):
+            path = line[4:].strip()
+            if not (path.startswith("a/") or path.startswith("/dev/null")):
+                return "--- a/" + path
+        if line.startswith("+++ "):
+            path = line[4:].strip()
+            if not (path.startswith("b/") or path.startswith("/dev/null")):
+                return "+++ b/" + path
+        return line
+
+    for ln in lines:
+        if ln.startswith(_ALLOWED_DIFF_PREFIXES):
+            if ln.startswith("--- ") or ln.startswith("+++ "):
+                ln = _ensure_ab(ln)
+            out.append(ln)
+            in_hunk = ln.startswith("@@ ") or in_hunk
+            continue
+
+        if in_hunk:
+            # hunk body lines must be one of ' ', '+', '-'
+            if ln.startswith((" ", "+", "-")):
+                out.append(ln)
+                continue
+            else:
+                in_hunk = False
+
+    # If we have +++/--- but no diff --git headers, synthesize minimal headers per file.
+    # This helps git apply on simple single-file patches the LLM produces.
+    text = "\n".join(out).strip()
+    if text and "diff --git " not in text:
+        # try to detect current file
+        cur: List[str] = []
+        fixed: List[str] = []
+        for ln in text.splitlines():
+            cur.append(ln)
+            if ln.startswith("+++ "):
+                plus_path = ln[4:].strip()
+                minus_path = None
+                # find a matching --- line before
+                for back in reversed(cur[:-1]):
+                    if back.startswith("--- "):
+                        minus_path = back[4:].strip()
+                        break
+                if plus_path and minus_path:
+                    fixed.insert(0, f"diff --git {minus_path} {plus_path}")
+        if fixed:
+            text = "\n".join(fixed) + "\n" + text
+    return (text + "\n") if text else ""
+
+def _write_artifacts(prompt: str, raw: str, diff: str) -> Tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    base = get_project_root() / "snapshots" / "selfopt" / "autocode" / time.strftime("%Y%m%d_%H%M%S")
+    base.mkdir(parents=True, exist_ok=True)
+    (base / "prompt.txt").write_text(prompt, encoding="utf-8")
+    (base / "raw.txt").write_text(raw, encoding="utf-8")
+    diff_path = base / "patch.diff"
+    if diff:
+        diff_path.write_text(diff, encoding="utf-8")
+    return base, diff_path, base / "raw.txt"
 
 def _git_apply(patch_path: pathlib.Path) -> bool:
-    try:
-        subprocess.check_call(["git", "apply", "--index", "--whitespace=fix", str(patch_path)])
-        return True
-    except Exception:
-        return False
+    attempts = [
+        ["git", "apply", "--index", "--whitespace=fix", str(patch_path)],
+        ["git", "apply", "--index", "--ignore-whitespace", str(patch_path)],
+        ["git", "apply", "--reject", str(patch_path)],
+    ]
+    for cmd in attempts:
+        try:
+            subprocess.check_call(cmd)
+            return True
+        except Exception:
+            continue
+    return False
 
 def _touch_list_from_diff(diff_text: str) -> List[str]:
     touched = []
@@ -83,16 +165,19 @@ def _touch_list_from_diff(diff_text: str) -> List[str]:
             path = line.split(" ", 1)[1].strip()
             if path.startswith("b/"):
                 path = path[2:]
-            touched.append(path)
-    return [t for t in touched if t and not t.startswith("/dev/null")]
+            if path and not path.startswith("/dev/null"):
+                touched.append(path)
+    return touched
 
-def propose_and_apply_refactor(max_files: int = 3) -> Optional[AutoCodeResult]:
+# ---------------- public API ----------------
+
+def propose_and_apply_refactor(max_files: int = 3, retries: int = 2) -> Optional[AutoCodeResult]:
     """
-    1) Pick a few hotspot files under bot/
-    2) Ask the LLM for a single unified diff
-    3) Save the diff under snapshots/selfopt/patches
-    4) Try to `git apply` it (guard will block writes to protected dirs at write-time)
-    5) Return result (caller gates adoption behind tests/evals)
+    1) Pick hotspot files under bot/
+    2) Ask the LLM for a single unified diff (retry with a 'convert to diff' repair prompt if needed)
+    3) Save prompt/raw/diff under snapshots/selfopt/autocode/<ts>/
+    4) Try to git-apply with fallbacks (CRLF, whitespace, reject)
+    5) Return result so the workflow can gate adoption behind tests/evals
     """
     if not _llm_ok():
         return None
@@ -103,22 +188,52 @@ def propose_and_apply_refactor(max_files: int = 3) -> Optional[AutoCodeResult]:
         return None
 
     prompt = _build_prompt(hotspots)
-    diff = ask(prompt, max_tokens=2500, temperature=0.2)
+    raw = ask(prompt, max_tokens=2500, temperature=0.2)
 
-    # Must look like a unified diff
-    if ("+++ " not in diff) or ("--- " not in diff) or ("@@ " not in diff):
-        return None
+    diff = _sanitize_to_diff(raw)
+    attempt = 0
 
-    patch_path = _write_patch(diff)
-    touched = _touch_list_from_diff(diff)
+    # repair pass if not a valid diff-looking output
+    def looks_like_diff(d: str) -> bool:
+        return ("+++ " in d and "--- " in d and "@@ " in d)
 
-    # Let the FS guard enforce deny-listing at write time (raises PermissionError if we ever tried).
-    # We don't write here; we just attempt to apply via git which will write if allowed.
-    applied = _git_apply(patch_path)
+    while not looks_like_diff(diff) and attempt < retries:
+        attempt += 1
+        repair_prompt = (
+            "Convert the following output into a VALID unified diff.\n"
+            "Rules:\n"
+            " - Only output the diff, no commentary.\n"
+            " - Ensure each file has 'diff --git a/… b/…' and '--- a/…' + '+++ b/…' headers.\n"
+            " - Include correct '@@' hunks.\n\n"
+            "OUTPUT TO CONVERT:\n"
+        ) + raw
+        raw2 = ask(repair_prompt, max_tokens=2000, temperature=0.0)
+        diff = _sanitize_to_diff(raw2)
+        if diff.strip():
+            raw = raw2  # keep latest raw
+
+    # write artifacts (always)
+    art_dir, diff_path, raw_path = _write_artifacts(prompt, raw, diff)
+    touched = _touch_list_from_diff(diff) if diff else []
+
+    if not looks_like_diff(diff):
+        return AutoCodeResult(
+            title="autocode-refactor",
+            patch_path=str(raw_path),       # no diff; point at raw so you can inspect
+            patch_applied=False,
+            touched_paths=[],
+            artifacts_dir=str(art_dir),
+            note="LLM did not produce a valid unified diff",
+        )
+
+    applied = _git_apply(diff_path)
+    note = "patch applied via git apply" if applied else "patch did NOT apply (see .rej files if any)"
 
     return AutoCodeResult(
         title="autocode-refactor",
-        patch_path=str(patch_path),
+        patch_path=str(diff_path),
         patch_applied=bool(applied),
         touched_paths=touched,
+        artifacts_dir=str(art_dir),
+        note=note,
     )
