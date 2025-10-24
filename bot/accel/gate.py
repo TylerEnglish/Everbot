@@ -34,3 +34,8 @@ def set_default_env_from_gate() -> None:
     pref = get_chunk_preference()
     if pref:
         os.environ["EVERABOT_CHUNK_ENGINE"] = pref
+def canon_chunks(batch):
+    def c1(rec):
+        doc, start, text, toks = rec[0], rec[1], rec[2], rec[3]
+        return (str(doc), int(start), str(text), int(toks))
+    return [[c1(r) for r in group] for group in batch]
