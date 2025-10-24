@@ -1,5 +1,5 @@
 from __future__ import annotations
-import requests, pathlib, re
+import requests, pathlib, re, time, threading
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from PyPDF2 import PdfReader
@@ -15,8 +15,71 @@ _ALLOWED = {h.lower() for h in (load_all().get("tools", {}).get("net", {}).get("
 # match mistaken RFC PDF paths like https://www.rfc-editor.org/rfc/rfc3284.pdf
 _RFC_PDF_MISPATH = re.compile(r"^https?://(?:www\.)?rfc-editor\.org/rfc/rfc(\d+)\.pdf$", re.I)
 
+_TOOLS   = load_all().get("tools", {}) or {}
+_RL_CFG  = (_TOOLS.get("internet", {}) or {}).get("rate_limit", {}) or {}
+_CT_ALLOW = set((_TOOLS.get("content_types_allowlist") or []))
+_MAX_BYTES = int(_TOOLS.get("max_bytes_per_doc") or 0) or None
+
+class _TokenBucket:
+    def __init__(self, rps: float, burst: int, window_ms: int = 1000):
+        self.rate = max(0.0, float(rps))
+        self.capacity = max(0, int(burst))
+        self.tokens = self.capacity
+        self.window = max(1, int(window_ms))
+        self.lock = threading.Lock()
+        self.last = time.time()
+    def take(self, n: int = 1):
+        if self.rate <= 0 or self.capacity <= 0:
+            return
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last
+            refill = elapsed * self.rate
+            if refill >= 1.0:
+                self.tokens = min(self.capacity, self.tokens + int(refill))
+                self.last = now
+            while self.tokens < n:
+                need = (n - self.tokens) / max(1e-9, self.rate)
+                time.sleep(min(0.050, need))
+                now = time.time()
+                elapsed = now - self.last
+                refill = elapsed * self.rate
+                if refill >= 1.0:
+                    self.tokens = min(self.capacity, self.tokens + int(refill))
+                    self.last = now
+            self.tokens -= n
+
+_BUCKET = _TokenBucket(
+    float(_RL_CFG.get("rps_max") or 0),
+    int(_RL_CFG.get("burst_max") or 0),
+    int(_RL_CFG.get("window_ms") or 1000),
+)
+
 def _req(url: str) -> requests.Response:
-    return requests.get(url, headers=_UA, timeout=30)
+    _BUCKET.take()
+    # If we have a max size, try HEAD first to enforce a budget without downloading.
+    if _MAX_BYTES:
+        try:
+            _BUCKET.take()
+            h = requests.head(url, headers=_UA, timeout=15, allow_redirects=True)
+            if h.ok:
+                cl = h.headers.get("Content-Length")
+                if cl and cl.isdigit() and int(cl) > _MAX_BYTES:
+                    raise ValueError(f"Refusing to fetch > max_bytes_per_doc ({cl} > {_MAX_BYTES})")
+        except Exception:
+            # HEAD might be blocked; continue to GET and stream-guard.
+            pass
+    r = requests.get(url, headers=_UA, timeout=30, stream=bool(_MAX_BYTES))
+    if _MAX_BYTES and r.ok and r.raw:
+        # stream read up to _MAX_BYTES+1, then abort if exceeded
+        content = b""
+        for chunk in r.iter_content(chunk_size=65536):
+            content += chunk
+            if len(content) > _MAX_BYTES:
+                r.close()
+                raise ValueError("Downloaded payload exceeds max_bytes_per_doc")
+        r._content = content
+    return r
 
 def _try_rfc_fallback(orig_url: str, resp: requests.Response) -> tuple[str, requests.Response] | tuple[None, None]:
     if resp.status_code != 404:
@@ -61,6 +124,11 @@ def fetch(url_or_path: str) -> tuple[str, str]:
         r.raise_for_status()
 
         ct = (r.headers.get("content-type") or "").lower()
+        if _CT_ALLOW:
+            # normalize like 'application/pdf; charset=binary' → 'application/pdf'
+            cmain = ct.split(";", 1)[0].strip() if ct else ""
+            if cmain and cmain not in _CT_ALLOW:
+                raise PermissionError(f"Disallowed content-type: {cmain}")
         if "pdf" in ct or url_or_path.lower().endswith(".pdf"):
             return (url_or_path, _pdf_bytes_to_text(r.content))
         elif "html" in ct or "<html" in r.text.lower():

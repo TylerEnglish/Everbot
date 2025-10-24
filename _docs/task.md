@@ -155,9 +155,9 @@ Everabot/
 
 ### 12) Governance: promotion gates & safety rails
 
-* [ ] Encode the **Pareto gate**: `new_topic_score >= threshold` AND `all_root_scores >= last_promoted` else rollback.
-* [ ] Rate-limit and sandbox “internet tools”; whitelist only fetchers and doc types you’re comfortable with.
-* [ ] Enforce **max token**, **max wall-time**, **max disk** budgets per run (configurable in `ruleset/limits.yaml`).
+* [*] Encode the **Pareto gate**: `new_topic_score >= threshold` AND `all_root_scores >= last_promoted` else rollback.
+* [*] Rate-limit and sandbox “internet tools”; whitelist only fetchers and doc types you’re comfortable with.
+* [*] Enforce **max token**, **max wall-time**, **max disk** budgets per run (configurable in `ruleset/limits.yaml`).
 
 ---
 

@@ -298,7 +298,7 @@ turing_weights:
   fluency: 0.4
   consistency: 0.3
   safety: 0.3
-bench_thresholds:
+perf_thresholds:
   perf_tps_min: 6.0           # tokens/sec (char/4 heuristic)
   perf_mem_mb_max: 6000       # RSS upper bound after runs
   perf_model_mb_max: 5000     # model file size (if local path)
@@ -336,6 +336,7 @@ internet:
   rate_limit:
     rps_max: 4
     burst_max: 8
+    window_ms: 1000   # optional; token bucket refill window
 
 # Central, enforced by fetchers.py
 net:
@@ -343,6 +344,7 @@ net:
     - arxiv.org
     - www.rfc-editor.org
     - datatracker.ietf.org
+    - www.youtube.com
     - youtube.com
     - youtu.be
     - github.com
@@ -359,6 +361,14 @@ exec:
 sandbox:
   fs_ro_paths: ["ruleset", "test"]
   net_namespaces: ["default"]
+
+# Optional additional safety for fetchers:
+content_types_allowlist:
+  - text/html
+  - text/plain
+  - application/pdf
+  - text/markdown
+max_bytes_per_doc: 10485760   # 10 MiB cap per fetch
 
 ```
 
@@ -1438,6 +1448,7 @@ from bot.curriculum.registry import mark_done
 from bot.curriculum.strategies import get_params as get_strategy_params
 from bot.rag.hybrid import hybrid_topk
 from bot.rag.chunk_spec import chunk_text_equiv as _chunk_text  # spec chunker
+from bot.governance.tokens import TokenBudget
 
 _ROOT = get_project_root()
 _SNAP = _ROOT / "snapshots"
@@ -1737,11 +1748,23 @@ class Orchestrator:
                 with self.tracer.start_as_current_span("phase.practice"):
                     attempts, correct = 0, 0
                     logs = []
+                    # token budget from ruleset
+                    tmax = int(self.rules.get("limits", {}).get("tokens_max", 0) or 0)
+                    tbudget = TokenBudget(tmax)
                     for b in bullets[:3]:
                         q = f"Based on: {b['text']}\nQ: Explain this tactic briefly."
                         try:
                             prompt = reduce_prompt(q, target_tokens=256)
-                            ans = llm_ask(prompt, max_tokens=256, temperature=0.0)
+                            ok, max_ans = tbudget.will_fit(prompt, max_answer_tokens=256)
+                            if not ok or max_ans <= 0:
+                                logs.append({"q": q, "a": "(skipped: token budget exhausted)"})
+                                continue
+                            ans = llm_ask(prompt, max_tokens=max_ans, temperature=0.0)
+                            # record consumption (prompt + answer) using rough count
+                            try:
+                                tbudget.consume(prompt, ans)
+                            except Exception:
+                                pass
                             logs.append({"q": q, "a": ans})
                             correct += int(bool(ans.strip()))
                         except NotConfigured:
@@ -1749,7 +1772,8 @@ class Orchestrator:
                         attempts += 1
                     practice_score = (correct / attempts) if attempts else 0.0
                     self._log_phase_result(Phase.PRACTICE, {
-                        "attempts": attempts, "correct": correct, "score": practice_score, "samples": logs
+                        "attempts": attempts, "correct": correct, "score": practice_score,
+                        "samples": logs, "token_budget": {"max": tmax, "used": tbudget.used}
                     })
 
                 # ---------------- EVAL (root tests) -------------------------------------
@@ -3013,6 +3037,44 @@ class BudgetEnforcer:
 
 ```
 
+governance/tokens.py:
+```python
+from __future__ import annotations
+import threading
+
+class TokenBudget:
+    """Thread-safe token budget for a single run."""
+    def __init__(self, max_tokens: int):
+        self.max = int(max_tokens or 0)
+        self.used = 0
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _rough_count(text: str) -> int:
+        # OpenAI guidance: ~4 characters ≈ 1 token (rough) → keep conservative. 
+        # https://help.openai.com/en/articles/7934971 (search: “~4 characters per token”)
+        return max(1, len(text) // 4)
+
+    def will_fit(self, prompt: str, max_answer_tokens: int) -> tuple[bool, int]:
+        if self.max <= 0:
+            return (True, max_answer_tokens)
+        with self._lock:
+            prompt_tokens = self._rough_count(prompt)
+            remaining = self.max - self.used - prompt_tokens
+            if remaining <= 0:
+                return (False, 0)
+            return (True, max(0, min(remaining, int(max_answer_tokens))))
+
+    def consume(self, prompt: str, answer_text: str = "") -> int:
+        if self.max <= 0:
+            return 0
+        with self._lock:
+            t = self._rough_count(prompt) + (self._rough_count(answer_text) if answer_text else 0)
+            self.used += t
+            return t
+
+```
+
 llm/backends/base.py
 ```python
 from __future__ import annotations
@@ -3436,7 +3498,7 @@ def topk_equivalent(a: pathlib.Path, b: pathlib.Path,
 rag/fetchers.py
 ```python
 from __future__ import annotations
-import requests, pathlib, re
+import requests, pathlib, re, time, threading
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from PyPDF2 import PdfReader
@@ -3452,8 +3514,71 @@ _ALLOWED = {h.lower() for h in (load_all().get("tools", {}).get("net", {}).get("
 # match mistaken RFC PDF paths like https://www.rfc-editor.org/rfc/rfc3284.pdf
 _RFC_PDF_MISPATH = re.compile(r"^https?://(?:www\.)?rfc-editor\.org/rfc/rfc(\d+)\.pdf$", re.I)
 
+_TOOLS   = load_all().get("tools", {}) or {}
+_RL_CFG  = (_TOOLS.get("internet", {}) or {}).get("rate_limit", {}) or {}
+_CT_ALLOW = set((_TOOLS.get("content_types_allowlist") or []))
+_MAX_BYTES = int(_TOOLS.get("max_bytes_per_doc") or 0) or None
+
+class _TokenBucket:
+    def __init__(self, rps: float, burst: int, window_ms: int = 1000):
+        self.rate = max(0.0, float(rps))
+        self.capacity = max(0, int(burst))
+        self.tokens = self.capacity
+        self.window = max(1, int(window_ms))
+        self.lock = threading.Lock()
+        self.last = time.time()
+    def take(self, n: int = 1):
+        if self.rate <= 0 or self.capacity <= 0:
+            return
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last
+            refill = elapsed * self.rate
+            if refill >= 1.0:
+                self.tokens = min(self.capacity, self.tokens + int(refill))
+                self.last = now
+            while self.tokens < n:
+                need = (n - self.tokens) / max(1e-9, self.rate)
+                time.sleep(min(0.050, need))
+                now = time.time()
+                elapsed = now - self.last
+                refill = elapsed * self.rate
+                if refill >= 1.0:
+                    self.tokens = min(self.capacity, self.tokens + int(refill))
+                    self.last = now
+            self.tokens -= n
+
+_BUCKET = _TokenBucket(
+    float(_RL_CFG.get("rps_max") or 0),
+    int(_RL_CFG.get("burst_max") or 0),
+    int(_RL_CFG.get("window_ms") or 1000),
+)
+
 def _req(url: str) -> requests.Response:
-    return requests.get(url, headers=_UA, timeout=30)
+    _BUCKET.take()
+    # If we have a max size, try HEAD first to enforce a budget without downloading.
+    if _MAX_BYTES:
+        try:
+            _BUCKET.take()
+            h = requests.head(url, headers=_UA, timeout=15, allow_redirects=True)
+            if h.ok:
+                cl = h.headers.get("Content-Length")
+                if cl and cl.isdigit() and int(cl) > _MAX_BYTES:
+                    raise ValueError(f"Refusing to fetch > max_bytes_per_doc ({cl} > {_MAX_BYTES})")
+        except Exception:
+            # HEAD might be blocked; continue to GET and stream-guard.
+            pass
+    r = requests.get(url, headers=_UA, timeout=30, stream=bool(_MAX_BYTES))
+    if _MAX_BYTES and r.ok and r.raw:
+        # stream read up to _MAX_BYTES+1, then abort if exceeded
+        content = b""
+        for chunk in r.iter_content(chunk_size=65536):
+            content += chunk
+            if len(content) > _MAX_BYTES:
+                r.close()
+                raise ValueError("Downloaded payload exceeds max_bytes_per_doc")
+        r._content = content
+    return r
 
 def _try_rfc_fallback(orig_url: str, resp: requests.Response) -> tuple[str, requests.Response] | tuple[None, None]:
     if resp.status_code != 404:
@@ -3498,6 +3623,11 @@ def fetch(url_or_path: str) -> tuple[str, str]:
         r.raise_for_status()
 
         ct = (r.headers.get("content-type") or "").lower()
+        if _CT_ALLOW:
+            # normalize like 'application/pdf; charset=binary' → 'application/pdf'
+            cmain = ct.split(";", 1)[0].strip() if ct else ""
+            if cmain and cmain not in _CT_ALLOW:
+                raise PermissionError(f"Disallowed content-type: {cmain}")
         if "pdf" in ct or url_or_path.lower().endswith(".pdf"):
             return (url_or_path, _pdf_bytes_to_text(r.content))
         elif "html" in ct or "<html" in r.text.lower():

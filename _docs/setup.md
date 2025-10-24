@@ -87,3 +87,11 @@ Get-Item snapshots\rag\v1_copy\docs.jsonl
 # prove bitwise + top-k equivalence
 poetry run everabot rag prove-equivalence v1 v1_copy
 poetry run everabot rag delta-roundtrip snapshots/rag/v1 snapshots/rag/v1_copy --out snapshots/rag/deltas/v1_to_v1copy
+
+
+poetry run python -m bot.cli selfcheck
+poetry run python -m bot.cli rag init
+poetry run python -m bot.cli rag stats
+poetry run python -m bot.cli rag query "What is VCDIFF used for?"
+poetry run python -m bot.cli learn web_dev --strategy ace
+poetry run python -m bot.cli snapshot latest

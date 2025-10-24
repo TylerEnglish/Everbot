@@ -31,6 +31,7 @@ from bot.curriculum.registry import mark_done
 from bot.curriculum.strategies import get_params as get_strategy_params
 from bot.rag.hybrid import hybrid_topk
 from bot.rag.chunk_spec import chunk_text_equiv as _chunk_text  # spec chunker
+from bot.governance.tokens import TokenBudget
 
 _ROOT = get_project_root()
 _SNAP = _ROOT / "snapshots"
@@ -330,11 +331,23 @@ class Orchestrator:
                 with self.tracer.start_as_current_span("phase.practice"):
                     attempts, correct = 0, 0
                     logs = []
+                    # token budget from ruleset
+                    tmax = int(self.rules.get("limits", {}).get("tokens_max", 0) or 0)
+                    tbudget = TokenBudget(tmax)
                     for b in bullets[:3]:
                         q = f"Based on: {b['text']}\nQ: Explain this tactic briefly."
                         try:
                             prompt = reduce_prompt(q, target_tokens=256)
-                            ans = llm_ask(prompt, max_tokens=256, temperature=0.0)
+                            ok, max_ans = tbudget.will_fit(prompt, max_answer_tokens=256)
+                            if not ok or max_ans <= 0:
+                                logs.append({"q": q, "a": "(skipped: token budget exhausted)"})
+                                continue
+                            ans = llm_ask(prompt, max_tokens=max_ans, temperature=0.0)
+                            # record consumption (prompt + answer) using rough count
+                            try:
+                                tbudget.consume(prompt, ans)
+                            except Exception:
+                                pass
                             logs.append({"q": q, "a": ans})
                             correct += int(bool(ans.strip()))
                         except NotConfigured:
@@ -342,7 +355,8 @@ class Orchestrator:
                         attempts += 1
                     practice_score = (correct / attempts) if attempts else 0.0
                     self._log_phase_result(Phase.PRACTICE, {
-                        "attempts": attempts, "correct": correct, "score": practice_score, "samples": logs
+                        "attempts": attempts, "correct": correct, "score": practice_score,
+                        "samples": logs, "token_budget": {"max": tmax, "used": tbudget.used}
                     })
 
                 # ---------------- EVAL (root tests) -------------------------------------

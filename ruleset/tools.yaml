@@ -6,6 +6,7 @@ internet:
   rate_limit:
     rps_max: 4
     burst_max: 8
+    window_ms: 1000   # optional; token bucket refill window
 
 # Central, enforced by fetchers.py
 net:
@@ -30,3 +31,11 @@ exec:
 sandbox:
   fs_ro_paths: ["ruleset", "test"]
   net_namespaces: ["default"]
+
+# Optional additional safety for fetchers:
+content_types_allowlist:
+  - text/html
+  - text/plain
+  - application/pdf
+  - text/markdown
+max_bytes_per_doc: 10485760   # 10 MiB cap per fetch
