@@ -131,6 +131,9 @@ net:
     - www.investopedia.com
     - investopedia.com
     - gitlab.com
+    - www.aisc.org
+    - opentreeoflife.org
+    - www.finra.org
 
 file_ops:
   write_whitelist: ["snapshots"]
