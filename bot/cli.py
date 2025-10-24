@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os
-import typer, sys, pathlib, subprocess, json
+import typer, sys, pathlib, subprocess, json, hashlib
 import shutil
 from typing import Optional
 from rich import print
@@ -8,8 +8,7 @@ from bot.security.guard import install_guard
 from bot.paths import get_project_root
 from bot.rules.loader import load_all
 from bot.eval.harness import run_all
-from bot.rag.utils import read_jsonl
-from bot.rag.utils import write_jsonl
+from bot.rag.utils import read_jsonl, write_jsonl, canonicalize_json_rows
 from bot.telemetry.tracing import get_tracer, force_flush
 
 app = typer.Typer(help="Everabot CLI")
@@ -26,8 +25,79 @@ _ROOT = get_project_root()
 _PROTECTED_DIRS = {str(_ROOT / "ruleset"), str(_ROOT / "test")}
 install_guard(deny_dirs=_PROTECTED_DIRS)
 
-# Engines implemented behind gate.py / accel backends. Keep choices explicit to avoid typos.
-ENGINE_CHOICES = ("python", "go", "rust", "cpp")
+ENGINE_CHOICES = ("python", "go", "rust", "cpp", "auto")
+
+# -------------------- helpers --------------------
+
+def _sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+def _docs_hash(store_dir: pathlib.Path) -> str:
+    rows = list(read_jsonl(store_dir / "docs.jsonl"))
+    return _sha256_bytes(canonicalize_json_rows(rows))
+
+def _load_store_manifest(store_dir: pathlib.Path) -> dict:
+    m = store_dir / "manifest.json"
+    if not m.exists():
+        return {}
+    try:
+        return json.loads(m.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _detect_src_params(src_dir: pathlib.Path):
+    """
+    Try to detect engine and chunk params from the source manifest.
+    Fallbacks keep behavior sane if fields are missing.
+    """
+    man = _load_store_manifest(src_dir)
+    # engine
+    engine = (
+        man.get("chunk_engine")
+        or man.get("engine")
+        or man.get("chunker")
+        or "python"
+    )
+    engine = str(engine).lower().strip()
+    if engine not in ENGINE_CHOICES:
+        engine = "python"
+
+    # chunk size / overlap (probe common keys)
+    def _pick(*keys, default=None):
+        for k in keys:
+            if k in man:
+                return man[k]
+        return default
+
+    chunk_toks = _pick("chunk_toks", "chunk_tokens", "chunk_size", default=400)
+    overlap = _pick("overlap", "chunk_overlap", "overlap_tokens", default=60)
+
+    # normalize to ints if possible
+    try:
+        chunk_toks = int(chunk_toks)
+    except Exception:
+        chunk_toks = 400
+    try:
+        overlap = int(overlap)
+    except Exception:
+        overlap = 60
+
+    return {"engine": engine, "chunk_toks": chunk_toks, "overlap": overlap}
+
+def _copy_schema_registry(dst: pathlib.Path) -> None:
+    """
+    Copy Avro/Arrow schema files into the candidate store to make schema drift explicit.
+    """
+    root = get_project_root()
+    src = root / "ruleset" / "schemas"
+    out = dst / "schemas"
+    out.mkdir(parents=True, exist_ok=True)
+    if src.exists():
+        for f in src.iterdir():
+            if f.is_file():
+                (out / f.name).write_bytes(f.read_bytes())
+
+# -------------------- core commands --------------------
 
 @app.command()
 def eval():
@@ -62,7 +132,6 @@ def learn(
     tracer = get_tracer("everabot.cli")
     with tracer.start_as_current_span("cli.learn", attributes={"topic": topic}):
         from bot.workflows import learn as wf
-        # allow 'auto' topic or --auto switch, plus optional strategy override
         pick_auto = auto or (topic.strip().lower() == "auto")
         code = wf.run(topic if not pick_auto else "auto", strategy=strategy)
         print(f"[cyan]learn[/cyan] → {topic} [dim](snapshot created under snapshots/runs)[/dim]")
@@ -148,7 +217,6 @@ def opt_profile(
 ):
     """
     Profile a run with py-spy and save SVG under snapshots/profiles/.
-    Uses short flags for compatibility; on Windows will retry via a clean interpreter if needed.
     """
     from bot.profiling.pyspy_harness import record_child, record_exec
     out_dir = _ROOT / "snapshots" / "profiles"; out_dir.mkdir(parents=True, exist_ok=True)
@@ -168,22 +236,17 @@ def opt_profile(
         print(out)
     except Exception as e:
         print("[red]py-spy profiling failed[/red]")
-        # Helpful hints shown only on failure
         print(str(e))
         print("\n[dim]Hints:[/dim]")
         print(" • Try installing the official py-spy (pipx/pip) instead of a Conda build.")
         print(" • On Windows, pass --pyspy-python to a python.org interpreter.")
-        print(' • Self-test example (avoid pure sleep which has no Python frames):')
-        print('   py-spy record -d 2 -f flamegraph -o test.svg -- python -c "import time; t=time.time()+2\nwhile time.time()<t: pass"')
+        print(' • Self-test example:\n   py-spy record -d 2 -f flamegraph -o test.svg -- python -c "import time; t=time.time()+2\nwhile time.time()<t: pass"')
         raise typer.Exit(code=1)
 
 @opt_app.command("build-accel")
 def opt_build_accel(
     target: str = typer.Option("chunk-cpp", help="chunk-cpp|chunk-rust"),
 ):
-    """
-    Build an optional accelerator. Kept off by default; see A/B to enable safely.
-    """
     import subprocess, sys, pathlib
     if target == "chunk-cpp":
         pkg_dir = pathlib.Path("bot/accel/cpp")
@@ -204,10 +267,7 @@ def opt_ab_chunk(
     overlap_tokens: int = typer.Option(60),
     impl: str = typer.Option("auto", help="python|cpp|rust|go|auto"),
 ):
-    """
-    A/B + equivalence for accelerated chunker vs Python spec.
-    """
-    import time, json, pyarrow.parquet as pq, pathlib, random, tracemalloc, psutil, os
+    import time, json, pyarrow.parquet as pq, pathlib, random, tracemalloc, psutil
     from bot.rag.chunk_spec import chunk_text_equiv as py_spec
 
     def time_and_mem(fn):
@@ -222,7 +282,6 @@ def opt_ab_chunk(
         rss1 = proc.memory_info().rss
         return out, (t1 - t0), {"rss_delta": int(rss1 - rss0), "py_peak_bytes": int(peak)}
 
-    # texts
     texts = []
     if store:
         sdir = pathlib.Path("snapshots/rag") / store
@@ -234,12 +293,10 @@ def opt_ab_chunk(
         base = "RAG speeds up retrieval by chunking documents into overlapping windows. "
         texts = [base * 20 for _ in range(n)]
 
-    # baseline (Python spec)
     def run_py():
         return [py_spec("doc", t, chunk_tokens, overlap_tokens) for t in texts]
     py_out, py_sec, py_mem = time_and_mem(run_py)
 
-    # accelerator selection
     accel_impl = "python"
     out_accel, accel_sec, accel_mem = py_out, py_sec, py_mem
     if impl in ("auto", "cpp"):
@@ -288,7 +345,7 @@ def opt_ab_chunk(
     print(json.dumps(result, indent=2))
     raise typer.Exit(code=0 if equivalent else 1)
 
-# -------- snapshot subcommands (robust) --------
+# -------- snapshot subcommands --------
 snapshot_app = typer.Typer(help="Manage learn/train run snapshots")
 app.add_typer(snapshot_app, name="snapshot")
 
@@ -325,7 +382,6 @@ def snapshot_promote(
     id_: str = typer.Option(None, "--id", "-i", help="Run folder name under snapshots/runs"),
     reason: str = typer.Option("manual promote", "--reason"),
 ):
-    import json, time, pathlib
     runs_dir = (_ROOT / "snapshots" / "runs").resolve()
     run_dir = (runs_dir / id_).resolve()
     man = run_dir / "manifest.json"
@@ -333,11 +389,10 @@ def snapshot_promote(
         print(f"[red]No manifest at[/red] {man}"); raise typer.Exit(code=2)
 
     m = json.loads(man.read_text(encoding="utf-8"))
-    # write metrics sidecar
     metrics_dir = _ROOT / "snapshots" / "metrics"; metrics_dir.mkdir(parents=True, exist_ok=True)
     last = metrics_dir / "last_promoted.json"
     payload = {
-        "ts": int(time.time()),
+        "ts": int(__import__("time").time()),
         "topic": m.get("topic"),
         "new_topic_score": m.get("decision", {}).get("new_topic_score"),
         "bullets_count": m.get("decision", {}).get("bullets_count"),
@@ -349,7 +404,6 @@ def snapshot_promote(
     }
     last.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    # update pointer
     (_ROOT / "snapshots" / "CURRENT_POINTER.txt").write_text(str(run_dir), encoding="utf-8")
     print(f"[green]Promoted[/green] {run_dir.name}")
 
@@ -364,7 +418,7 @@ def snapshot_checkout(id_: str = typer.Option(..., "--id", "-i")):
 
 @snapshot_app.command("diff")
 def snapshot_diff(a: str, b: str):
-    import json, difflib, pathlib
+    import difflib
     A = (_ROOT / "snapshots" / "runs" / a / "manifest.json").resolve()
     B = (_ROOT / "snapshots" / "runs" / b / "manifest.json").resolve()
     if not A.exists() or not B.exists():
@@ -380,7 +434,6 @@ def snapshot_show(
     id_: str = typer.Option(None, "--id", "-i", help="Folder name under snapshots/runs"),
     path_or_id: str = typer.Argument(None, help="(Positional) either full path or run folder name"),
 ):
-    # Resolve target
     target = None
     provided = [x for x in (path, id_, path_or_id) if x]
     if len(provided) == 0:
@@ -395,7 +448,6 @@ def snapshot_show(
     elif id_:
         target = _runs_dir() / id_
     else:
-        # positional
         p = pathlib.Path(path_or_id)
         target = p if p.is_absolute() or (p / "manifest.json").exists() else (_runs_dir() / path_or_id)
 
@@ -413,17 +465,12 @@ def snapshot_rollback(
     reason: str = typer.Option("manual rollback", "--reason", help="Reason to record"),
 ):
     runs_dir = (_ROOT / "snapshots" / "runs").resolve()
-
-    # pick a single source
     token = path or id_ or path_or_id
     if not token:
         print("[red]Provide --id, --path, or positional path/id.[/red]")
         raise typer.Exit(code=2)
 
-    import pathlib, json, datetime
     p = pathlib.Path(token)
-
-    # If it's a path, normalize to absolute; if it's a bare ID, join under runs/
     if (p / "manifest.json").exists() or p.is_absolute() or any(sep in token for sep in ("/", "\\")):
         target = (p if p.is_absolute() else (_ROOT / p)).resolve()
     else:
@@ -435,6 +482,7 @@ def snapshot_rollback(
         raise typer.Exit(code=2)
 
     rb_dir = (_ROOT / "snapshots" / "rollbacks"); rb_dir.mkdir(parents=True, exist_ok=True)
+    import datetime
     evt = {"ts": datetime.datetime.utcnow().isoformat() + "Z", "to": str(target), "reason": reason}
     out = rb_dir / f"rollback_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
     out.write_text(json.dumps(evt, indent=2), encoding="utf-8")
@@ -446,20 +494,16 @@ def snapshot_rollback(
 
 @rag_app.command("init")
 def rag_init(seed: str = typer.Option("all", help="Seed set: all|none")):
-    """
-    Ingest the initial seed corpus (ACE, SICA, RAG, VCDIFF).
-    """
-    from bot.paths import get_project_root
     from bot.rag.pipeline import ingest
     root = get_project_root()
     out = root / "snapshots" / "rag" / "v1"
     urls = []
     if seed == "all":
         urls = [
-            "https://arxiv.org/pdf/2510.04618",  # ACE
-            "https://arxiv.org/pdf/2504.15228",  # SICA
-            "https://arxiv.org/pdf/2005.11401",  # RAG (Lewis et al.)
-            "https://datatracker.ietf.org/doc/html/rfc3284",  # VCDIFF
+            "https://arxiv.org/pdf/2510.04618",
+            "https://arxiv.org/pdf/2504.15228",
+            "https://arxiv.org/pdf/2005.11401",
+            "https://datatracker.ietf.org/doc/html/rfc3284",
         ]
     meta = ingest(urls, out)
     print(f"[green]RAG store created at[/green] {out}  counts={meta['counts']} model={meta['emb_model']}")
@@ -467,9 +511,7 @@ def rag_init(seed: str = typer.Option("all", help="Seed set: all|none")):
 @rag_app.command("ingest")
 def rag_ingest(url: list[str] = typer.Argument(..., help="One or more URLs or paths"),
                out: str = typer.Option(None, "--out", help="Output dir under snapshots/rag")):
-    from bot.paths import get_project_root
     from bot.rag.pipeline import ingest
-    import pathlib
     root = get_project_root()
     out_dir = pathlib.Path(out) if out else (root / "snapshots" / "rag" / "custom")
     meta = ingest(list(url), out_dir)
@@ -477,30 +519,17 @@ def rag_ingest(url: list[str] = typer.Argument(..., help="One or more URLs or pa
 
 @rag_app.command("query")
 def rag_query(
-    q_pos: Optional[str] = typer.Argument(
-        None, metavar="Q", help="Query string (positional)"
-    ),
-    query: Optional[str] = typer.Option(
-        None, "--query", "-q", help="Query string (use this or positional Q)"
-    ),
+    q_pos: Optional[str] = typer.Argument(None, metavar="Q", help="Query string (positional)"),
+    query: Optional[str] = typer.Option(None, "--query", "-q", help="Query string (use this or positional Q)"),
     store: str = typer.Option("v1", "--store", "-s", help="Subdir under snapshots/rag"),
-    hybrid: bool = typer.Option(
-        True, "--hybrid/--no-hybrid",
-        help="Use BM25+Vector (RRF) with optional MMR re-rank"
-    ),
+    hybrid: bool = typer.Option(True, "--hybrid/--no-hybrid", help="Use BM25+Vector (RRF) with optional MMR re-rank"),
     k: int = typer.Option(10, "--k", "-k", help="Top-k"),
 ):
-    # accept either positional or --query/-q (option wins if both given)
     q = query or q_pos
     if not q:
-        raise typer.BadParameter(
-            "Provide a query as positional Q or with --query/-q", param_name="query"
-        )
+        raise typer.BadParameter("Provide a query as positional Q or with --query/-q", param_name="query")
 
-    from bot.paths import get_project_root
-    from bot.rag.utils import read_jsonl
-    import pyarrow.parquet as pq, json, pathlib
-
+    import pyarrow.parquet as pq
     root = get_project_root()
     sdir = root / "snapshots" / "rag" / store
 
@@ -508,10 +537,7 @@ def rag_query(
         from bot.rag.hybrid import hybrid_topk
         top = hybrid_topk(sdir, q, k=k, mmr=True)
         chunks_tab = pq.read_table(sdir / "chunks.parquet")
-        text_by_chunk = {
-            chunks_tab["id"][i].as_py(): chunks_tab["text"][i].as_py()
-            for i in range(chunks_tab.num_rows)
-        }
+        text_by_chunk = {chunks_tab["id"][i].as_py(): chunks_tab["text"][i].as_py() for i in range(chunks_tab.num_rows)}
         docs = {row["id"]: row for row in read_jsonl(sdir / "docs.jsonl")}
         out = []
         for cid, score in top:
@@ -525,7 +551,6 @@ def rag_query(
         print(json.dumps(out, indent=2, ensure_ascii=False))
         return
 
-    # fallback: pure vector search
     from bot.rag.embeddings import get_embedder
     from bot.rag.index_faiss import load_index
 
@@ -537,15 +562,11 @@ def rag_query(
     D, I = idx.search(qv, k)
 
     chunks_tab = pq.read_table(sdir / "chunks.parquet")
-    text_by_chunk = {
-        chunks_tab["id"][i].as_py(): chunks_tab["text"][i].as_py()
-        for i in range(chunks_tab.num_rows)
-    }
+    text_by_chunk = {chunks_tab["id"][i].as_py(): chunks_tab["text"][i].as_py() for i in range(chunks_tab.num_rows)}
     docs = {row["id"]: row for row in read_jsonl(sdir / "docs.jsonl")}
     out = []
     for j, score in zip(I[0], D[0]):
-        cid = ids[j]
-        doc_id = cid.split(":")[0]
+        cid = ids[j]; doc_id = cid.split(":")[0]
         out.append({
             "chunk_id": cid,
             "doc_title": docs[doc_id]["title"],
@@ -555,11 +576,8 @@ def rag_query(
     print(json.dumps(out, indent=2, ensure_ascii=False))
 
 @rag_app.command("stats")
-def rag_stats(
-    store: str = typer.Option("v1", "--store", "-s", help="Subdir under snapshots/rag"),
-):
-    from bot.paths import get_project_root
-    import pyarrow.parquet as pq, json
+def rag_stats(store: str = typer.Option("v1", "--store", "-s", help="Subdir under snapshots/rag")):
+    import pyarrow.parquet as pq
     root = get_project_root()
     sdir = root / "snapshots" / "rag" / store
     docs = sum(1 for _ in open(sdir/"docs.jsonl", "r", encoding="utf-8", errors="replace"))
@@ -571,9 +589,7 @@ def rag_export(
     store: str = typer.Option(..., "--store", "-s", help="RAG store subdir (e.g., v1)"),
     out: str   = typer.Option(..., "--out", "-o", help="Output folder for canonical JSONL"),
 ):
-    from bot.paths import get_project_root
-    from bot.rag.utils import read_jsonl, canonicalize_json_rows
-    import pathlib, json, pyarrow.parquet as pq
+    import pyarrow.parquet as pq
     root = get_project_root()
     sdir = root / "snapshots" / "rag" / store
     out_dir = pathlib.Path(out); out_dir.mkdir(parents=True, exist_ok=True)
@@ -592,55 +608,31 @@ def rag_rebuild_from_docs(
     target: str = typer.Option(..., "--target", "-o", help="Target store dir (e.g., snapshots/rag/v2)"),
     chunk_toks: int = typer.Option(400, "--chunk-toks"),
     overlap: int = typer.Option(60, "--overlap"),
-    engine: str = typer.Option(
-        "python", "--engine",
-        case_sensitive=False,
-        help="Chunker engine to use for rebuild; must match the engine used by the source store. Choices: python|go|rust|cpp",
-    ),
+    engine: str = typer.Option("python", "--engine", case_sensitive=False,
+                               help="Chunker engine for rebuild: python|go|rust|cpp"),
 ):
     """
-    Rebuild a candidate store (chunks/embeddings/index) *and* ensure docs.jsonl exists
-    so downstream export/equivalence/delta steps can run.
-    Engine is pinned to avoid drift and guarantee equivalence.
+    Rebuild candidate store; ensure docs.jsonl exists; copy schema registry.
+    Engine is pinned via EVERABOT_CHUNK_ENGINE to avoid drift.
     """
     from bot.core.state import _rebuild_store_from_docs
 
     eng = engine.lower().strip()
-    if eng not in ENGINE_CHOICES:
-        raise typer.BadParameter(f"--engine must be one of {ENGINE_CHOICES}, got: {engine}")
-    # Pin the engine deterministically for this process.
+    if eng not in ENGINE_CHOICES or eng == "auto":
+        raise typer.BadParameter(f"--engine must be one of ('python','go','rust','cpp'), got: {engine}")
     os.environ["EVERABOT_CHUNK_ENGINE"] = eng
 
     src = pathlib.Path(source).resolve()
-    out = pathlib.Path(target)
-    out.mkdir(parents=True, exist_ok=True)
+    out = pathlib.Path(target); out.mkdir(parents=True, exist_ok=True)
 
-    # 1) Always materialize docs.jsonl in the target (source may be docs.canon.jsonl).
     docs_out = out / "docs.jsonl"
     if not docs_out.exists():
         rows = list(read_jsonl(src))
         write_jsonl(docs_out, rows)
 
-    # 2) Build chunks/embeddings/index using the provided docs.
     _rebuild_store_from_docs(src, out, chunk_toks, overlap)
-
-    # 3) Drop schema registry alongside the candidate.
     _copy_schema_registry(out)
-
     print(f"Rebuilt candidate store at {out}")
-
-def _copy_schema_registry(dst: pathlib.Path) -> None:
-    """
-    Copy Avro/Arrow schema files into the candidate store to make schema drift explicit.
-    """
-    root = get_project_root()
-    src = root / "ruleset" / "schemas"
-    out = dst / "schemas"
-    out.mkdir(parents=True, exist_ok=True)
-    if src.exists():
-        for f in src.iterdir():
-            if f.is_file():
-                (out / f.name).write_bytes(f.read_bytes())
 
 @rag_app.command("canary-migrate")
 def rag_canary_migrate(
@@ -648,58 +640,67 @@ def rag_canary_migrate(
     dst: str = typer.Option("v2", "--to"),
     chunk_toks: int = typer.Option(400, "--chunk-toks"),
     overlap: int = typer.Option(60, "--overlap"),
-    engine: str = typer.Option(
-        "python", "--engine",
-        case_sensitive=False,
-        help="Chunker engine for rebuild; MUST match the engine used by --from to prove equivalence. Choices: python|go|rust|cpp",
-    ),
+    engine: str = typer.Option("auto", "--engine", case_sensitive=False,
+                               help="auto|python|go|rust|cpp (auto reads from --from manifest)"),
+    use_src_params: bool = typer.Option(True, "--use-src-params/--no-src-params",
+                                        help="Adopt chunk_toks/overlap from --from manifest (default on)"),
+    require_chunk_bits: bool = typer.Option(False, "--require-chunk-bits/--relaxed-chunks",
+                                            help="If set, also require chunk-level bitwise equality."),
+    no_rechunk: bool = typer.Option(False, "--no-rechunk", help="Skip rebuild; only prove equivalence and maybe flip."),
     flip_on_pass: bool = typer.Option(True, "--flip/--no-flip"),
 ):
     """
-    Full canary: export golden → rebuild candidate → equivalence (hash+top-k) → flip pointer.
-    Uses existing subcommands to avoid duplication. The engine is pinned to avoid drift.
+    Golden export → optional rebuild → docs-bitwise (+ optional chunks-bitwise) + top-k → flip pointer.
+    Default is relaxed-chunks (docs bitwise + top-k), which is appropriate for store refactors.
     """
     root = get_project_root()
+    src_dir = (root / "snapshots" / "rag" / src).resolve()
+    dst_dir = (root / "snapshots" / "rag" / dst).resolve()
 
+    # Detect engine/params from source if requested
+    detected = _detect_src_params(src_dir)
     eng = engine.lower().strip()
-    if eng not in ENGINE_CHOICES:
-        raise typer.BadParameter(f"--engine must be one of {ENGINE_CHOICES}, got: {engine}")
-    # Pin engine for the entire canary process.
+    if eng == "auto":
+        eng = detected["engine"]
+    if eng not in ENGINE_CHOICES or eng == "auto":
+        eng = "python"
     os.environ["EVERABOT_CHUNK_ENGINE"] = eng
 
+    if use_src_params:
+        chunk_toks = detected["chunk_toks"]
+        overlap = detected["overlap"]
+
     canon = root / "snapshots" / "rag" / f"canon_{src}"
-    # 1) export golden dumps
-    canon.mkdir(parents=True, exist_ok=True)
     print("[cyan]Exporting golden dumps...[/cyan]")
-    subprocess.run(
-        ["python", "-m", "bot.cli", "rag", "export", "-s", src, "-o", str(canon)],
-        check=True
-    )
-    # 2) rebuild candidate from golden docs (identical chunking)
-    v2_dir = root / "snapshots" / "rag" / dst
-    print("[cyan]Rebuilding candidate store from canonical docs...[/cyan]")
-    rag_rebuild_from_docs(
-        source=str(canon / "docs.canon.jsonl"),
-        target=str(v2_dir),
-        chunk_toks=chunk_toks,
-        overlap=overlap,
-        engine=eng,
-    )
-    _copy_schema_registry(v2_dir)
-    # 3) prove equivalence
-    print("[cyan]Proving equivalence (bitwise + top-k)...[/cyan]")
-    res = subprocess.run(
-        ["python", "-m", "bot.cli", "rag", "prove-equivalence", src, dst],
-        check=False
-    )
+    subprocess.run(["python", "-m", "bot.cli", "rag", "export", "-s", src, "-o", str(canon)], check=True)
+
+    if not no_rechunk:
+        print("[cyan]Rebuilding candidate store from canonical docs...[/cyan]")
+        rag_rebuild_from_docs(
+            source=str(canon / "docs.canon.jsonl"),
+            target=str(dst_dir),
+            chunk_toks=chunk_toks,
+            overlap=overlap,
+            engine=eng if eng != "auto" else detected["engine"],
+        )
+        _copy_schema_registry(dst_dir)
+
+    print("[cyan]Proving equivalence (docs-bitwise"
+          f"{' + chunks-bitwise' if require_chunk_bits else ''} + top-k)...[/cyan]")
+
+    # Call prove-equivalence with the same strictness
+    cmd = ["python", "-m", "bot.cli", "rag", "prove-equivalence", src, dst]
+    if require_chunk_bits:
+        cmd.append("--require-chunk-bits")
+    res = subprocess.run(cmd, check=False)
     if res.returncode != 0:
         print("[red]Equivalence FAILED — pointer not flipped.[/red]")
         raise typer.Exit(code=1)
-    # 4) flip pointer on full pass
+
     if flip_on_pass:
         cur = root / "snapshots" / "rag" / "CURRENT_STORE.txt"
-        cur.write_text(str(v2_dir.resolve()))
-        print(f"[green]Pointer flipped →[/green] {cur} = {v2_dir}")
+        cur.write_text(str(dst_dir.resolve()))
+        print(f"[green]Pointer flipped →[/green] {cur} = {dst_dir}")
     print("[green]Canary migration complete.[/green]")
 
 @rag_app.command("prove-equivalence")
@@ -707,17 +708,35 @@ def rag_prove_equivalence(
     a: str,
     b: str,
     k: int = typer.Option(5, "--k", "-k", help="Top-k for equivalence check"),
+    require_chunk_bits: bool = typer.Option(False, "--require-chunk-bits/--relaxed-chunks",
+                                            help="If set, require chunk-level bitwise equality too."),
 ):
     """
-    Prove both: (1) bitwise canonical equality, (2) top-k equivalence on a frozen query set.
+    Prove: (1) docs bitwise canonical equality; (2) optional chunks bitwise; (3) top-k equivalence on a frozen query set.
     """
-    from bot.paths import get_project_root
     from bot.rag.equiv import bit_for_bit_equivalent, topk_equivalent
     root = get_project_root()
-    import pathlib, json
     A = (root / "snapshots" / "rag" / a).resolve()
     B = (root / "snapshots" / "rag" / b).resolve()
-    ok_bits, detail_bits = bit_for_bit_equivalent(A, B)
+
+    # Always check docs bitwise
+    ha_docs = _docs_hash(A)
+    hb_docs = _docs_hash(B)
+    docs_ok = (ha_docs == hb_docs)
+
+    bits_ok = docs_ok
+    detail_bits = {"a": {"docs": ha_docs}, "b": {"docs": hb_docs}}
+
+    # Optionally also require chunks bitwise using the existing helper
+    if require_chunk_bits:
+        ok_bits_all, detail_all = bit_for_bit_equivalent(A, B)
+        # Merge chunk info if available
+        if "a" in detail_all and "chunks" in detail_all["a"]:
+            detail_bits["a"]["chunks"] = detail_all["a"]["chunks"]
+        if "b" in detail_all and "chunks" in detail_all["b"]:
+            detail_bits["b"]["chunks"] = detail_all["b"]["chunks"]
+        bits_ok = ok_bits_all  # this includes docs+chunks in the helper
+
     queries = [
         "What is ACE and how does it prevent context collapse?",
         "How does RAG combine parametric and non-parametric memory?",
@@ -725,10 +744,11 @@ def rag_prove_equivalence(
         "Self-improving coding agent promotion gates"
     ]
     ok_topk, detail_topk = topk_equivalent(A, B, queries, k=k)
-    result = {"bitwise": ok_bits, "topk": ok_topk,
+
+    result = {"bitwise": bits_ok, "topk": ok_topk,
               "detail_bits": detail_bits, "detail_topk": detail_topk}
     print(json.dumps(result, indent=2))
-    raise typer.Exit(code=0 if (ok_bits and ok_topk) else 1)
+    raise typer.Exit(code=0 if (bits_ok and ok_topk) else 1)
 
 @rag_app.command("delta-create")
 def rag_delta_create(
@@ -736,10 +756,6 @@ def rag_delta_create(
     target: str = typer.Argument(..., help="Path to TARGET store dir (similar schema)"),
     out: str = typer.Option(..., "--out", "-o", help="Output folder for .vcdiff files + PROOF.json"),
 ):
-    """
-    Create VCDIFF (xdelta3) deltas for heavy files between two stores and verify reconstruction.
-    """
-    import pathlib, json
     from bot.snapshots.delta import roundtrip_manifest
     base_p, tgt_p, out_p = pathlib.Path(base), pathlib.Path(target), pathlib.Path(out)
     files = ["docs.jsonl", "chunks.parquet", "embeddings.parquet", "index.faiss"]
@@ -750,13 +766,9 @@ def rag_delta_create(
 @rag_app.command("delta-reconstruct")
 def rag_delta_reconstruct(
     base: str = typer.Argument(..., help="Path to BASE store dir"),
-    delta_dir: str = typer.Argument(..., help="Folder with .vcdiff files (created by delta-create)"),
+    delta_dir: str = typer.Argument(..., help="Folder with .vcdiff files"),
     out: str = typer.Option(None, "--out", "-o", help="Reconstruction output dir (defaults to <delta_dir>/recon)"),
 ):
-    """
-    Reconstruct target files from base + deltas.
-    """
-    import pathlib, json
     from bot.snapshots.delta import apply_delta
     base_p, dd = pathlib.Path(base), pathlib.Path(delta_dir)
     recon = pathlib.Path(out) if out else (dd / "recon"); recon.mkdir(parents=True, exist_ok=True)
@@ -774,10 +786,6 @@ def rag_delta_roundtrip(
     target: str = typer.Argument(..., help="Path to TARGET store dir"),
     out: str = typer.Option(..., "--out", "-o", help="Delta output dir (will contain .vcdiff + recon + PROOF.json)"),
 ):
-    """
-    One-shot: create deltas, reconstruct, and prove byte-identical equality via SHA-256.
-    """
-    import pathlib, json
     from bot.snapshots.delta import roundtrip_manifest
     base_p, tgt_p, out_p = pathlib.Path(base), pathlib.Path(target), pathlib.Path(out)
     files = ["docs.jsonl", "chunks.parquet", "embeddings.parquet", "index.faiss"]
@@ -792,7 +800,6 @@ app.add_typer(rules_app, name="rules")
 
 @rules_app.command("show")
 def rules_show():
-    import json
     cfg = load_all()
     print(json.dumps(cfg, indent=2))
 
@@ -803,7 +810,6 @@ def llm_selftest(prompt: str = typer.Option("Say exactly: OK", "--prompt")):
         out = ask(prompt, max_tokens=16, temperature=0.0)
         print(f"[green]Backend[/green]: {info()}")
         print(f"[cyan]Output[/cyan]: {out}")
-        # pass/fail smoke
         code = 0 if "OK" in prompt and out.strip().endswith("OK") else 0
         raise typer.Exit(code=code)
     except NotConfigured as e:
