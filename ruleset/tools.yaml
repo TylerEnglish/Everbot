@@ -8,7 +8,6 @@ internet:
     burst_max: 8
     window_ms: 1000
 
-# Central, enforced by fetchers.py
 net:
   allowed_hosts:
     # Standards & research
@@ -18,6 +17,10 @@ net:
     - www.rfc-editor.org
     - datatracker.ietf.org
     - ietf.org
+
+    # Arrow/Parquet (from seeds)
+    - arrow.apache.org
+    - parquet.apache.org
 
     # Core language & systems docs
     - en.cppreference.com
@@ -32,10 +35,11 @@ net:
     - sourceware.org
     - man7.org
     - kernel.org
-    - www.intel.com
     - developer.arm.com
+    - docs.nvidia.com
     - riscv.org
     - csapp.cs.cmu.edu
+    - cs61c.org
     - inst.eecs.berkeley.edu
 
     # Data/ML docs (read-only)
@@ -46,35 +50,66 @@ net:
     - pytorch.org
     - huggingface.co
     - fastapi.tiangolo.com
+    - htmx.org
     - faiss.ai
     - milvus.io
 
     # Patterns & software architecture
     - refactoring.guru
     - c4model.com
+    - martinfowler.com
 
     # Science/education references
     - openstax.org
     - khanacademy.org
     - projecteuler.net
+    - cp-algorithms.com
+    - www.redblobgames.com
+    - nrich.maths.org
+    - artofproblemsolving.com
+
+    # Chemistry/physics/etc.
+    - phys.libretexts.org
     - chem.libretexts.org
     - webbook.nist.gov
-    - ncbi.nlm.nih.gov
-    - alleninstitute.org
+    - goldbook.iupac.org
+    - pubchem.ncbi.nlm.nih.gov
 
-    # Finance & macro
-    - investopedia.com
-    - investor.gov
-    - fred.stlouisfed.org
-    - federalreserve.gov
-    - pages.stern.nyu.edu
-    - bogleheads.org
+    # Neuroscience / biology
+    - brain-map.org
+    - humanconnectome.org
+    - braininitiative.nih.gov
+    - medlineplus.gov
+    - evolution.berkeley.edu
+    - opentreeoflife.org
 
-    # Construction architecture & codes
-    - wbdg.org
-    - iccsafe.org
+    # Computer architecture perf/ABI
+    - refspecs.linuxfoundation.org
+    - pubs.opengroup.org
+    - uops.info
+    - www.agner.org
+
+    # Construction codes & resilience
+    - www.energycodes.gov
+    - www.ashrae.org
+    - www.wbdg.org
+    - www.aisc.org
+    - www.iccsafe.org
+    - www.fema.gov
     - usgbc.org
     - aia.org
+
+    # Finance & macro
+    - www.consumerfinance.gov
+    - www.investor.gov
+    - fred.stlouisfed.org
+    - www.federalreserve.gov
+    - pages.stern.nyu.edu
+    - www.bogleheads.org
+    - www.irs.gov
+    - www.sec.gov
+    - www.bls.gov
+    - apps.bea.gov
 
     # Tutorials/blogs (safe, mainstream)
     - towardsdatascience.com
@@ -106,4 +141,4 @@ content_types_allowlist:
   - application/pdf
   - application/json
 
-max_bytes_per_doc: 10485760   # 10 MiB cap per fetch
+max_bytes_per_doc: 10485760
