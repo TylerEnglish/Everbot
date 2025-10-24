@@ -1,20 +1,21 @@
 version: 1
 tokens_max: 8192
-wall_time_sec_max: 1800
-ram_mb_max: 8184
-disk_mb_max: 8184
+wall_time_sec_max: 3600
+
+ram_mb_max: 12288     # 12 GB cap gives FAISS/pyarrow some room
+disk_mb_max: 16384    # avoids parquet/FAISS temp churn failures
 
 cpu:
-  percent_max: 85
+  percent_max: 90
 fd_limits:
-  soft_max: 512
+  soft_max: 1024
 
 phases:
-  RESEARCH: { wall_time_sec_max: 480 }
-  DISTILL:  { wall_time_sec_max: 240 }
-  PRACTICE: { wall_time_sec_max: 360 }
-  EVAL:     { wall_time_sec_max: 240 }
-  DECIDE:   { wall_time_sec_max: 120 }
+  RESEARCH: { wall_time_sec_max: 600 }
+  DISTILL:  { wall_time_sec_max: 300 }
+  PRACTICE: { wall_time_sec_max: 600 }
+  EVAL:     { wall_time_sec_max: 300 }
+  DECIDE:   { wall_time_sec_max: 180 }
 
 snapshots:
   binary_delta: ["vcdiff", "xdelta3"]
