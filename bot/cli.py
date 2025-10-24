@@ -127,6 +127,10 @@ def learn(
     def once():
         with tracer.start_as_current_span("cli.learn", attributes={"topic": topic}):
             code = wf.run(topic if not pick_auto else "auto", strategy=strategy)
+            from bot.workflows import self_improve as wsi
+            # e.g., if code != 0 or a manifest shows low scores
+            wsi.run()
+
             print(f"[cyan]learn[/cyan] → {topic} [dim](snapshot created under snapshots/runs)[/dim]")
         if autopromote:
             # reuse the built-in canary equivalence + pointer flip
