@@ -10,7 +10,6 @@ from bot.rules.loader import load_all
 from bot.eval.harness import run_all
 from bot.rag.utils import read_jsonl
 from bot.rag.utils import write_jsonl
-from typing import Optional
 from bot.telemetry.tracing import get_tracer, force_flush
 
 app = typer.Typer(help="Everabot CLI")
@@ -26,6 +25,9 @@ app.add_typer(curr_app, name="curriculum")
 _ROOT = get_project_root()
 _PROTECTED_DIRS = {str(_ROOT / "ruleset"), str(_ROOT / "test")}
 install_guard(deny_dirs=_PROTECTED_DIRS)
+
+# Engines implemented behind gate.py / accel backends. Keep choices explicit to avoid typos.
+ENGINE_CHOICES = ("python", "go", "rust", "cpp")
 
 @app.command()
 def eval():
@@ -590,12 +592,24 @@ def rag_rebuild_from_docs(
     target: str = typer.Option(..., "--target", "-o", help="Target store dir (e.g., snapshots/rag/v2)"),
     chunk_toks: int = typer.Option(400, "--chunk-toks"),
     overlap: int = typer.Option(60, "--overlap"),
+    engine: str = typer.Option(
+        "python", "--engine",
+        case_sensitive=False,
+        help="Chunker engine to use for rebuild; must match the engine used by the source store. Choices: python|go|rust|cpp",
+    ),
 ):
     """
     Rebuild a candidate store (chunks/embeddings/index) *and* ensure docs.jsonl exists
     so downstream export/equivalence/delta steps can run.
+    Engine is pinned to avoid drift and guarantee equivalence.
     """
     from bot.core.state import _rebuild_store_from_docs
+
+    eng = engine.lower().strip()
+    if eng not in ENGINE_CHOICES:
+        raise typer.BadParameter(f"--engine must be one of {ENGINE_CHOICES}, got: {engine}")
+    # Pin the engine deterministically for this process.
+    os.environ["EVERABOT_CHUNK_ENGINE"] = eng
 
     src = pathlib.Path(source).resolve()
     out = pathlib.Path(target)
@@ -628,20 +642,31 @@ def _copy_schema_registry(dst: pathlib.Path) -> None:
             if f.is_file():
                 (out / f.name).write_bytes(f.read_bytes())
 
-
 @rag_app.command("canary-migrate")
 def rag_canary_migrate(
     src: str = typer.Option("v1", "--from"),
     dst: str = typer.Option("v2", "--to"),
     chunk_toks: int = typer.Option(400, "--chunk-toks"),
     overlap: int = typer.Option(60, "--overlap"),
+    engine: str = typer.Option(
+        "python", "--engine",
+        case_sensitive=False,
+        help="Chunker engine for rebuild; MUST match the engine used by --from to prove equivalence. Choices: python|go|rust|cpp",
+    ),
     flip_on_pass: bool = typer.Option(True, "--flip/--no-flip"),
 ):
     """
     Full canary: export golden → rebuild candidate → equivalence (hash+top-k) → flip pointer.
-    Uses existing subcommands to avoid duplication.
+    Uses existing subcommands to avoid duplication. The engine is pinned to avoid drift.
     """
     root = get_project_root()
+
+    eng = engine.lower().strip()
+    if eng not in ENGINE_CHOICES:
+        raise typer.BadParameter(f"--engine must be one of {ENGINE_CHOICES}, got: {engine}")
+    # Pin engine for the entire canary process.
+    os.environ["EVERABOT_CHUNK_ENGINE"] = eng
+
     canon = root / "snapshots" / "rag" / f"canon_{src}"
     # 1) export golden dumps
     canon.mkdir(parents=True, exist_ok=True)
@@ -658,6 +683,7 @@ def rag_canary_migrate(
         target=str(v2_dir),
         chunk_toks=chunk_toks,
         overlap=overlap,
+        engine=eng,
     )
     _copy_schema_registry(v2_dir)
     # 3) prove equivalence
@@ -783,7 +809,6 @@ def llm_selftest(prompt: str = typer.Option("Say exactly: OK", "--prompt")):
     except NotConfigured as e:
         print(f"[red]LLM backend not configured:[/red] {e}")
         raise typer.Exit(code=1)
-
 
 if __name__ == "__main__":
     app()
