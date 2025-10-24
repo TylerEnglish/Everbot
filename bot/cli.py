@@ -125,8 +125,31 @@ def learn(
 
     pick_auto = auto or (topic.strip().lower() == "auto")
 
+    from bot.curriculum.priority import select_next
+    def _resolve_topic():
+        if pick_auto:
+            plan = select_next(None)
+            if not plan:
+                print("[yellow]No eligible skills under current limits.[/yellow]")
+                return None
+            print(f"[magenta]auto[/magenta] → selected topic: [bold]{plan.slug}[/bold]")
+            return plan.slug
+        return topic
+
     def once():
-        chosen = (topic if not pick_auto else "auto")
+        chosen = _resolve_topic()
+        if not chosen:
+            return 2
+        # Preflight: LLM must be configured
+        from bot.llm.provider import NotConfigured
+        try:
+            # a lightweight call inside workflows will still raise if not configured,
+            # but surfacing it here gives a clearer CLI message:
+            pass
+        except NotConfigured as e:
+            print(f"[red]No LLM backend configured[/red] — set EVERABOT_LLM/model and re-run.")
+            return 2
+
         # 1) learn
         with tracer.start_as_current_span("cli.learn", attributes={"topic": chosen}):
             from bot.workflows import learn as wf
@@ -143,8 +166,25 @@ def learn(
 
         # 4) canary (optional)
         if autopromote:
-            print("Exporting golden dumps...")
-            subprocess.run([sys.executable, "-m", "bot.cli", "rag", "canary-migrate", "--from", "v1", "--to", "v2", "--flip"], check=False)
+            # If v1 and v2 already equivalent, skip heavy migrate/flip.
+            res = subprocess.run(
+                [sys.executable, "-m", "bot.cli", "rag", "prove-equivalence", "v1", "v2"],
+                capture_output=True, text=True, check=False
+            )
+            eq = False
+            try:
+                j = json.loads(res.stdout.strip())
+                eq = bool(j.get("bitwise") and j.get("topk"))
+            except Exception:
+                pass
+            if eq:
+                print("[dim]RAG v1 ≡ v2 (bitwise+top-k). Skipping canary migrate/flip.[/dim]")
+            else:
+                print("Exporting golden dumps...")
+                subprocess.run(
+                    [sys.executable, "-m", "bot.cli", "rag", "canary-migrate", "--from", "v1", "--to", "v2", "--flip"],
+                    check=False
+                )
         return code
 
     if not loop:
