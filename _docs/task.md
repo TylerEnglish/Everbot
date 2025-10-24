@@ -163,16 +163,16 @@
 
 ### 14) Optional: lightweight UI the agent can build later
 
-* [ ] Keep `app/` empty except for a placeholder API that streams logs and scores; first milestone is terminal-only.
-* [ ] When you ask for it, the agent scaffolds a local dashboard that reads **OpenTelemetry**/MLflow runs and renders **proofs** (sources, bullets, attempts, diffs). ([OpenTelemetry][3])
+* [*] Keep `app/` empty except for a placeholder API that streams logs and scores; first milestone is terminal-only.
+* [*] When you ask for it, the agent scaffolds a local dashboard that reads **OpenTelemetry**/MLflow runs and renders **proofs** (sources, bullets, attempts, diffs). ([OpenTelemetry][3])
 
 ---
 
 ### 15) Developer ergonomics
 
-* [ ] **Poetry scripts** (and optional `poethepoet` tasks) for `eval`, `selfcheck`, `snapshot`, etc. (No Makefile.)
-* [ ] Devcontainer config so you can pop into a consistent shell.
-* [ ] Pre-commit hooks to prevent accidental edits to `ruleset/` and `test/`.
+* [*] **Poetry scripts** (and optional `poethepoet` tasks) for `eval`, `selfcheck`, `snapshot`, etc. (No Makefile.)
+* [*] Devcontainer config so you can pop into a consistent shell.
+* [*] Pre-commit hooks to prevent accidental edits to `ruleset/` and `test/`.
 
 ---
 
