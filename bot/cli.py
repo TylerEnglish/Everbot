@@ -118,49 +118,33 @@ def learn(
     strategy: str = typer.Option("ace", help="Strategy override"),
     auto: bool = typer.Option(False, "--auto", help="Pick topic automatically"),
     loop: bool = typer.Option(False, "--loop", help="Run continuous learn cycles until stopped"),
-    autopromote: bool = typer.Option(
-        False,
-        "--autopromote",
-        help="After each learn, rebuild v2 from canon v1, prove equivalence, and flip pointer on pass",
-    ),
+    autopromote: bool = typer.Option(False, "--autopromote", help="After each learn, rebuild v2 from canon v1, prove equivalence, and flip pointer on pass")
 ):
-    """
-    Run one (or continuous) learn + self-eval + self-improve cycle.
-    If --autopromote is set, runs a canary migration (docs-bitwise + top-k) and flips pointer on pass.
-    """
     tracer = get_tracer("everabot.cli")
-    pick_auto = auto or (topic.strip().lower() == "auto")
-    chosen = topic if not pick_auto else "auto"
+    import time, subprocess, sys
 
-    def once() -> int:
+    pick_auto = auto or (topic.strip().lower() == "auto")
+
+    def once():
+        chosen = (topic if not pick_auto else "auto")
         # 1) learn
         with tracer.start_as_current_span("cli.learn", attributes={"topic": chosen}):
             from bot.workflows import learn as wf
             code = wf.run(chosen, strategy=strategy)
             print(f"[cyan]learn[/cyan] → {chosen} [dim](snapshot created under snapshots/runs)[/dim]")
 
-        # 2) root eval (explicitly)
-        payload = run_all()
-        print(f"[dim]root eval[/dim]: {payload.get('overall')}  artifact={payload.get('artifact')}")
+        # 2) root eval (explicit print for visibility)
+        root = run_all()
+        print(f"root eval: {root.get('overall')}  artifact={root.get('artifact')}")
 
-        # 3) self-improve (A/B + adopt if equivalent & ≥1.5x)
-        try:
-            from bot.workflows import self_improve as wsi
-            wsi.run()
-        except Exception as e:
-            print(f"[yellow]self-improve skipped[/yellow]: {e}")
+        # 3) self-improve
+        from bot.workflows import self_improve as wsi
+        wsi.run()
 
-        # 4) (optional) canary + flip
+        # 4) canary (optional)
         if autopromote:
-            try:
-                # Reuse our own CLI command for a full canary migration
-                subprocess.run(
-                    [sys.executable, "-m", "bot.cli", "rag", "canary-migrate", "--from", "v1", "--to", "v2", "--flip"],
-                    check=False,
-                )
-            except Exception as e:
-                print(f"[yellow]autopromote skipped[/yellow]: {e}")
-
+            print("Exporting golden dumps...")
+            subprocess.run([sys.executable, "-m", "bot.cli", "rag", "canary-migrate", "--from", "v1", "--to", "v2", "--flip"], check=False)
         return code
 
     if not loop:
@@ -168,8 +152,7 @@ def learn(
         force_flush()
         raise typer.Exit(code=code)
 
-    # Continuous loop
-    backoff = 30  # seconds between cycles; tweak as desired
+    backoff = 30
     try:
         while True:
             code = once()
@@ -178,22 +161,6 @@ def learn(
     except KeyboardInterrupt:
         print("\n[dim]Exiting loop.[/dim]")
         raise typer.Exit(code=0)
-
-@curr_app.command("list")
-def curr_list():
-    from bot.curriculum.registry import load_registry, is_done
-
-    reg = load_registry()
-    for slug, t in reg.items():
-        print(
-            f"[bold]{t.name}[/bold] (safety={t.safety_level}) strategies={t.default_strategies}"
-        )
-        for s in t.skills:
-            status = "✓" if is_done(t.name, s.id) else "•"
-            print(
-                f"  {status} {s.id} – {s.title} (gain≈{s.est_gain:.2f}, risk≈{s.risk_regression:.2f}, {s.time_min}m)"
-            )
-
 
 @curr_app.command("next")
 def curr_next(
@@ -372,9 +339,7 @@ def opt_build_accel(
 
 @opt_app.command("ab-chunk")
 def opt_ab_chunk(
-    store: str = typer.Option(
-        None, help="If provided, sample texts from snapshots/rag/<store>"
-    ),
+    store: str = typer.Option(None, help="If provided, sample texts from snapshots/rag/<store>"),
     n: int = typer.Option(5000, help="Num sentences to chunk (approx)"),
     chunk_tokens: int = typer.Option(400),
     overlap_tokens: int = typer.Option(60),
@@ -382,14 +347,9 @@ def opt_ab_chunk(
 ):
     """
     A/B + equivalence for accelerated chunker vs Python spec.
+    Normalizes record shapes (tuple/list) so equality isn't tripped by type differences.
     """
-    import time
-    import json
-    import pyarrow.parquet as pq
-    import pathlib
-    import random
-    import tracemalloc
-    import psutil
+    import time, json, pyarrow.parquet as pq, pathlib, random, tracemalloc, psutil
     from bot.rag.chunk_spec import chunk_text_equiv as py_spec
 
     def time_and_mem(fn):
@@ -399,14 +359,10 @@ def opt_ab_chunk(
         t0 = time.perf_counter()
         out = fn()
         t1 = time.perf_counter()
-        cur, peak = tracemalloc.get_traced_memory()
+        _, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
         rss1 = proc.memory_info().rss
-        return (
-            out,
-            (t1 - t0),
-            {"rss_delta": int(rss1 - rss0), "py_peak_bytes": int(peak)},
-        )
+        return out, (t1 - t0), {"rss_delta": int(rss1 - rss0), "py_peak_bytes": int(peak)}
 
     texts = []
     if store:
@@ -414,11 +370,9 @@ def opt_ab_chunk(
         tab = pq.read_table(sdir / "chunks.parquet")
         pool = [tab["text"][i].as_py() for i in range(tab.num_rows)]
         random.shuffle(pool)
-        texts = pool[: min(len(pool), n)]
+        texts = pool[:min(len(pool), n)]
     else:
-        base = (
-            "RAG speeds up retrieval by chunking documents into overlapping windows. "
-        )
+        base = "RAG speeds up retrieval by chunking documents into overlapping windows. "
         texts = [base * 20 for _ in range(n)]
 
     def run_py():
@@ -428,16 +382,12 @@ def opt_ab_chunk(
 
     accel_impl = "python"
     out_accel, accel_sec, accel_mem = py_out, py_sec, py_mem
+
     if impl in ("auto", "cpp"):
         try:
             import everabot_chunk_cpp as cpp
-
             def run_cpp():
-                return [
-                    cpp.chunk_text_equiv("doc", t, chunk_tokens, overlap_tokens)
-                    for t in texts
-                ]
-
+                return [cpp.chunk_text_equiv("doc", t, chunk_tokens, overlap_tokens) for t in texts]
             out_accel, accel_sec, accel_mem = time_and_mem(run_cpp)
             accel_impl = "cpp"
         except Exception:
@@ -446,13 +396,8 @@ def opt_ab_chunk(
     if out_accel is None and impl in ("auto", "rust"):
         try:
             import everabot_chunk_rust as r
-
             def run_rust():
-                return [
-                    r.chunk_text_equiv("doc", t, chunk_tokens, overlap_tokens)
-                    for t in texts
-                ]
-
+                return [r.chunk_text_equiv("doc", t, chunk_tokens, overlap_tokens) for t in texts]
             out_accel, accel_sec, accel_mem = time_and_mem(run_rust)
             accel_impl = "rust"
         except Exception:
@@ -461,10 +406,8 @@ def opt_ab_chunk(
     if out_accel is None and impl in ("auto", "go"):
         try:
             from bot.accel.go.go_client import chunk_text_equiv as go_chunk
-
             def run_go():
                 return [go_chunk("doc", t, chunk_tokens, overlap_tokens) for t in texts]
-
             out_accel, accel_sec, accel_mem = time_and_mem(run_go)
             accel_impl = "go"
         except Exception:
@@ -473,18 +416,28 @@ def opt_ab_chunk(
     if out_accel is None and impl == "auto":
         accel_impl, accel_sec, accel_mem, out_accel = "python", py_sec, py_mem, py_out
 
-    equivalent = (py_out == out_accel)
+    # --- Canonicalize shapes: (doc_id:str, start:int, text:str, toks:int)
+    def _canon(batch):
+        def c1(rec):
+            # rec may be tuple/list like [doc, start, text, toks]
+            doc, start, text, toks = rec[0], rec[1], rec[2], rec[3]
+            return (str(doc), int(start), str(text), int(toks))
+        return [[c1(rec) for rec in group] for group in batch]
+
+    py_norm  = _canon(py_out)
+    acc_norm = _canon(out_accel)
+
+    equivalent = (py_norm == acc_norm)
     sample_diffs = []
     if not equivalent:
-        # show the first few mismatches to debug accelerator parity
-        for i, (p, a) in enumerate(zip(py_out, out_accel)):
+        for i, (p, a) in enumerate(zip(py_norm, acc_norm)):
             if p != a:
-                # Both are lists of chunks; show the first chunk that differs
                 pp = p[0] if p else None
                 aa = a[0] if a else None
                 sample_diffs.append({"i": i, "py_first": pp, "acc_first": aa})
                 if len(sample_diffs) >= 3:
                     break
+
     result = {
         "equivalent": bool(equivalent),
         "python_sec": py_sec,
@@ -497,7 +450,6 @@ def opt_ab_chunk(
     }
     print(json.dumps(result, indent=2))
     raise typer.Exit(code=0 if equivalent else 1)
-
 
 # -------- snapshot subcommands
 snapshot_app = typer.Typer(help="Manage learn/train run snapshots")
@@ -871,33 +823,14 @@ def rag_export(
 
 @rag_app.command("rebuild-from-docs")
 def rag_rebuild_from_docs(
-    source: str = typer.Option(
-        ..., "--source", "-i", help="Path to docs.canon.jsonl (or docs.jsonl)"
-    ),
-    target: str = typer.Option(
-        ..., "--target", "-o", help="Target store dir (e.g., snapshots/rag/v2)"
-    ),
+    source: str = typer.Option(..., "--source", "-i", help="Path to docs.canon.jsonl (or docs.jsonl)"),
+    target: str = typer.Option(..., "--target", "-o", help="Target store dir (e.g., snapshots/rag/v2)"),
     chunk_toks: int = typer.Option(400, "--chunk-toks"),
     overlap: int = typer.Option(60, "--overlap"),
-    engine: Optional[str] = typer.Option(
-        None, "--engine", help=f"Chunker engine {ENGINE_CHOICES}"
-    ),
-    prefer_canon_chunks: bool = typer.Option(
-        True,
-        "--prefer-canon-chunks/--rechunk",
-        help="If sibling chunks.canon.jsonl exists, use it to avoid re-chunk drift.",
-    ),
-    from_store: Optional[str] = typer.Option(
-        None,
-        "--from-store",
-        help="When preferring canon chunks, optionally copy heavy artifacts from this store (e.g., v1) to guarantee bitwise parity.",
-    ),
+    engine: Optional[str] = typer.Option(None, "--engine", help=f"Chunker engine {ENGINE_CHOICES}"),
+    prefer_canon_chunks: bool = typer.Option(True, "--prefer-canon-chunks/--rechunk", help="If sibling chunks.canon.jsonl exists, use it to avoid re-chunk drift."),
+    from_store: Optional[str] = typer.Option(None, "--from-store", help="When preferring canon chunks, optionally copy heavy artifacts from this store (e.g., v1) to guarantee bitwise parity."),
 ):
-    """
-    Rebuild a candidate store (docs + chunks/embeddings/index).
-    If chunks.canon.jsonl is present and --prefer-canon-chunks is true, avoid re-chunking.
-    Always writes a minimal manifest.json so downstream code can pin this store.
-    """
     from bot.core.state import _rebuild_store_from_docs
     import time, json, os
     import pyarrow.parquet as pq
@@ -908,27 +841,25 @@ def rag_rebuild_from_docs(
     out = pathlib.Path(target)
     out.mkdir(parents=True, exist_ok=True)
 
-    # 1) Always materialize docs.jsonl in the target
+    # 1) docs
     docs_out = out / "docs.jsonl"
     rows = list(read_jsonl(src))
     write_jsonl(docs_out, rows)
 
-    # 2) Either reconstruct chunks from canonical chunks or re-chunk from docs
+    # 2) chunks/embeddings/index
     canon_dir = src.parent
     canon_chunks = canon_dir / "chunks.canon.jsonl"
     if prefer_canon_chunks and canon_chunks.exists():
-        # If asked, try to copy heavy artifacts from an existing store (bitwise match path)
         if from_store:
             base = get_project_root() / "snapshots" / "rag" / from_store
             for rel in ("chunks.parquet", "embeddings.parquet", "index.faiss"):
                 b = base / rel
                 if b.exists():
                     shutil.copy2(b, out / rel)
-        # If chunks.parquet still missing, write it from canonical JSONL
         if not (out / "chunks.parquet").exists():
             chunk_rows = list(read_jsonl(canon_chunks))
             _write_parquet_from_canon(chunk_rows, out / "chunks.parquet")
-        # If embeddings/index missing, build them from chunks now
+
         missing_emb = not (out / "embeddings.parquet").exists()
         missing_idx = not (out / "index.faiss").exists()
         if missing_emb or missing_idx:
@@ -941,49 +872,40 @@ def rag_rebuild_from_docs(
                     ids = [tab["id"][i].as_py() for i in range(tab.num_rows)]
                     texts = [tab["text"][i].as_py() for i in range(tab.num_rows)]
                     vecs = embed(texts)
+
                     import pyarrow as pa
-                    vec_list = pa.array(
-                        [pa.array(v.tolist(), type=pa.float32()) for v in vecs],
-                        type=pa.list_(pa.float32()),
-                    )
-                    emb_tab = pa.Table.from_arrays(
-                        [pa.array(ids, type=pa.string()), vec_list],
-                        names=["chunk_id", "vector"],
-                    )
+                    vec_list = pa.array([pa.array(v.tolist(), type=pa.float32()) for v in vecs], type=pa.list_(pa.float32()))
+                    emb_tab = pa.Table.from_arrays([pa.array(ids, type=pa.string()), vec_list], names=["chunk_id", "vector"])
                     pq.write_table(emb_tab, out / "embeddings.parquet")
                 if missing_idx:
                     build_index(out / "embeddings.parquet", out / "index.faiss")
             except Exception:
-                # Fallback to full rebuild if embedding build path not available
                 _rebuild_store_from_docs(src, out, chunk_toks, overlap)
     else:
         _rebuild_store_from_docs(src, out, chunk_toks, overlap)
 
-    # 3) Schema registry for drift detection
+    # 3) schemas
     _copy_schema_registry(out)
 
-    # 4) Write a minimal manifest.json (this unblocks run_learn pinning to this store)
+    # 4) manifest (always)
     def _exists(p: pathlib.Path) -> bool:
-        try:
-            return p.exists()
-        except Exception:
-            return False
-
-    docs_count = sum(1 for _ in open(docs_out, "r", encoding="utf-8", errors="replace"))
-    chunks_count = 0
-    try:
-        chunks_tab = pq.read_table(out / "chunks.parquet")
-        chunks_count = chunks_tab.num_rows
-    except Exception:
-        pass
+        try: return p.exists()
+        except Exception: return False
 
     def _file_meta(p: pathlib.Path) -> dict:
         return {
             "exists": _exists(p),
             "size": (os.path.getsize(p) if _exists(p) else None),
             "mtime": (os.path.getmtime(p) if _exists(p) else None),
-            "rel": str(p.relative_to(out)) if _exists(p) else None,
+            "rel": (str(p.relative_to(out)) if _exists(p) else None),
         }
+
+    docs_count = sum(1 for _ in open(docs_out, "r", encoding="utf-8", errors="replace"))
+    chunks_count = 0
+    try:
+        chunks_count = pq.read_table(out / "chunks.parquet").num_rows
+    except Exception:
+        pass
 
     manifest = {
         "version": 1,
@@ -997,11 +919,12 @@ def rag_rebuild_from_docs(
             "index.faiss": _file_meta(out / "index.faiss"),
             "schemas/": {"exists": _exists(out / "schemas")},
         },
-        "notes": "Auto-generated by rag_rebuild_from_docs for pinning/verification.",
+        "notes": "Auto-generated for pinning/verification.",
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     print(f"Rebuilt candidate store at {out}")
+
 
 @rag_app.command("canary-migrate")
 def rag_canary_migrate(
@@ -1009,33 +932,18 @@ def rag_canary_migrate(
     dst: str = typer.Option("v2", "--to"),
     chunk_toks: int = typer.Option(400, "--chunk-toks"),
     overlap: int = typer.Option(60, "--overlap"),
-    engine: Optional[str] = typer.Option(
-        None, "--engine", help=f"Chunker engine {ENGINE_CHOICES}"
-    ),
-    no_rechunk: bool = typer.Option(
-        False,
-        "--no-rechunk",
-        help="Skip rebuild step; just prove equivalence of existing stores.",
-    ),
-    require_chunk_bits: bool = typer.Option(
-        False,
-        "--require-chunk-bits",
-        help="Require chunks.canon equivalence in addition to docs.",
-    ),
+    engine: Optional[str] = typer.Option(None, "--engine", help=f"Chunker engine {ENGINE_CHOICES}"),
+    no_rechunk: bool = typer.Option(False, "--no-rechunk", help="Skip rebuild step; just prove equivalence of existing stores."),
+    require_chunk_bits: bool = typer.Option(False, "--require-chunk-bits", help="Require chunks.canon equivalence in addition to docs."),
     flip_on_pass: bool = typer.Option(True, "--flip/--no-flip"),
 ):
-    """
-    Full canary: export golden → (optional rebuild) → equivalence (hash+top-k) → flip pointer.
-    """
+    import json, os, time, pyarrow.parquet as pq
     root = get_project_root()
     canon = root / "snapshots" / "rag" / f"canon_{src}"
     canon.mkdir(parents=True, exist_ok=True)
 
     print("[cyan]Exporting golden dumps...[/cyan]")
-    subprocess.run(
-        [sys.executable, "-m", "bot.cli", "rag", "export", "-s", src, "-o", str(canon)],
-        check=True,
-    )
+    subprocess.run([sys.executable, "-m", "bot.cli", "rag", "export", "-s", src, "-o", str(canon)], check=True)
 
     v2_dir = root / "snapshots" / "rag" / dst
 
@@ -1048,17 +956,43 @@ def rag_canary_migrate(
             overlap=overlap,
             engine=engine,
             prefer_canon_chunks=True,
-            from_store=src,  # borrow heavy artifacts if desired (bitwise path)
+            from_store=src,
         )
 
-    print(
-        f"[cyan]Proving equivalence ({'docs-bitwise + chunks-bitwise + ' if require_chunk_bits else 'docs-bitwise + ' }top-k)...[/cyan]"
-    )
-    res = subprocess.run(
-        [sys.executable, "-m", "bot.cli", "rag", "prove-equivalence", src, dst]
-        + (["--require-chunk-bits"] if require_chunk_bits else []),
-        check=False,
-    )
+    # Ensure manifest exists even if we skipped rebuild
+    man = v2_dir / "manifest.json"
+    if not man.exists():
+        try:
+            docs = v2_dir / "docs.jsonl"
+            import pyarrow.parquet as pq
+            chunks_rows = 0
+            try:
+                chunks_rows = pq.read_table(v2_dir / "chunks.parquet").num_rows
+            except Exception:
+                pass
+            counts = {
+                "docs": sum(1 for _ in open(docs, "r", encoding="utf-8", errors="replace")) if docs.exists() else 0,
+                "chunks": int(chunks_rows),
+            }
+            payload = {
+                "version": 1,
+                "ts": int(time.time()),
+                "store_dir": str(v2_dir.resolve()),
+                "counts": counts,
+                "files": {
+                    "docs.jsonl": {"exists": docs.exists()},
+                    "chunks.parquet": {"exists": (v2_dir / "chunks.parquet").exists()},
+                    "embeddings.parquet": {"exists": (v2_dir / "embeddings.parquet").exists()},
+                    "index.faiss": {"exists": (v2_dir / "index.faiss").exists()},
+                },
+                "notes": "Synthesized by canary-migrate",
+            }
+            man.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as e:
+            print(f"[yellow]Warning:[/yellow] could not synthesize manifest.json: {e}")
+
+    print(f"[cyan]Proving equivalence ({'docs-bitwise + chunks-bitwise + ' if require_chunk_bits else 'docs-bitwise + ' }top-k)...[/cyan]")
+    res = subprocess.run([sys.executable, "-m", "bot.cli", "rag", "prove-equivalence", src, dst] + (["--require-chunk-bits"] if require_chunk_bits else []), check=False)
     if res.returncode != 0:
         print("[red]Equivalence FAILED — pointer not flipped.[/red]")
         raise typer.Exit(code=1)
@@ -1068,7 +1002,6 @@ def rag_canary_migrate(
         cur.write_text(str(v2_dir.resolve()))
         print(f"[green]Pointer flipped →[/green] {cur} = {v2_dir}")
     print("[green]Canary migration complete.[/green]")
-
 
 @rag_app.command("prove-equivalence")
 def rag_prove_equivalence(
