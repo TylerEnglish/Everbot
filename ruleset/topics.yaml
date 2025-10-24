@@ -1,6 +1,6 @@
 version: 2
 
-# Keeps legacy list so tests keep passing
+# Legacy shim so any old tests/code keep passing
 allowed_topics:
   - problem_solving
   - web_dev
@@ -10,36 +10,123 @@ allowed_topics:
 
 aliases:
   web: web_dev
+  webdev: web_dev
   security: security_basics
+  perf: selfopt/perf
+  memory: selfopt/memory
+  latency: selfopt/latency
+  ram: systems/ram
+  cpu: systems/cpu
+  ds: data_science
+  ml: ml_engineering
+  nlp: nlp
+  cv: vision
+  bio: biology/reading
 
 notes:
   - "Topics gate only the 'learn' path; 'build' is free-form but still bound by safety."
 
-# New structured registry for curriculum/auto-expansion
+# New structured registry for curriculum/auto-expansion (single, consistent schema)
 topics:
-  problem_solving:
+  # ---- Self-optimization lane ----
+  - id: selfopt/perf
+    name: Performance Profiling & Hotspot Rewrites
     safety_level: low
-    default_strategies: ["ace", "vanilla"]
+    default_strategies: [ace, vanilla]
+    notes: >
+      Profile, A/B, then propose drop-in rewrites behind stable interfaces.
+      Must keep functional equivalence and pass root tests.
     skills:
-      - id: ps-breakdown
-        title: "Systematic problem decomposition"
-        est_gain: 0.40       # 0..1 expected KPI gain
-        risk_regression: 0.05 # 0..1
-        time_min: 3          # minutes
-        cpu_pct_est: 20
-        ram_mb_est: 64
-        notes: "Chain-of-thought checklists; concise bullets"
-      - id: ps-search
-        title: "Targeted retrieval queries"
+      - id: perf-pyspy
+        title: "py-spy guided hotspot identification"
         est_gain: 0.35
         risk_regression: 0.03
-        time_min: 3
+        time_min: 6
+        cpu_pct_est: 20
+        ram_mb_est: 64
+      - id: perf-ab
+        title: "A/B a rewritten module (same I/O)"
+        est_gain: 0.30
+        risk_regression: 0.04
+        time_min: 7
         cpu_pct_est: 25
         ram_mb_est: 96
 
-  web_dev:
+  - id: selfopt/memory
+    name: Memory Footprint & Cache Hygiene
+    safety_level: low
+    default_strategies: [ace, vanilla]
+    notes: >
+      Reduce peak RSS, tune batch sizes, reuse buffers, ensure no leaks.
+    skills:
+      - id: mem-peak
+        title: "Reduce peak RSS by X% on rag pipeline"
+        est_gain: 0.28
+        risk_regression: 0.04
+        time_min: 8
+        cpu_pct_est: 25
+        ram_mb_est: 96
+      - id: mem-bufs
+        title: "Buffer reuse & pool sizing"
+        est_gain: 0.24
+        risk_regression: 0.03
+        time_min: 6
+        cpu_pct_est: 20
+        ram_mb_est: 64
+
+  - id: selfopt/latency
+    name: Tail Latency & Concurrency
+    safety_level: low
+    default_strategies: [ace, vanilla]
+    notes: >
+      Trim p95/p99; parallelize I/O; bound long-tails; keep determinism for tests.
+    skills:
+      - id: lat-batch
+        title: "Tune batch size for p95"
+        est_gain: 0.22
+        risk_regression: 0.03
+        time_min: 6
+        cpu_pct_est: 30
+        ram_mb_est: 96
+
+  # ---- Systems / infra-ish ----
+  - id: systems/ram
+    name: RAM, paging behavior, and memory locality
+    safety_level: low
+    default_strategies: [ace]
+    notes: >
+      Explore locality + working-set sizing; document win/loss.
+    skills:
+      - id: ram-locality
+        title: "Locality experiment design"
+        est_gain: 0.20
+        risk_regression: 0.02
+        time_min: 6
+        cpu_pct_est: 20
+        ram_mb_est: 64
+
+  - id: systems/cpu
+    name: CPU cache, vectorization, thread pools
+    safety_level: low
+    default_strategies: [ace]
+    notes: >
+      Apply to chunking/embedding/index stages; measure perf delta.
+    skills:
+      - id: cpu-pool
+        title: "Right-size thread pool for stage X"
+        est_gain: 0.22
+        risk_regression: 0.03
+        time_min: 6
+        cpu_pct_est: 35
+        ram_mb_est: 96
+
+  # ---- App domains ----
+  - id: web_dev
+    name: Web Development (FastAPI/HTMX)
     safety_level: medium
-    default_strategies: ["ace", "long_context", "vanilla"]
+    default_strategies: [ace, vanilla]
+    notes: >
+      Extend the minimal UI safely; no external calls without ruleset/tools.yaml allowance.
     skills:
       - id: web-auth-basics
         title: "HTTP auth & sessions basics"
@@ -56,9 +143,12 @@ topics:
         cpu_pct_est: 25
         ram_mb_est: 96
 
-  game_dev:
+  - id: game_dev
+    name: Game Dev (algorithms & loops)
     safety_level: medium
-    default_strategies: ["long_context", "vanilla"]
+    default_strategies: [ace, vanilla]
+    notes: >
+      Practice deterministic loops, ECS patterns, and perf tradeoffs.
     skills:
       - id: gd-ecs
         title: "Entity-Component-System basics"
@@ -68,9 +158,136 @@ topics:
         cpu_pct_est: 35
         ram_mb_est: 192
 
-  math:
+  - id: biology/reading
+    name: Biology Reading & Notes
+    safety_level: medium
+    default_strategies: [ace]
+    notes: >
+      Summarize and distill; prioritize reputable sources; keep citations.
+    skills:
+      - id: bio-lit
+        title: "Paper skimming → bullet distillation"
+        est_gain: 0.20
+        risk_regression: 0.03
+        time_min: 8
+        cpu_pct_est: 20
+        ram_mb_est: 96
+
+  - id: memory/engineering
+    name: Long-context & Memory Engineering
     safety_level: low
-    default_strategies: ["ace", "vanilla"]
+    default_strategies: [ace]
+    notes: >
+      Retrieval layouts, recency heuristics, context windows; verify via RAG equivalence suites.
+    skills:
+      - id: mem-rag-layout
+        title: "RAG layout variants + equivalence"
+        est_gain: 0.26
+        risk_regression: 0.04
+        time_min: 8
+        cpu_pct_est: 30
+        ram_mb_est: 128
+
+  # ---- Software engineering meta ----
+  - id: sw-eng/refactors
+    name: Safe Refactors & API Stabilization
+    safety_level: low
+    default_strategies: [ace, vanilla]
+    notes: >
+      Refactor outside ruleset/ & test/; preserve CLI contracts and pass all root tests.
+    skills:
+      - id: refactor-api
+        title: "Stabilize module interfaces"
+        est_gain: 0.24
+        risk_regression: 0.03
+        time_min: 7
+        cpu_pct_est: 25
+        ram_mb_est: 96
+
+  # ---- Data & ML ----
+  - id: data_science
+    name: Data Wrangling & Analysis
+    safety_level: low
+    default_strategies: [ace]
+    notes: "Parquet/Arrow idioms; groupby; joins; memory safety."
+    skills:
+      - id: ds-parquet
+        title: "Arrow/Parquet efficient IO patterns"
+        est_gain: 0.22
+        risk_regression: 0.02
+        time_min: 6
+        cpu_pct_est: 25
+        ram_mb_est: 128
+
+  - id: ml_engineering
+    name: ML Engineering (HF/transformers)
+    safety_level: medium
+    default_strategies: [ace]
+    notes: "Adapters, quantization tradeoffs, reproducibility."
+    skills:
+      - id: ml-adapters
+        title: "LoRA config exploration under budget"
+        est_gain: 0.25
+        risk_regression: 0.05
+        time_min: 10
+        cpu_pct_est: 50
+        ram_mb_est: 2048
+
+  - id: nlp
+    name: NLP / Retrieval / Reranking
+    safety_level: medium
+    default_strategies: [ace]
+    notes: "BM25 tuning, hybrid RRF, MMR; top-k equivalence testing."
+    skills:
+      - id: nlp-bm25
+        title: "BM25/Hybrid parameters A/B"
+        est_gain: 0.20
+        risk_regression: 0.04
+        time_min: 8
+        cpu_pct_est: 40
+        ram_mb_est: 512
+
+  - id: vision
+    name: CV basics (reading & notes)
+    safety_level: medium
+    default_strategies: [ace]
+    notes: "Paper reading → distilled bullets; no heavy training by default."
+    skills:
+      - id: cv-reading
+        title: "Read a survey and distill"
+        est_gain: 0.14
+        risk_regression: 0.02
+        time_min: 8
+        cpu_pct_est: 20
+        ram_mb_est: 64
+
+  # ---- General problem-solving ----
+  - id: problem_solving
+    name: Systematic Problem Solving
+    safety_level: low
+    default_strategies: [ace, vanilla]
+    notes: "Checklists and concise bullets."
+    skills:
+      - id: ps-breakdown
+        title: "Systematic problem decomposition"
+        est_gain: 0.40
+        risk_regression: 0.05
+        time_min: 3
+        cpu_pct_est: 20
+        ram_mb_est: 64
+      - id: ps-search
+        title: "Targeted retrieval queries"
+        est_gain: 0.35
+        risk_regression: 0.03
+        time_min: 3
+        cpu_pct_est: 25
+        ram_mb_est: 96
+
+  - id: math
+    name: Math Reasoning
+    safety_level: low
+    default_strategies: [ace, vanilla]
+    notes: "GSM8K-style habits."
     skills:
       - id: m-arithmetic
         title: "Grade-school arithmetic steps"
@@ -87,9 +304,11 @@ topics:
         cpu_pct_est: 25
         ram_mb_est: 96
 
-  security_basics:
+  - id: security_basics
+    name: Security Basics (defensive)
     safety_level: high
-    default_strategies: ["ace", "vanilla"]
+    default_strategies: [ace]
+    notes: "Defensive patterns only; no offensive content."
     skills:
       - id: sec-threat-model
         title: "Threat modeling: STRIDE-lite"
