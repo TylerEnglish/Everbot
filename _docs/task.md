@@ -149,15 +149,15 @@
 
 ### 13) RAG & storage **refactor** path with 100% match proof
 
-* [ ] Provide an interface for candidate stores (e.g., Parquet→custom columnar, index v1→v2).
-* [ ] Implement **canary migration**:
+* [*] Provide an interface for candidate stores (e.g., Parquet→custom columnar, index v1→v2).
+* [*] Implement **canary migration**:
 
 1. Export canonical **golden dumps** (ordered JSONL + Parquet schemas).
 2. Import into new store.
 3. Run **bitwise hash** and **top-k equivalence** suites.
 4. Only switch the pointer (`current_store`) on full pass.
 
-* [ ] Maintain **schema registry** (Avro/Arrow schema files) to avoid silent drift. ([Apache Parquet][8])
+* [*] Maintain **schema registry** (Avro/Arrow schema files) to avoid silent drift. ([Apache Parquet][8])
 
 ---
 

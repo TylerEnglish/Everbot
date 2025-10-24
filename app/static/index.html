@@ -1,0 +1,39 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Everabot – placeholder stream</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 20px; }
+  pre { background: #111; color: #ddd; padding: 10px; border-radius: 6px; max-height: 60vh; overflow: auto; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#eee; margin-left:6px;}
+</style>
+<h3>Everabot – runs</h3>
+<select id="run"></select><span id="meta" class="pill"></span>
+<pre id="out"></pre>
+<script>
+async function loadRuns(){
+  const res = await fetch('/runs'); const runs = await res.json();
+  const sel = document.getElementById('run');
+  sel.innerHTML = '';
+  runs.forEach(r=>{
+    const opt = document.createElement('option');
+    opt.value = r.id; opt.textContent = `${r.id} — ${r.run_type || ''} ${r.topic || ''}`;
+    sel.appendChild(opt);
+  });
+  if (runs.length) { sel.value = runs[runs.length-1].id; connect(sel.value); meta(sel.value); }
+  sel.onchange = (e)=>{ connect(e.target.value); meta(e.target.value); };
+}
+async function meta(id){
+  const res = await fetch(`/scores/${id}`); const s = await res.json();
+  const pill = document.getElementById('meta');
+  pill.textContent = `topic:${s.topic} new:${s.new_topic_score} practice:${s.practice_score} root_ok:${s.root_ok}`;
+}
+let es;
+function connect(id){
+  const out = document.getElementById('out'); out.textContent = '';
+  if (es) es.close();
+  es = new EventSource(`/stream/logs/${id}`);
+  es.onmessage = (e)=>{ out.textContent += e.data + "\n"; out.scrollTop = out.scrollHeight; };
+  es.onerror = ()=>{ out.textContent += "[stream closed]\n"; es.close(); };
+}
+loadRuns();
+</script>

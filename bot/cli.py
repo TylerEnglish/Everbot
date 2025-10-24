@@ -800,7 +800,21 @@ def rag_delta_roundtrip(
     raise typer.Exit(code=0 if proof["all_equal"] else 1)
 
 # ------------------- rules commands -------------------
+ui_app = typer.Typer(help="Lightweight UI / API")
+app.add_typer(ui_app, name="ui")
 
+@ui_app.command("serve")
+def ui_serve(host: str = typer.Option("127.0.0.1"), port: int = typer.Option(8000)):
+    """
+    Start the placeholder API that streams runs/logs/scores. Terminal-first; no dashboard.
+    """
+    try:
+        import uvicorn
+    except ImportError:
+        print("[red]uvicorn missing[/red] — run: poetry add fastapi uvicorn")
+        raise typer.Exit(code=1)
+    uvicorn.run("app.server:app", host=host, port=port, reload=False, log_level="info")
+                
 rules_app = typer.Typer(help="Inspect and validate ruleset")
 app.add_typer(rules_app, name="rules")
 

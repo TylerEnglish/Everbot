@@ -52,6 +52,9 @@ Everbot
 |   |-task.md
 |   |-xdelta3.sh
 |-app/
+|   |-static/
+|   |   |-index.html
+|   |-server.py
 |-bin/
 |-examples/
 |   |-sft_tiny.jsonl
