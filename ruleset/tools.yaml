@@ -19,7 +19,26 @@ net:
     - datatracker.ietf.org
     - ietf.org
 
-    # Docs (read-only)
+    # Core language & systems docs
+    - en.cppreference.com
+    - open-std.org
+    - isocpp.org
+    - github.com
+    - doc.rust-lang.org
+    - rust-lang.org
+    - erlang.org
+    - llvm.org
+    - gcc.gnu.org
+    - sourceware.org
+    - man7.org
+    - kernel.org
+    - www.intel.com
+    - developer.arm.com
+    - riscv.org
+    - csapp.cs.cmu.edu
+    - inst.eecs.berkeley.edu
+
+    # Data/ML docs (read-only)
     - docs.python.org
     - pypi.org
     - numpy.org
@@ -30,8 +49,32 @@ net:
     - faiss.ai
     - milvus.io
 
-    # Code & source (read-only)
-    - github.com
+    # Patterns & software architecture
+    - refactoring.guru
+    - c4model.com
+
+    # Science/education references
+    - openstax.org
+    - khanacademy.org
+    - projecteuler.net
+    - chem.libretexts.org
+    - webbook.nist.gov
+    - ncbi.nlm.nih.gov
+    - alleninstitute.org
+
+    # Finance & macro
+    - investopedia.com
+    - investor.gov
+    - fred.stlouisfed.org
+    - federalreserve.gov
+    - pages.stern.nyu.edu
+    - bogleheads.org
+
+    # Construction architecture & codes
+    - wbdg.org
+    - iccsafe.org
+    - usgbc.org
+    - aia.org
 
     # Tutorials/blogs (safe, mainstream)
     - towardsdatascience.com
