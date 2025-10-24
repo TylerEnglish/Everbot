@@ -1,6 +1,6 @@
 from __future__ import annotations
 import certifi
-import requests, pathlib, re, time, threading
+import requests, pathlib, re, time, threading, io
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from PyPDF2 import PdfReader
@@ -18,7 +18,7 @@ _CT_ALLOW = set(_TOOLS.get("content_types_allowlist") or [])
 _MAX_BYTES = int(_TOOLS.get("max_bytes_per_doc") or 0) or None
 
 # Allowed hosts with optional suffix matching
-_ALLOWED = set(policy.get("net", {}).get("allowed_hosts", []) or [])
+_ALLOWED = set((_NET.get("allowed_hosts") or []))
 _ALLOW_SUFFIX = bool(_NET.get("allow_suffix", True))  # default True if not set
 
 # RFC PDF path typo helper (rfcXXXX.pdf)
@@ -69,14 +69,15 @@ _BUCKET = _TokenBucket(
     int(_RL_CFG.get("window_ms") or 1000),
 )
 
-
 def _req(url: str) -> requests.Response:
     _BUCKET.take()
     # If we have a max size, try HEAD first to enforce a budget without downloading.
     if _MAX_BYTES:
         try:
             _BUCKET.take()
-            h = requests.head(url, headers=_UA, timeout=15, allow_redirects=True, verify=certifi.where())
+            h = requests.head(
+                url, headers=_UA, timeout=15, allow_redirects=True, verify=certifi.where()
+            )
             if h.ok:
                 cl = h.headers.get("Content-Length")
                 if cl and cl.isdigit() and int(cl) > _MAX_BYTES:
@@ -93,6 +94,7 @@ def _req(url: str) -> requests.Response:
             if len(content) > _MAX_BYTES:
                 r.close()
                 raise ValueError("Downloaded payload exceeds max_bytes_per_doc")
+        # Stash the bytes so downstream consumers have r.content
         r._content = content
     return r
 
@@ -117,7 +119,7 @@ def _try_rfc_fallback(orig_url: str, resp: requests.Response) -> tuple[str, requ
 def fetch(url_or_path: str) -> tuple[str, str]:
     """
     Returns (title, text). If local path to .pdf/.html/.txt, we parse locally.
-    If URL, we fetch politely (single GET). YouTube: transcript fast-path.
+    If URL, we fetch politely (HEAD/GET + size guard). YouTube: transcript fast-path.
     """
     # 0) YouTube transcript
     if re.match(r"^https?://(www\.)?(youtube\.com|youtu\.be)/", url_or_path, re.I):
@@ -144,9 +146,10 @@ def fetch(url_or_path: str) -> tuple[str, str]:
             cmain = ct.split(";", 1)[0].strip() if ct else ""
             if cmain and cmain not in _CT_ALLOW:
                 raise PermissionError(f"Disallowed content-type: {cmain}")
+
         if "pdf" in ct or url_or_path.lower().endswith(".pdf"):
             return (url_or_path, _pdf_bytes_to_text(r.content))
-        elif "html" in ct or "<html" in r.text.lower():
+        elif "html" in ct or "<html" in (r.text or "").lower():
             return _html_to_text(r.text, url_or_path)
         else:
             return (url_or_path, r.text)
@@ -160,7 +163,6 @@ def fetch(url_or_path: str) -> tuple[str, str]:
     return (p.name, p.read_text(encoding="utf-8", errors="replace"))
 
 def _pdf_bytes_to_text(b: bytes) -> str:
-    import io
     reader = PdfReader(io.BytesIO(b))
     out = []
     for page in reader.pages:
