@@ -27,17 +27,13 @@ def _write_note(p: pathlib.Path, payload: dict) -> None:
 def run() -> int:
     tracer = get_tracer("everabot.self_improve")
     with tracer.start_as_current_span("self_improve.entry"):
-        # 1) Try to find a free win on the chunker (use real corpus if available)
+        # 1) Prefer a real corpus if available, else synthetic
         store = None
-        sdir = get_project_root() / "snapshots" / "rag" / "v1"
-        if (sdir / "chunks.parquet").exists():
+        v1_chunks = get_project_root() / "snapshots" / "rag" / "v1" / "chunks.parquet"
+        if v1_chunks.exists():
             store = "v1"
-        # prefer a real corpus if available, else synthetic
-        from bot.paths import get_project_root
-        store = None
-        if (get_project_root() / "snapshots" / "rag" / "v1" / "chunks.parquet").exists():
-            store = "v1"
-        res = ab_chunk(store=store, n=2000)
+
+        res = ab_chunk(store=store, n=2000)  # modest load
         note = {
             "ts": int(time.time()),
             "task": "chunk_ab",
@@ -65,11 +61,17 @@ def run() -> int:
         # Persist the decision + A/B evidence into snapshots
         out = pathlib.Path("snapshots") / "selfopt" / f"chunk_{int(time.time())}.json"
         _write_note(out, note)
-        # Make it visible in the CLI output
-        print(json.dumps({"self_improve": note, "note_path": str(out)}, indent=2))
+
+        # Human-friendly summary
+        try:
+            spd = f"{res.speedup_x:.2f}x" if res.speedup_x else "NA"
+        except Exception:
+            spd = "NA"
+        print(f"[green]self-improve[/green] chunker: impl={res.accel_impl} eq={bool(res.equivalent)} speedup≈{spd} adopted={adopted}")
+        print(f"[dim]note:[/dim] {out}")
 
         # 4) If tests passed and we adopted, commit the pref file
-        ok = bool(root.get("overall") == "PASS" or root.get("overall") == "OK")
+        ok = bool(root.get("overall") in ("PASS", "OK"))
         if ok and adopted:
             pref = pathlib.Path("snapshots") / "accel_prefs.json"
             _git_safe_commit(
