@@ -32,7 +32,12 @@ def run() -> int:
         sdir = get_project_root() / "snapshots" / "rag" / "v1"
         if (sdir / "chunks.parquet").exists():
             store = "v1"
-        res = ab_chunk(store=store, n=2000)  # modest load
+        # prefer a real corpus if available, else synthetic
+        from bot.paths import get_project_root
+        store = None
+        if (get_project_root() / "snapshots" / "rag" / "v1" / "chunks.parquet").exists():
+            store = "v1"
+        res = ab_chunk(store=store, n=2000)
         note = {
             "ts": int(time.time()),
             "task": "chunk_ab",
