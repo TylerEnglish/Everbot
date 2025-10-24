@@ -51,11 +51,14 @@ Everbot
 |   |-sources.md
 |   |-task.md
 |   |-xdelta3.sh
+|-.devcontainer/
+|   |-devcontainer.json
 |-app/
 |   |-static/
 |   |   |-index.html
 |   |-server.py
 |-bin/
+|   |-precommit_block_protected.py
 |-examples/
 |   |-sft_tiny.jsonl
 |-ruleset/
@@ -175,6 +178,7 @@ Everbot
 |   |-__init__.py
 |   |-cli.py
 |   |-paths.py
+|-.pre-commit-config.yaml
 |-Dockerfile
 |-.gitignore
 |-poetry.lock

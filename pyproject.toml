@@ -46,9 +46,14 @@ pybind11 = {version="^2.11.0", optional=true}
 scikit-build-core = {version="^0.8.0", optional=true}
 maturin = {version="^1.5.0", optional=true}   # for Rust lane  
 
+
 [tool.poetry.extras]
 qlora = ["bitsandbytes","pybind11","scikit-build-core","maturin"]
 accel = ["pybind11","scikit-build-core","maturin"] 
+
+[tool.poetry.group.dev.dependencies]
+poethepoet = "^0.27.0"
+pre-commit = "^3.7.0"
 
 # Optional group for llama.cpp wheels
 [tool.poetry.group.llamacpp]
@@ -66,7 +71,20 @@ priority = "explicit"
 
 [tool.poetry.scripts]
 everabot = "bot.cli:app"
+everabot-eval = "bot.cli:eval"
+everabot-selfcheck = "bot.cli:selfcheck"
+everabot-snapshot = "bot.cli:snapshot_list"
+
+# Optional nice aliases
+everabot-ui = "bot.cli:ui"  # if your Typer group exposes `ui` as a callable
 
 [build-system]
 requires = ["poetry-core>=1.9.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.poe.tasks]
+eval = "python -m bot.cli eval"
+selfcheck = "python -m bot.cli selfcheck"
+snapshot = "python -m bot.cli snapshot list"
+ui = "python -m bot.cli ui serve"
+rag-canary = "python -m bot.cli rag canary-migrate --from v1 --to v2 --require-chunk-bits --no-rechunk"

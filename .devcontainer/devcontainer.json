@@ -1,0 +1,27 @@
+{
+  "name": "Everabot",
+  "context": "..",
+  "dockerFile": "../Dockerfile",
+  "remoteUser": "everabot",
+  "postCreateCommand": "poetry install && pre-commit install || true",
+  "mounts": [
+    "source=${localWorkspaceFolder}/ruleset,target=/workspace/ruleset,type=bind,consistency=cached,readonly",
+    "source=${localWorkspaceFolder}/test,target=/workspace/test,type=bind,consistency=cached,readonly"
+  ],
+  "forwardPorts": [8000],
+  "features": {},
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "charliermarsh.ruff",
+        "tamasfe.even-better-toml"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.analysis.typeCheckingMode": "basic"
+      }
+    }
+  }
+}
