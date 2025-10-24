@@ -19,6 +19,17 @@ _TOOLS   = load_all().get("tools", {}) or {}
 _RL_CFG  = (_TOOLS.get("internet", {}) or {}).get("rate_limit", {}) or {}
 _CT_ALLOW = set((_TOOLS.get("content_types_allowlist") or []))
 _MAX_BYTES = int(_TOOLS.get("max_bytes_per_doc") or 0) or None
+_ALLOWED = set(policy.get("net", {}).get("allowed_hosts", []) or [])
+_ALLOW_SUFFIX = True  # or read a flag from tools.yaml
+
+def _host_allowed(host: str) -> bool:
+    if not _ALLOWED:
+        return True
+    if host in _ALLOWED:
+        return True
+    if _ALLOW_SUFFIX:
+        return any(host == d or host.endswith("." + d) for d in _ALLOWED)
+    return False
 
 class _TokenBucket:
     def __init__(self, rps: float, burst: int, window_ms: int = 1000):
@@ -114,7 +125,7 @@ def fetch(url_or_path: str) -> tuple[str, str]:
     # 1) Remote URL
     if re.match(r"^https?://", url_or_path, re.I):
         host = (urlparse(url_or_path).hostname or "").lower()
-        if _ALLOWED and host not in _ALLOWED:
+        if not _host_allowed(host):
             raise PermissionError(f"Host '{host}' not in allowed_hosts policy.")
         r = _req(url_or_path)
         if not r.ok:
