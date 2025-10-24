@@ -236,17 +236,30 @@ def build(goal: str):
 
 
 @app.command("self-improve")
-def self_improve():
+def self_improve(
+    loop: bool = typer.Option(False, "--loop", help="Run continuously"),
+    every: int = typer.Option(60, "--every", help="Seconds between iterations when --loop"),
+):
     tracer = get_tracer("everabot.cli")
-    with tracer.start_as_current_span("cli.self_improve"):
-        from bot.workflows import self_improve as wf
+    from bot.workflows import self_improve as wf
 
-        code = wf.run()
-        print(
-            "[cyan]self-improve[/cyan] ran A/B optimization (chunker). Results saved under snapshots/selfopt."
-        )
-    force_flush()
-    raise typer.Exit(code=code)
+    def once() -> int:
+        with tracer.start_as_current_span("cli.self_improve"):
+            code = wf.run()
+            print("[cyan]self-improve[/cyan] A/B + autocode completed; artifacts under snapshots/selfopt.")
+        force_flush()
+        return code
+
+    if not loop:
+        raise typer.Exit(code=once())
+
+    try:
+        while True:
+            code = once()
+            time.sleep(max(1, int(every)))
+    except KeyboardInterrupt:
+        print("\n[dim]Exiting loop.[/dim]")
+        raise typer.Exit(code=0)
 
 
 @app.command()
