@@ -1,9 +1,7 @@
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-from .types import Skill, TopicCfg  # whatever you already import today
-from bot.rules.loader import load_all
-import json, pathlib, re
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+import json, re
 from bot.rules.loader import load_all
 from bot.paths import get_project_root
 
@@ -15,7 +13,6 @@ def _slug(s: str) -> str:
 
 @dataclass
 class Skill:
-    topic: str
     id: str
     title: str
     est_gain: float
@@ -23,18 +20,25 @@ class Skill:
     time_min: int
     cpu_pct_est: int
     ram_mb_est: int
+    notes: Optional[str] = None
+    topic: Optional[str] = None  # filled from parent topic
 
 @dataclass
 class TopicCfg:
+    id: str                   # slug/id
     name: str
     safety_level: str
     default_strategies: List[str]
-    skills: List[Skill]
+    notes: Optional[str] = None
+    skills: List[Skill] = field(default_factory=list)
 
 def _load_progress() -> dict:
-    if not _PROGRESS.exists(): return {"done": []}
-    try: return json.loads(_PROGRESS.read_text(encoding="utf-8"))
-    except Exception: return {"done": []}
+    if not _PROGRESS.exists():
+        return {"done": []}
+    try:
+        return json.loads(_PROGRESS.read_text(encoding="utf-8"))
+    except Exception:
+        return {"done": []}
 
 def _save_progress(p: dict) -> None:
     _PROGRESS.parent.mkdir(parents=True, exist_ok=True)
@@ -53,10 +57,10 @@ def is_done(topic: str, skill_id: str) -> bool:
     return token in p.get("done", [])
 
 def load_registry() -> Dict[str, TopicCfg]:
-    cfg = load_all().get("topics", {})
+    cfg = load_all().get("topics", {}) or {}
     raw = cfg.get("topics") or {}
 
-    # Normalize: support both dict (legacy) and list (new)
+    # Support both dict (legacy) and list (new)
     if isinstance(raw, list):
         topics_iter = [(t.get("id") or t.get("name"), t) for t in raw]
     elif isinstance(raw, dict):
@@ -68,11 +72,13 @@ def load_registry() -> Dict[str, TopicCfg]:
     for tname, tcfg in topics_iter:
         if not tname or not isinstance(tcfg, dict):
             continue
-        skills_raw = (tcfg.get("skills") or [])
+        tid = tcfg.get("id") or tcfg.get("name") or tname
+        slug = _slug(tid)
+        name = tcfg.get("name", tid)
+        skills_raw = tcfg.get("skills") or []
         skills: List[Skill] = []
         for s in skills_raw:
-            # Be permissive with missing fields
-            skills.append(Skill(
+            sk = Skill(
                 id=s["id"],
                 title=s.get("title", s["id"]),
                 est_gain=float(s.get("est_gain", 0.0)),
@@ -80,14 +86,16 @@ def load_registry() -> Dict[str, TopicCfg]:
                 time_min=int(s.get("time_min", 0)),
                 cpu_pct_est=int(s.get("cpu_pct_est", 0)),
                 ram_mb_est=int(s.get("ram_mb_est", 0)),
-                notes=s.get("notes", None),
-            ))
-        out[tname] = TopicCfg(
-            id=tcfg.get("id", tname),
-            name=tcfg.get("name", tname),
+                notes=s.get("notes"),
+                topic=slug,
+            )
+            skills.append(sk)
+        out[slug] = TopicCfg(
+            id=slug,
+            name=name,
             safety_level=tcfg.get("safety_level", "low"),
             default_strategies=list(tcfg.get("default_strategies", [])),
-            notes=tcfg.get("notes", None),
+            notes=tcfg.get("notes"),
             skills=skills,
         )
     return out
@@ -97,7 +105,8 @@ def list_candidates() -> List[Skill]:
     out: List[Skill] = []
     for t in reg.values():
         for s in t.skills:
-            if not is_done(t.name, s.id):
+            # Track progress by topic id (slug), not display name
+            if not is_done(t.id, s.id):
                 out.append(s)
     return out
 
