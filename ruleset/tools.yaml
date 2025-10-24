@@ -121,6 +121,17 @@ net:
     - youtube.com
     - youtu.be
 
+    - www.valgrind.org
+    - valgrind.org
+    - www.brendangregg.com
+    - brendangregg.com
+    - cs61.seas.harvard.edu
+    - itanium-cxx-abi.github.io
+    - portal.brain-map.org
+    - www.investopedia.com
+    - investopedia.com
+    - gitlab.com
+
 file_ops:
   write_whitelist: ["snapshots"]
   write_blacklist: ["ruleset", "test"]
