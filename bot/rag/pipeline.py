@@ -16,7 +16,15 @@ def ingest(urls: List[str], out_dir: pathlib.Path) -> dict:
         try:
             title, text = fetch(u)
         except PermissionError as e:
-            # log and continue
+            # disallowed host → log & continue
+            print(f"[skip] {u} → {e}")
+            continue
+        except requests.exceptions.RequestException as e:
+            # network issues (timeouts, DNS, etc.) → log & continue
+            print(f"[net] {u} → {e.__class__.__name__}: {e}")
+            continue
+        except Exception as e:
+            # Parse/other unexpected errors → log & continue
             print(f"[skip] {u} → {e}")
             continue
         did = sha256_str(u)
