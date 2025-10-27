@@ -132,43 +132,40 @@ def run() -> int:
         # --- 3) Auto-refactor & code improvement (guarded + gated), multiple attempts
         attempts = 3
         for i in range(attempts):
+        # Try a few autocoder attempts; never crash if none apply
+        attempts = 3
+        ok2 = True  # default: no patch applied → baseline stays valid
+        for i in range(attempts):
             auto_result: AutoCodeResult | None = None
             try:
-                auto_result = propose_and_apply_refactor(max_files=5, retries=2)
+                auto_result = propose_and_apply_refactor(max_files=3)
             except Exception as e:
-                print(f"[yellow]autocoder attempt {i+1} skipped[/yellow]: {e}")
+                print(f"[yellow]autocoder skipped[/yellow]: {e}")
+                break
+
+            if not auto_result:
+                print("[dim]autocoder produced no output.[/dim]")
+                break
+
+            if not auto_result.patch_applied:
+                print(f"[dim]autocoder attempt {i+1} produced no applicable patch ({auto_result.note}).[/dim]")
                 continue
 
-            if not (auto_result and auto_result.patch_applied):
-                print(f"[dim]autocoder attempt {i+1} produced no applicable patch ({getattr(auto_result,'note','n/a')}).[/dim]")
-                continue
-
-            # New branch per successful apply (clean PR)
-            branch = _git_safe_branch("selfopt/autocode")
-
+            # Patch applied → re-run root eval and gate adoption
             print("[cyan]autocoder[/cyan] → patch applied; running root eval...")
             root2 = run_all()
             ok2 = bool(root2.get("overall") in ("PASS", "OK"))
             print(f"[cyan]autocoder[/cyan] root eval: {root2.get('overall')}")
 
             if ok2:
-                # Optional language compile checks for touched files
-                comp = _lang_compile_checks(auto_result.touched_paths)
-                note_path = pathlib.Path(auto_result.artifacts_dir) / "compile_checks.json"
-                note_path.write_text(json.dumps(comp, indent=2), encoding="utf-8")
-
-                # Include artifacts + patch in commit
-                commit_paths = [str(p) for p in auto_result.touched_paths] + [auto_result.patch_path, str(note_path)]
-                pr_md = pathlib.Path(auto_result.artifacts_dir) / "PR.md"
-                if pr_md.exists():
-                    commit_paths.append(str(pr_md))
                 _git_safe_commit(
-                    f"selfopt: autocode ({branch}) — tests PASS",
-                    commit_paths
+                    f"selfopt: autocode patch '{auto_result.title}' (tests PASS)",
+                    [str(p) for p in auto_result.touched_paths] + [auto_result.patch_path]
                 )
-                break  # stop after first successful, tested patch
+                break  # success; no further attempts this cycle
             else:
                 print("[red]autocoder change failed tests; reverting[/red]")
                 _git_safe_revert()
+                # keep artifacts for inspection; try another attempt
 
-        return 0 if (ok_root and ok2) else 1
+        return 0 if ok_root else 1
