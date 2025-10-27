@@ -138,13 +138,26 @@ def learn(
     from bot.curriculum.priority import select_next
     def _resolve_topic():
         if pick_auto:
-            recent = set(_recent_topics(5))
-            try:
-                # prefer an overload that supports exclusion if present
-                plan = select_next(None, exclude=recent)  # type: ignore[arg-type]
-            except TypeError:
-                # fallback: plain select_next (may repeat); rotation comes from evaluator scoring
-                plan = select_next(None)
+            # Merge persistent + in-memory recent topics for cooldown
+            recent_hist = set(_recent_topics(5))
+            recent_now  = set(_recent)
+            cooldown = recent_hist | recent_now
+
+            plan = None
+            # Try a few times to avoid repeats if priority.select_next ignores 'exclude'
+            for _tries in range(4):
+                try:
+                    plan = select_next(None, exclude=cooldown)  # type: ignore[arg-type]
+                except TypeError:
+                    # Older priority implementation without 'exclude' — fall back
+                    plan = select_next(None)
+                if not plan:
+                    break
+                if plan.slug not in cooldown:
+                    break
+                # If we kept getting the same one, add it to cooldown and try again.
+                cooldown.add(plan.slug)
+
             if not plan:
                 print("[yellow]No eligible skills under current limits.[/yellow]")
                 return None
@@ -226,12 +239,22 @@ def learn(
         force_flush()
         raise typer.Exit(code=code)
 
-    backoff = 30
+    # Loop delay (seconds), configurable via env
+    try:
+        backoff = int(os.getenv("EVERABOT_LEARN_LOOP_DELAY", "30"))
+    except Exception:
+        backoff = 30
     try:
         while True:
             code = once()
             force_flush()
-            time.sleep(backoff)
+            # Heartbeat so it doesn't look hung
+            try:
+                nxt = time.strftime("%H:%M:%S", time.localtime(time.time() + backoff))
+                print(f"[dim]sleeping {backoff}s — next run at {nxt}[/dim]")
+            except Exception:
+                pass
+            time.sleep(max(1, backoff))
     except KeyboardInterrupt:
         print("\n[dim]Exiting loop.[/dim]")
         raise typer.Exit(code=0)
