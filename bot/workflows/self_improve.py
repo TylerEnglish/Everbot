@@ -23,6 +23,16 @@ def _git_safe_revert() -> None:
     except Exception:
         pass
 
+def _git_safe_branch(prefix: str) -> str:
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    name = f"{prefix}/{ts}"
+    try:
+        subprocess.check_call(["git", "checkout", "-b", name])
+    except Exception:
+        # ignore if not a git repo or branch exists
+        pass
+    return name
+
 def _write_note(p: pathlib.Path, payload: dict) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -34,6 +44,35 @@ def _record_adopted_engine(engine: str) -> None:
     m = _adopted_engine_marker()
     m.parent.mkdir(parents=True, exist_ok=True)
     m.write_text(engine.strip(), encoding="utf-8")
+
+def _lang_compile_checks(touched: list[str]) -> list[dict]:
+    """
+    Run cheap, best-effort builds for accel targets when relevant files changed.
+    Never fails the run; returns a list of results for logging.
+    """
+    root = get_project_root()
+    exts = {pathlib.Path(p).suffix.lower() for p in touched}
+    results: list[dict] = []
+    def _run(cmd: list[str], cwd: pathlib.Path | None = None) -> tuple[int,str,str]:
+        try:
+            p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False)
+            return p.returncode, p.stdout[-4000:], p.stderr[-4000:]
+        except Exception as e:
+            return 127, "", str(e)
+    # C/C++ -> try building the cpp accelerator if present
+    if any(x in exts for x in (".c",".cc",".cpp",".h",".hpp")) and (root/"bot/accel/cpp").exists():
+        rc,out,err = _run([sys.executable,"-m","bot.cli","opt","build-accel","--target","chunk-cpp"], cwd=root)
+        results.append({"target":"cpp","rc":rc,"out":out,"err":err})
+    # Rust
+    if ".rs" in exts and (root/"bot/accel/rust").exists():
+        rc,out,err = _run([sys.executable,"-m","bot.cli","opt","build-accel","--target","chunk-rust"], cwd=root)
+        results.append({"target":"rust","rc":rc,"out":out,"err":err})
+    # Go (best effort; only if a go module is present)
+    if ".go" in exts and (root/"bot/accel/go").exists():
+        rc,out,err = _run(["go","build","./..."], cwd=root/"bot/accel/go")
+        results.append({"target":"go","rc":rc,"out":out,"err":err})
+    # ASM: no generic build step here
+    return results
 
 def run() -> int:
     """
@@ -90,38 +129,46 @@ def run() -> int:
                 [str(pref), str(out), str(_adopted_engine_marker())]
             )
 
-        # --- 3) Auto-refactor & code improvement (guarded + gated)
-        auto_result: AutoCodeResult | None = None
-        try:
-            auto_result = propose_and_apply_refactor(max_files=3, retries=2)
-        except Exception as e:
-            print(f"[yellow]autocoder crashed[/yellow]: {e}")
+        # --- 3) Auto-refactor & code improvement (guarded + gated), multiple attempts
+        attempts = 3
+        for i in range(attempts):
+            auto_result: AutoCodeResult | None = None
+            try:
+                auto_result = propose_and_apply_refactor(max_files=5, retries=2)
+            except Exception as e:
+                print(f"[yellow]autocoder attempt {i+1} skipped[/yellow]: {e}")
+                continue
 
-        if not auto_result:
-            print("[dim]autocoder[/dim]: skipped (no LLM or no hotspots)")
-            return 0 if ok_root else 1
+            if not (auto_result and auto_result.patch_applied):
+                print(f"[dim]autocoder attempt {i+1} produced no applicable patch ({getattr(auto_result,'note','n/a')}).[/dim]")
+                continue
 
-        # Always report what happened and where artifacts live
-        print(f"[cyan]autocoder[/cyan]: {auto_result.note}")
-        print(f"[dim]artifacts:[/dim] {auto_result.artifacts_dir}")
+            # New branch per successful apply (clean PR)
+            branch = _git_safe_branch("selfopt/autocode")
 
-        if not auto_result.patch_applied:
-            # Nothing applied; we still keep artifacts for inspection
-            return 0 if ok_root else 1
+            print("[cyan]autocoder[/cyan] → patch applied; running root eval...")
+            root2 = run_all()
+            ok2 = bool(root2.get("overall") in ("PASS", "OK"))
+            print(f"[cyan]autocoder[/cyan] root eval: {root2.get('overall')}")
 
-        # re-run root eval after code change
-        print("[cyan]autocoder[/cyan] → patch applied; running root eval...")
-        root2 = run_all()
-        ok2 = bool(root2.get("overall") in ("PASS", "OK"))
-        print(f"[cyan]autocoder[/cyan] root eval: {root2.get('overall')}")
+            if ok2:
+                # Optional language compile checks for touched files
+                comp = _lang_compile_checks(auto_result.touched_paths)
+                note_path = pathlib.Path(auto_result.artifacts_dir) / "compile_checks.json"
+                note_path.write_text(json.dumps(comp, indent=2), encoding="utf-8")
 
-        if ok2:
-            _git_safe_commit(
-                f"selfopt: autocode patch '{auto_result.title}' (tests PASS)",
-                [str(p) for p in auto_result.touched_paths if p] + [auto_result.patch_path]
-            )
-        else:
-            print("[red]autocoder change failed tests; reverting[/red]")
-            _git_safe_revert()
+                # Include artifacts + patch in commit
+                commit_paths = [str(p) for p in auto_result.touched_paths] + [auto_result.patch_path, str(note_path)]
+                pr_md = pathlib.Path(auto_result.artifacts_dir) / "PR.md"
+                if pr_md.exists():
+                    commit_paths.append(str(pr_md))
+                _git_safe_commit(
+                    f"selfopt: autocode ({branch}) — tests PASS",
+                    commit_paths
+                )
+                break  # stop after first successful, tested patch
+            else:
+                print("[red]autocoder change failed tests; reverting[/red]")
+                _git_safe_revert()
 
         return 0 if (ok_root and ok2) else 1
