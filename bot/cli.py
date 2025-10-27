@@ -128,8 +128,10 @@ def learn(
     strategy: str = typer.Option("ace", help="Strategy override"),
     auto: bool = typer.Option(False, "--auto", help="Pick topic automatically"),
     loop: bool = typer.Option(False, "--loop", help="Run continuous learn cycles until stopped"),
-    autopromote: bool = typer.Option(False, "--autopromote", help="After each learn, rebuild v2 from canon v1, prove equivalence, and flip pointer on pass")
-):
+    autopromote: bool = typer.Option(False, "--autopromote", help="After each learn, rebuild v2 from canon v1, prove equivalence, and flip pointer on pass"),
+    force_migrate: bool = typer.Option(False, "--force-migrate", help="Always run canary migrate/flip regardless of current v1≡v2"),
+    rechunk_on_adopt: bool = typer.Option(True, "--rechunk-on-adopt/--no-rechunk-on-adopt", help="If a new chunk engine was adopted, force v2 rebuild with that engine")
+ ):
     tracer = get_tracer("everabot.cli")
     pick_auto = auto or (topic.strip().lower() == "auto")
     _recent: list[str] = []
@@ -181,6 +183,8 @@ def learn(
         # 1) learn
         with tracer.start_as_current_span("cli.learn", attributes={"topic": chosen}):
             from bot.workflows import learn as wf
+            # Encourage a fresh training/eval run (downstream should respect this env if supported)
+            os.environ["EVERABOT_FRESH_RUN"] = "1"
             code = wf.run(chosen, strategy=strategy)
             print(f"[cyan]learn[/cyan] → {chosen} [dim](snapshot created under snapshots/runs)[/dim]")
             if pick_auto:
@@ -200,6 +204,12 @@ def learn(
         from bot.workflows import self_improve as wsi
         wsi.run()
 
+        # 3.5) Post-patch eval in a *fresh interpreter* so tests see the new code
+        try:
+            subprocess.run([sys.executable, "-m", "bot.cli", "eval"], check=False)
+        except Exception:
+            pass
+
         # 4) canary migrate (optional) — if a new engine was adopted, rechunk with that engine
         if autopromote:
             adopted_engine_file = _ROOT / "snapshots" / "selfopt" / "ADOPTED_ENGINE.txt"
@@ -212,26 +222,32 @@ def learn(
                 except Exception:
                     engine_arg = None
 
-            # If v1 and v2 already equivalent, skip heavy migrate/flip to save time.
-            res = subprocess.run(
-                [sys.executable, "-m", "bot.cli", "rag", "prove-equivalence", "v1", "v2"],
-                capture_output=True, text=True, check=False
-            )
-            eq = False
-            try:
-                j = json.loads(res.stdout.strip())
-                eq = bool(j.get("bitwise") and j.get("topk"))
-            except Exception:
-                pass
-            if eq:
-                print("[dim]RAG v1 ≡ v2 (bitwise+top-k). Skipping canary migrate/flip.[/dim]")
-            else:
+            force_rechunk = bool(engine_arg) if rechunk_on_adopt else False
+
+            if force_migrate or force_rechunk:
                 print("[cyan]Canary migrate[/cyan] — rebuilding v2 from canon docs...")
                 cmd = [sys.executable, "-m", "bot.cli", "rag", "canary-migrate", "--from", "v1", "--to", "v2"]
-                if engine_arg:
-                    cmd += ["--engine", engine_arg]  # forces rechunk with adopted engine
+                if force_rechunk and engine_arg:
+                    cmd += ["--engine", engine_arg]
                 subprocess.run(cmd, check=False)
-
+            else:
+                # If v1 and v2 already equivalent, skip heavy migrate/flip to save time.
+                res = subprocess.run(
+                    [sys.executable, "-m", "bot.cli", "rag", "prove-equivalence", "v1", "v2"],
+                    capture_output=True, text=True, check=False
+                )
+                eq = False
+                try:
+                    j = json.loads(res.stdout.strip())
+                    eq = bool(j.get("bitwise") and j.get("topk"))
+                except Exception:
+                    pass
+                if eq:
+                    print("[dim]RAG v1 ≡ v2 (bitwise+top-k). Skipping canary migrate/flip.[/dim]")
+                else:
+                    print("[cyan]Canary migrate[/cyan] — rebuilding v2 from canon docs...")
+                    cmd = [sys.executable, "-m", "bot.cli", "rag", "canary-migrate", "--from", "v1", "--to", "v2"]
+                    subprocess.run(cmd, check=False)
         return code
 
     if not loop:
