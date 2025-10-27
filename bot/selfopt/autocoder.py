@@ -20,6 +20,8 @@ class AutoCodeResult:
 # ---------------- internals ----------------
 
 _ALLOWED_DIFF_PREFIXES = ("diff --git", "index ", "--- ", "+++ ", "@@ ")
+_CODE_GLOBS = ("*.py","*.rs","*.go","*.c","*.cc","*.cpp","*.h","*.hpp","*.s","*.asm")
+_EXCLUDE_DIRS = {"test","ruleset","snapshots","accel/rust/target","accel/cpp/build",".git","dist","build",".venv","venv","node_modules"}
 
 def _llm_ok() -> bool:
     try:
@@ -28,22 +30,23 @@ def _llm_ok() -> bool:
     except NotConfigured:
         return False
 
-def _scan_hotspots(root: pathlib.Path, max_files: int = 3) -> List[pathlib.Path]:
+def _scan_hotspots(root: pathlib.Path, max_files: int = 5) -> List[pathlib.Path]:
     """
-    Ultra-light heuristic: prefer longer files with TODO markers; skip noisy/guarded dirs.
+    Prefer longer files and those with TODO/FIXME; scan common languages; skip noisy/guarded dirs.
     """
-    bot_dir = root / "bot"
+    repo_dir = root / "bot"
     files: list[tuple[int, int, pathlib.Path]] = []
-    for p in bot_dir.rglob("*.py"):
-        parts = set(p.parts)
-        if "test" in parts or "ruleset" in parts or "snapshots" in parts or "accel" in parts:
-            continue
+    for pat in _CODE_GLOBS:
+        for p in repo_dir.rglob(pat):
+            parts = {"/".join(p.parts[i:i+2]) for i in range(len(p.parts)-1)} | set(p.parts)
+            if any(x in _EXCLUDE_DIRS for x in parts):
+                continue
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
         length = text.count("\n")
-        todos = text.count("TODO") + text.count("FIXME")
+        todos = text.upper().count("TODO") + text.upper().count("FIXME")
         score = 3 * todos + length
         files.append((score, length, p))
     files.sort(reverse=True)
@@ -52,14 +55,14 @@ def _scan_hotspots(root: pathlib.Path, max_files: int = 3) -> List[pathlib.Path]
 def _build_prompt(file_paths: List[pathlib.Path]) -> str:
     header = (
         "You are Everabot's internal code refactorer.\n"
-        "Goal: small, safe improvements (docstrings, type hints, clearer names, micro-optimizations, "
-        "better error handling) that maintain behavior. You MAY add new helper modules if justified.\n"
+        "Goals: safe improvements (docstrings, type hints, clearer names, micro-opts, better errors) "
+        "without changing behavior. Multi-language is OK (Python/C/C++/Rust/Go/ASM) if helpful.\n"
         "Constraints:\n"
         " - Only modify files under 'bot/'.\n"
         " - Do NOT touch 'ruleset/' or 'test/'.\n"
-        " - Output ONE unified diff across all changes. Use paths relative to repo root (e.g., 'bot/xxx.py').\n"
-        " - No commentary, ONLY the diff.\n"
-        " - Keep changes focused; prefer 20–150 lines of diff total.\n\n"
+        " - Output ONE unified diff across ALL changes. Paths relative to repo root (e.g., 'bot/…').\n"
+        " - No commentary; ONLY the diff.\n"
+        " - Keep changes focused; ~20-150 lines of diff total.\n\n"
     )
     context = []
     for p in file_paths:
@@ -169,16 +172,28 @@ def _touch_list_from_diff(diff_text: str) -> List[str]:
                 touched.append(path)
     return touched
 
+def _generate_pr_md(diff_text: str) -> str:
+    prompt = (
+        "Write a crisp PR title and summary for the following unified diff. "
+        "Keep it factual and short. Include a one-line title, a short bullet list of changes, "
+        "risks, and a minimal test plan.\n\nDIFF:\n" + diff_text
+    )
+    try:
+        return ask(prompt, max_tokens=400, temperature=0.2)
+    except Exception:
+        return "Autocode PR\n\n- Changes: refactors & cleanup\n- Risks: low\n- Test plan: root eval + basic builds"
+
 # ---------------- public API ----------------
 
-def propose_and_apply_refactor(max_files: int = 3, retries: int = 2) -> Optional[AutoCodeResult]:
+def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional[AutoCodeResult]:
     """
     1) Pick hotspot files under bot/
-    2) Ask the LLM for a single unified diff (retry with a 'convert to diff' repair prompt if needed)
+    2) Ask the LLM for a single unified diff (retry with a repair prompt if needed)
     3) Save prompt/raw/diff under snapshots/selfopt/autocode/<ts>/
-    4) Try to git-apply with fallbacks (CRLF, whitespace, reject)
-    5) Return result so the workflow can gate adoption behind tests/evals
-    """
+    4) Try to git-apply with fallbacks
+    5) Save PR.md with title/summary derived from diff
+    6) Return result (caller gates adoption behind tests/evals)
+     """
     if not _llm_ok():
         return None
 
@@ -190,13 +205,11 @@ def propose_and_apply_refactor(max_files: int = 3, retries: int = 2) -> Optional
     prompt = _build_prompt(hotspots)
     raw = ask(prompt, max_tokens=2500, temperature=0.2)
 
-    diff = _sanitize_to_diff(raw)
-    attempt = 0
-
-    # repair pass if not a valid diff-looking output
     def looks_like_diff(d: str) -> bool:
         return ("+++ " in d and "--- " in d and "@@ " in d)
 
+    diff = _sanitize_to_diff(raw)
+    attempt = 0
     while not looks_like_diff(diff) and attempt < retries:
         attempt += 1
         repair_prompt = (
@@ -210,24 +223,31 @@ def propose_and_apply_refactor(max_files: int = 3, retries: int = 2) -> Optional
         raw2 = ask(repair_prompt, max_tokens=2000, temperature=0.0)
         diff = _sanitize_to_diff(raw2)
         if diff.strip():
-            raw = raw2  # keep latest raw
+            raw = raw2
 
-    # write artifacts (always)
     art_dir, diff_path, raw_path = _write_artifacts(prompt, raw, diff)
-    touched = _touch_list_from_diff(diff) if diff else []
+    touched = _touch_list_from_diff(diff) if looks_like_diff(diff) else []
 
     if not looks_like_diff(diff):
         return AutoCodeResult(
             title="autocode-refactor",
-            patch_path=str(raw_path),       # no diff; point at raw so you can inspect
+            patch_path=str(raw_path),
             patch_applied=False,
             touched_paths=[],
             artifacts_dir=str(art_dir),
             note="LLM did not produce a valid unified diff",
         )
 
+    # Try to apply
     applied = _git_apply(diff_path)
     note = "patch applied via git apply" if applied else "patch did NOT apply (see .rej files if any)"
+
+    # Generate PR.md alongside artifacts
+    try:
+        pr_text = _generate_pr_md(diff)
+        (pathlib.Path(art_dir) / "PR.md").write_text(pr_text, encoding="utf-8")
+    except Exception:
+        pass
 
     return AutoCodeResult(
         title="autocode-refactor",
