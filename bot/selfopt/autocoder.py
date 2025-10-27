@@ -279,12 +279,18 @@ def _write_artifacts(prompt: str, raw: str, diff: str) -> Tuple[pathlib.Path, pa
     base.mkdir(parents=True, exist_ok=True)
     (base / "prompt.txt").write_text(prompt, encoding="utf-8")
     (base / "raw.txt").write_text(raw, encoding="utf-8")
+    # Always write a patch file so you can inspect what the sanitizer produced.
     diff_path = base / "patch.diff"
-    if diff:
-        # Ensure trailing newline
-        if not diff.endswith("\n"):
-            diff = diff + "\n"
-        (base / "patch.diff").write_text(diff, encoding="utf-8")
+    out = diff if diff else "# empty (no valid unified diff detected)\n"
+    if out and not out.endswith("\n"):
+        out += "\n"
+    diff_path.write_text(out, encoding="utf-8")
+    # Lightweight debug print (no rich styling here)
+    try:
+        print(f"[autocoder] artifacts -> {base}  (prompt.txt={ (base/'prompt.txt').stat().st_size }B, "
+              f"raw.txt={ (base/'raw.txt').stat().st_size }B, patch.diff={ diff_path.stat().st_size }B)")
+    except Exception:
+        pass
     return base, diff_path, base / "raw.txt"
 
 def _git_apply(patch_path: pathlib.Path) -> bool:
