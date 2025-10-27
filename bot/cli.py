@@ -49,8 +49,7 @@ def _recent_topics(n: int = 5) -> list[str]:
         return []
     lines = _HIST_FILE.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-n:]
     return [json.loads(x).get("topic") for x in lines if x.strip()]
-
-
+    
 def _copy_schema_registry(dst: pathlib.Path) -> None:
     root = get_project_root()
     src = root / "ruleset" / "schemas"
