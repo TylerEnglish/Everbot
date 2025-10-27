@@ -21,7 +21,11 @@ class AutoCodeResult:
 
 _ALLOWED_DIFF_PREFIXES = ("diff --git", "index ", "--- ", "+++ ", "@@ ")
 _CODE_GLOBS = ("*.py","*.rs","*.go","*.c","*.cc","*.cpp","*.h","*.hpp","*.s","*.asm")
-_EXCLUDE_DIRS = {"test","ruleset","snapshots","accel/rust/target","accel/cpp/build",".git","dist","build",".venv","venv","node_modules"}
+# avoid generated/build/vendor paths entirely
+_EXCLUDE_DIRS = {
+    "test","ruleset","snapshots","accel/rust/target","accel/cpp/build",
+    ".git","dist","build",".venv","venv","node_modules","__pycache__"
+}
 
 def _llm_ok() -> bool:
     try:
@@ -59,6 +63,7 @@ def _build_prompt(file_paths: List[pathlib.Path]) -> str:
         "without changing behavior. Multi-language is OK (Python/C/C++/Rust/Go/ASM) if helpful.\n"
         "Constraints:\n"
         " - Only modify files under 'bot/'.\n"
+        " - Hard-ban generated/build/vendor paths (target/, build/, dist/, node_modules/, __pycache__/ ...).\n"
         " - Do NOT touch 'ruleset/' or 'test/'.\n"
         " - Output ONE unified diff across ALL changes. Paths relative to repo root (e.g., 'bot/…').\n"
         " - No commentary; ONLY the diff.\n"
@@ -76,6 +81,76 @@ def _build_prompt(file_paths: List[pathlib.Path]) -> str:
 def _strip_code_fences(s: str) -> str:
     # remove ```...``` fences if present
     return re.sub(r"```(?:diff|patch)?\\n|```", "", s, flags=re.IGNORECASE)
+
+def _normalize_diff_git_headers(text: str) -> str:
+    """
+    Ensure 'diff --git' headers use 'a/<path> b/<path>' and align with ---/+++.
+    """
+    out_lines: list[str] = []
+    last_minus: Optional[str] = None
+    last_plus: Optional[str] = None
+    for ln in text.splitlines():
+        if ln.startswith("--- "):
+            path = ln[4:].strip()
+            if not (path.startswith("a/") or path.startswith("/dev/null")):
+                path = "a/" + path
+            ln = f"--- {path}"
+            last_minus = path[2:] if path.startswith("a/") else None
+        elif ln.startswith("+++ "):
+            path = ln[4:].strip()
+            if not (path.startswith("b/") or path.startswith("/dev/null")):
+                path = "b/" + path
+            ln = f"+++ {path}"
+            last_plus = path[2:] if path.startswith("b/") else None
+        elif ln.startswith("diff --git "):
+            # Rewrite to 'diff --git a/X b/X' if needed
+            m = re.match(r"^diff --git\s+(.+?)\s+(.+)$", ln)
+            if m:
+                a, b = m.group(1).strip(), m.group(2).strip()
+                if not a.startswith("a/"):
+                    a = f"a/{a.lstrip('./')}"
+                if not b.startswith("b/"):
+                    b = f"b/{b.lstrip('./')}"
+                ln = f"diff --git {a} {b}"
+            else:
+                # If we have recent ---/+++ hints, synthesize paths
+                if last_minus and last_plus:
+                    ln = f"diff --git a/{last_minus} b/{last_plus}"
+        out_lines.append(ln)
+    return "\n".join(out_lines)
+
+def _filter_diff_files(text: str) -> str:
+    """
+    Keep only file diffs whose path is under 'a/bot/' and 'b/bot/' and not in excluded dirs.
+    """
+    blocks: list[list[str]] = []
+    cur: list[str] = []
+    def _flush():
+        nonlocal cur
+        if cur:
+            blocks.append(cur)
+            cur = []
+    for ln in text.splitlines():
+        if ln.startswith("diff --git "):
+            _flush()
+        cur.append(ln)
+    _flush()
+    kept: list[str] = []
+    for blk in blocks:
+        head = next((x for x in blk if x.startswith("diff --git ")), "")
+        m = re.match(r"^diff --git\s+a/(.+?)\s+b/(.+?)$", head or "")
+        if not m:
+            continue
+        a_path, b_path = m.group(1), m.group(2)
+        # Only keep changes scoped to bot/, and not excluded
+        def bad(p: str) -> bool:
+            parts = p.split("/")
+            pairs = set("/".join(parts[i:i+2]) for i in range(len(parts)-1))
+            return (not p.startswith("bot/")) or any(x in _EXCLUDE_DIRS for x in (set(parts) | pairs))
+        if bad(a_path) or bad(b_path):
+            continue
+        kept.extend(blk)
+    return ("\n".join(kept) + ("\n" if kept else ""))
 
 def _sanitize_to_diff(raw: str) -> str:
     """
@@ -135,6 +210,10 @@ def _sanitize_to_diff(raw: str) -> str:
                     fixed.insert(0, f"diff --git {minus_path} {plus_path}")
         if fixed:
             text = "\n".join(fixed) + "\n" + text
+    # Normalize headers (ensure a/ and b/ on diff --git + ---/+++)
+    text = _normalize_diff_git_headers(text) if text else ""
+    # Drop any file diffs not under bot/ or in excluded dirs
+    text = _filter_diff_files(text) if text else ""
     return (text + "\n") if text else ""
 
 def _write_artifacts(prompt: str, raw: str, diff: str) -> Tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
@@ -169,14 +248,18 @@ def _touch_list_from_diff(diff_text: str) -> List[str]:
             if path.startswith("b/"):
                 path = path[2:]
             if path and not path.startswith("/dev/null"):
-                touched.append(path)
+                if path.startswith("bot/"):
+                    parts = path.split("/")
+                    pairs = set("/".join(parts[i:i+2]) for i in range(len(parts)-1))
+                    if not any(x in _EXCLUDE_DIRS for x in (set(parts) | pairs)):
+                        touched.append(path)
     return touched
 
 def _generate_pr_md(diff_text: str) -> str:
     prompt = (
         "Write a crisp PR title and summary for the following unified diff. "
         "Keep it factual and short. Include a one-line title, a short bullet list of changes, "
-        "risks, and a minimal test plan.\n\nDIFF:\n" + diff_text
+        "risks, and a minimal test plan. Prefer language-agnostic phrasing.\n\nDIFF:\n" + diff_text
     )
     try:
         return ask(prompt, max_tokens=400, temperature=0.2)
