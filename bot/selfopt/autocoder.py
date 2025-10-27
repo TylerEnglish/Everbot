@@ -45,14 +45,14 @@ def _scan_hotspots(root: pathlib.Path, max_files: int = 5) -> List[pathlib.Path]
             parts = {"/".join(p.parts[i:i+2]) for i in range(len(p.parts)-1)} | set(p.parts)
             if any(x in _EXCLUDE_DIRS for x in parts):
                 continue
-        try:
-            text = p.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            continue
-        length = text.count("\n")
-        todos = text.upper().count("TODO") + text.upper().count("FIXME")
-        score = 3 * todos + length
-        files.append((score, length, p))
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            length = text.count("\n")
+            todos = text.upper().count("TODO") + text.upper().count("FIXME")
+            score = 3 * todos + length
+            files.append((score, length, p))
     files.sort(reverse=True)
     return [p for _, __, p in files[:max_files]]
 
@@ -78,9 +78,23 @@ def _build_prompt(file_paths: List[pathlib.Path]) -> str:
             pass
     return header + "\n".join(context)
 
+def _clean_unicode(s: str) -> str:
+    # Normalize line endings, strip BOM, and collapse NBSP to regular spaces.
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = s.replace("\u00A0", " ")
+    if s.startswith("\ufeff"):
+        s = s.lstrip("\ufeff")
+    return s
+
 def _strip_code_fences(s: str) -> str:
-    # remove ```...``` fences if present
-    return re.sub(r"```(?:diff|patch)?\\n|```", "", s, flags=re.IGNORECASE)
+    """
+    Remove ```...``` fences if present. The previous pattern used '\\n' (literal) instead of a newline.
+    """
+    s = _clean_unicode(s)
+    # Remove an opening code fence with optional language and the closing fence
+    s = re.sub(r"```(?:[a-zA-Z0-9_-]+)?\n", "", s)
+    s = re.sub(r"```", "", s)
+    return s
 
 def _normalize_diff_git_headers(text: str) -> str:
     """
@@ -93,17 +107,16 @@ def _normalize_diff_git_headers(text: str) -> str:
         if ln.startswith("--- "):
             path = ln[4:].strip()
             if not (path.startswith("a/") or path.startswith("/dev/null")):
-                path = "a/" + path
+                path = "a/" + path.lstrip("./")
             ln = f"--- {path}"
             last_minus = path[2:] if path.startswith("a/") else None
         elif ln.startswith("+++ "):
             path = ln[4:].strip()
             if not (path.startswith("b/") or path.startswith("/dev/null")):
-                path = "b/" + path
+                path = "b/" + path.lstrip("./")
             ln = f"+++ {path}"
             last_plus = path[2:] if path.startswith("b/") else None
         elif ln.startswith("diff --git "):
-            # Rewrite to 'diff --git a/X b/X' if needed
             m = re.match(r"^diff --git\s+(.+?)\s+(.+)$", ln)
             if m:
                 a, b = m.group(1).strip(), m.group(2).strip()
@@ -113,50 +126,96 @@ def _normalize_diff_git_headers(text: str) -> str:
                     b = f"b/{b.lstrip('./')}"
                 ln = f"diff --git {a} {b}"
             else:
-                # If we have recent ---/+++ hints, synthesize paths
                 if last_minus and last_plus:
                     ln = f"diff --git a/{last_minus} b/{last_plus}"
         out_lines.append(ln)
     return "\n".join(out_lines)
 
-def _filter_diff_files(text: str) -> str:
-    """
-    Keep only file diffs whose path is under 'a/bot/' and 'b/bot/' and not in excluded dirs.
-    """
+def _split_blocks(text: str) -> list[list[str]]:
+    """Split a normalized diff into file blocks starting at 'diff --git'."""
     blocks: list[list[str]] = []
     cur: list[str] = []
-    def _flush():
-        nonlocal cur
-        if cur:
-            blocks.append(cur)
-            cur = []
     for ln in text.splitlines():
         if ln.startswith("diff --git "):
-            _flush()
-        cur.append(ln)
-    _flush()
-    kept: list[str] = []
-    for blk in blocks:
-        head = next((x for x in blk if x.startswith("diff --git ")), "")
-        m = re.match(r"^diff --git\s+a/(.+?)\s+b/(.+?)$", head or "")
-        if not m:
+            if cur:
+                blocks.append(cur)
+            cur = [ln]
+        else:
+            cur.append(ln)
+    if cur:
+        blocks.append(cur)
+    return blocks
+
+def _is_excluded_path(p: str) -> bool:
+    parts = p.split("/")
+    pairs = set("/".join(parts[i:i+2]) for i in range(len(parts)-1))
+    return (not p.startswith("bot/")) or any(x in _EXCLUDE_DIRS for x in (set(parts) | pairs))
+
+def _rebuild_block(blk: list[str]) -> Optional[str]:
+    """
+    Rebuild a single file diff block into a canonical minimal diff:
+    diff --git a/X b/X
+    --- a/X
+    +++ b/X
+    @@ hunk
+    (hunk body)
+    """
+    head = next((x for x in blk if x.startswith("diff --git ")), None)
+    if not head:
+        return None
+    m = re.match(r"^diff --git\s+a/(.+?)\s+b/(.+?)$", head.strip())
+    if not m:
+        return None
+    a_path, b_path = m.group(1), m.group(2)
+    if _is_excluded_path(a_path) or _is_excluded_path(b_path):
+        return None
+
+    # Collect hunks and body
+    lines: list[str] = []
+    have_hunk = False
+    in_hunk = False
+    for ln in blk:
+        if ln.startswith("@@ "):
+            lines.append(ln)
+            have_hunk = True
+            in_hunk = True
             continue
-        a_path, b_path = m.group(1), m.group(2)
-        # Only keep changes scoped to bot/, and not excluded
-        def bad(p: str) -> bool:
-            parts = p.split("/")
-            pairs = set("/".join(parts[i:i+2]) for i in range(len(parts)-1))
-            return (not p.startswith("bot/")) or any(x in _EXCLUDE_DIRS for x in (set(parts) | pairs))
-        if bad(a_path) or bad(b_path):
-            continue
-        kept.extend(blk)
-    return ("\n".join(kept) + ("\n" if kept else ""))
+        if in_hunk:
+            if ln.startswith((" ", "+", "-")):
+                lines.append(ln)
+            else:
+                in_hunk = False
+
+    if not have_hunk:
+        return None
+
+    rebuilt = []
+    rebuilt.append(f"diff --git a/{a_path} b/{b_path}")
+    rebuilt.append(f"--- a/{a_path}")
+    rebuilt.append(f"+++ b/{b_path}")
+    rebuilt.extend(lines)
+    return "\n".join(rebuilt)
+
+def _canonicalize_blocks(text: str) -> str:
+    """
+    Keep only valid file blocks under bot/ and rebuild them into a
+    canonical Git-style unified diff (ordering & headers fixed).
+    """
+    out: list[str] = []
+    for blk in _split_blocks(text):
+        rebuilt = _rebuild_block(blk)
+        if rebuilt:
+            out.append(rebuilt)
+    return ("\n".join(out) + ("\n" if out else ""))
 
 def _sanitize_to_diff(raw: str) -> str:
     """
-    Keep only diff-looking lines and valid hunk bodies; fix a/b prefixes if missing.
+    Keep only diff-looking lines and valid hunk bodies; fix a/b prefixes if missing;
+    then canonicalize into minimal per-file diffs.
     """
-    raw = _strip_code_fences(raw).replace("\r\n", "\n")
+    raw = _strip_code_fences(raw)
+    raw = _clean_unicode(raw)
+
     lines = raw.splitlines()
     out: list[str] = []
     in_hunk = False
@@ -166,11 +225,11 @@ def _sanitize_to_diff(raw: str) -> str:
         if line.startswith("--- "):
             path = line[4:].strip()
             if not (path.startswith("a/") or path.startswith("/dev/null")):
-                return "--- a/" + path
+                return "--- a/" + path.lstrip("./")
         if line.startswith("+++ "):
             path = line[4:].strip()
             if not (path.startswith("b/") or path.startswith("/dev/null")):
-                return "+++ b/" + path
+                return "+++ b/" + path.lstrip("./")
         return line
 
     for ln in lines:
@@ -178,7 +237,8 @@ def _sanitize_to_diff(raw: str) -> str:
             if ln.startswith("--- ") or ln.startswith("+++ "):
                 ln = _ensure_ab(ln)
             out.append(ln)
-            in_hunk = ln.startswith("@@ ") or in_hunk
+            if ln.startswith("@@ "):
+                in_hunk = True
             continue
 
         if in_hunk:
@@ -189,11 +249,10 @@ def _sanitize_to_diff(raw: str) -> str:
             else:
                 in_hunk = False
 
-    # If we have +++/--- but no diff --git headers, synthesize minimal headers per file.
-    # This helps git apply on simple single-file patches the LLM produces.
     text = "\n".join(out).strip()
+
+    # If we have +++/--- but no diff --git headers, synthesize minimal headers per file.
     if text and "diff --git " not in text:
-        # try to detect current file
         cur: List[str] = []
         fixed: List[str] = []
         for ln in text.splitlines():
@@ -201,7 +260,6 @@ def _sanitize_to_diff(raw: str) -> str:
             if ln.startswith("+++ "):
                 plus_path = ln[4:].strip()
                 minus_path = None
-                # find a matching --- line before
                 for back in reversed(cur[:-1]):
                     if back.startswith("--- "):
                         minus_path = back[4:].strip()
@@ -210,10 +268,10 @@ def _sanitize_to_diff(raw: str) -> str:
                     fixed.insert(0, f"diff --git {minus_path} {plus_path}")
         if fixed:
             text = "\n".join(fixed) + "\n" + text
-    # Normalize headers (ensure a/ and b/ on diff --git + ---/+++)
+
+    # Normalize headers and canonicalize blocks under bot/
     text = _normalize_diff_git_headers(text) if text else ""
-    # Drop any file diffs not under bot/ or in excluded dirs
-    text = _filter_diff_files(text) if text else ""
+    text = _canonicalize_blocks(text) if text else ""
     return (text + "\n") if text else ""
 
 def _write_artifacts(prompt: str, raw: str, diff: str) -> Tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
@@ -223,13 +281,20 @@ def _write_artifacts(prompt: str, raw: str, diff: str) -> Tuple[pathlib.Path, pa
     (base / "raw.txt").write_text(raw, encoding="utf-8")
     diff_path = base / "patch.diff"
     if diff:
-        diff_path.write_text(diff, encoding="utf-8")
+        # Ensure trailing newline
+        if not diff.endswith("\n"):
+            diff = diff + "\n"
+        (base / "patch.diff").write_text(diff, encoding="utf-8")
     return base, diff_path, base / "raw.txt"
 
 def _git_apply(patch_path: pathlib.Path) -> bool:
+    if not patch_path.exists() or patch_path.stat().st_size == 0:
+        return False
     attempts = [
         ["git", "apply", "--index", "--whitespace=fix", str(patch_path)],
-        ["git", "apply", "--index", "--ignore-whitespace", str(patch_path)],
+        ["git", "apply", "--index", "--recount", "--whitespace=fix", str(patch_path)],
+        ["git", "apply", "--index", "--unidiff-zero", str(patch_path)],
+        ["git", "apply", "--index", "-p0", str(patch_path)],
         ["git", "apply", "--reject", str(patch_path)],
     ]
     for cmd in attempts:
@@ -289,7 +354,7 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
     raw = ask(prompt, max_tokens=2500, temperature=0.2)
 
     def looks_like_diff(d: str) -> bool:
-        return ("+++ " in d and "--- " in d and "@@ " in d)
+        return ("diff --git " in d and "+++ " in d and "--- " in d and "@@ " in d)
 
     diff = _sanitize_to_diff(raw)
     attempt = 0
