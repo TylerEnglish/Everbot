@@ -133,6 +133,8 @@ def learn(
 ):
     tracer = get_tracer("everabot.cli")
     pick_auto = auto or (topic.strip().lower() == "auto")
+    _recent: list[str] = []
+    _recent_cap = 3
 
     from bot.curriculum.priority import select_next
     def _resolve_topic():
@@ -169,6 +171,10 @@ def learn(
             from bot.workflows import learn as wf
             code = wf.run(chosen, strategy=strategy)
             print(f"[cyan]learn[/cyan] → {chosen} [dim](snapshot created under snapshots/runs)[/dim]")
+            if pick_auto:
+                _recent.append(chosen)
+                if len(_recent) > _recent_cap:
+                    _recent.pop(0)
             try:
                 _record_topic(chosen)
             except Exception:
