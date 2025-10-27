@@ -286,6 +286,8 @@ def _write_artifacts(prompt: str, raw: str, diff: str) -> Tuple[pathlib.Path, pa
     # Always write a patch file so you can inspect what the sanitizer (or synthesizer) produced.
     diff_path = base / "patch.diff"
     out = diff if diff else "# empty (no valid unified diff detected)\n"
+    # normalize to LF to avoid CRLF double-terminators confusing git apply on Windows
+    out = out.replace("\r\n", "\n").replace("\r", "\n")
     if out and not out.endswith("\n"):
         out += "\n"
     diff_path.write_text(out, encoding="utf-8")
@@ -303,9 +305,10 @@ def _git_apply(patch_path: pathlib.Path) -> bool:
     attempts = [
         ["git", "apply", "--index", "--whitespace=fix", str(patch_path)],
         ["git", "apply", "--index", "--recount", "--whitespace=fix", str(patch_path)],
-        ["git", "apply", "--index", "--unidiff-zero", str(patch_path)],
-        ["git", "apply", "--index", "-p0", str(patch_path)],
-        ["git", "apply", "--reject", str(patch_path)],
+        ["git", "apply", "--index", "--unidiff-zero", "--whitespace=fix", str(patch_path)],
+        ["git", "apply", "--index", "-p0", "--whitespace=fix", str(patch_path)],
+        ["git", "apply", "--index", "--whitespace=nowarn", str(patch_path)],
+        ["git", "apply", "--reject", "--whitespace=nowarn", str(patch_path)],
     ]
     for cmd in attempts:
         try:
@@ -354,12 +357,18 @@ def _synthesize_python_module_comment_or_docstring(rel_path: str, abs_path: path
     Create a minimal, safe unified diff for a Python module:
       - If there is no module docstring at file top, insert one.
       - Else insert a top-level comment after the docstring.
-    This guarantees a harmless, non-functional change that still passes tests.
+    Normalizes line endings to LF to produce a git-friendly patch on Windows.
     """
     try:
-        original = abs_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        data = abs_path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return ""
+
+    # Normalize to LF for diff stability
+    data = data.replace("\r\n", "\n").replace("\r", "\n")
+    original: List[str] = data.splitlines()  # no keepends
+    if not original:
+        original = [""]
 
     # Find insertion point: after shebang / coding lines
     i = 0
@@ -372,41 +381,43 @@ def _synthesize_python_module_comment_or_docstring(rel_path: str, abs_path: path
 
     # Detect existing docstring at top
     def _is_triple_quote_line(s: str) -> bool:
-        return s.strip().startswith('"""') or s.strip().startswith("'''")
+        s2 = s.lstrip()
+        return s2.startswith('"""') or s2.startswith("'''")
 
-    insert_line = None
+    insert_line: str
     j = i
     if j < len(original) and _is_triple_quote_line(original[j]):
         # Skip past the closing triple-quote
-        quote = '"""' if original[j].strip().startswith('"""') else "'''"
+        quote = '"""' if original[j].lstrip().startswith('"""') else "'''"
         j += 1
         while j < len(original):
             if quote in original[j]:
                 j += 1
                 break
             j += 1
-        insert_line = "# Autocode: non-functional comment.\n"
+        insert_line = "# Autocode: non-functional comment."
         ins_idx = j
     else:
-        insert_line = '"""Autocode: module-level docstring (non-functional)."""\n'
+        insert_line = '"""Autocode: module-level docstring (non-functional)."""'
         ins_idx = i
 
     new_lines = original[:ins_idx] + [insert_line] + original[ins_idx:]
 
-    # Build proper unified diff with headers and hunks
-    diff_body = difflib.unified_diff(
+    # Build proper unified diff with LF endings
+    diff_iter = difflib.unified_diff(
         original,
         new_lines,
         fromfile=f"a/{rel_path}",
         tofile=f"b/{rel_path}",
-        lineterm=""
+        lineterm="\n",
+        n=3,  # default context
     )
-    diff_text = "\n".join(diff_body)
+    diff_text = "".join(diff_iter)
     if not diff_text.strip():
         return ""
 
-    # Prepend diff --git header (git expects it for multi-file diffs; our sanitizer requires it)
-    out = f"diff --git a/{rel_path} b/{rel_path}\n" + diff_text + "\n"
+    # Prepend diff --git header
+    out = f"diff --git a/{rel_path} b/{rel_path}\n" + diff_text
     return out
 
 # ---------------- public API ----------------
@@ -442,7 +453,6 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
     attempt = 0
     while not looks_like_diff(diff) and attempt < max(2, retries):
         attempt += 1
-        # If the model answered with junk, show it and demand a conversion
         repair_prompt = (
             "Convert the following into a VALID unified diff. Rules:\n"
             " - Only output the diff, no commentary or code fences.\n"
