@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Iterable
 import math, json, pathlib, time
 from bot.paths import get_project_root
 from bot.rules.loader import load_all, load_last_promoted
@@ -17,7 +17,13 @@ class Plan:
 
     @property
     def slug(self) -> str:
-        return self.topic.lower().replace(" ", "-")
+        return _slug(self.topic)
+
+
+# ---------------- helpers ----------------
+
+def _slug(s: str) -> str:
+    return (s or "").strip().lower().replace(" ", "-")
 
 
 def _weights_and_caps(promo: dict) -> Tuple[Dict[str, float], Dict[str, float]]:
@@ -45,7 +51,7 @@ def _limits_caps(limits: dict) -> dict:
         "ram_mb": float(limits.get("ram_mb_max", 4096)),
         "cpu_pct": float((limits.get("cpu") or {}).get("percent_max", 85)),
         # soft rotation: consecutive repeat avoidance
-        "cooldown_runs": int(limits.get("curriculum", {}).get("cooldown_runs", 1)),
+        "cooldown_runs": int((limits.get("curriculum") or {}).get("cooldown_runs", 1)),
     }
 
 
@@ -72,6 +78,31 @@ def _latest_run_skill_id() -> Optional[str]:
         return None
 
 
+def _recent_topic_slugs(n: int = 5) -> List[str]:
+    """
+    Reads snapshots/metrics/learn_history.jsonl (if present) and returns the last n topic slugs.
+    Each line is {"ts": <int>, "topic": "<slug or name>"}.
+    """
+    root = get_project_root()
+    hist = root / "snapshots" / "metrics" / "learn_history.jsonl"
+    if not hist.exists():
+        return []
+    try:
+        lines = [x for x in hist.read_text(encoding="utf-8", errors="replace").splitlines() if x.strip()]
+        recent = []
+        for row in lines[-n:]:
+            try:
+                j = json.loads(row)
+                t = j.get("topic")
+                if t:
+                    recent.append(_slug(t))
+            except Exception:
+                continue
+        return recent
+    except Exception:
+        return []
+
+
 def _utility(skill, weights: dict, caps: dict, last: dict | None) -> float:
     # Normalize time/cost pressure into [0,1]
     t_pen = min(1.0, (skill.time_min * 60.0) / max(1.0, caps["time"]))  # utility horizon
@@ -89,37 +120,93 @@ def _utility(skill, weights: dict, caps: dict, last: dict | None) -> float:
             - 0.15 * risk_pen)
 
 
-def select_next(preferred_topic: Optional[str] = None) -> Optional[Plan]:
+# ---------------- selection ----------------
+
+def select_next(
+    preferred_topic: Optional[str] = None,
+    exclude: Optional[Iterable[str]] = None
+) -> Optional[Plan]:
+    """
+    Pick the next skill to practice:
+      • Honors resource/time budgets.
+      • Supports rotation by excluding recently-practiced topics (cooldown).
+      • Accepts an explicit 'exclude' list of topic slugs from the caller.
+      • If preferred_topic is provided, we constrain to it (and relax exclude if that leaves nothing).
+
+    Returns a Plan or None if nothing is eligible.
+    """
     cfg = load_all()
     weights, u_caps = _weights_and_caps(cfg.get("promotion", {}))
     limits_caps = _limits_caps(cfg.get("limits", {}))
     last_promoted = load_last_promoted()
     last_skill_attempted = _latest_run_skill_id()
-    cooldown_runs = limits_caps["cooldown_runs"]
+    cooldown_runs = max(0, int(limits_caps.get("cooldown_runs", 1)))
 
-    skills = [s for s in list_candidates() if _fits_budget(s, {**u_caps, **limits_caps})]
+    # Build an exclude set from caller + recent history (cooldown)
+    exclude_slugs: set[str] = set(_slug(x) for x in (exclude or []))
+    if cooldown_runs > 0:
+        # Pull last N topics from history and add them to the exclusion set
+        for s in _recent_topic_slugs(cooldown_runs):
+            exclude_slugs.add(_slug(s))
+
+    # Candidate pool within budgets
+    caps = {**u_caps, **limits_caps}
+    skills = [s for s in list_candidates() if _fits_budget(s, caps)]
 
     # Optional topic constraint
     if preferred_topic:
-        slug = preferred_topic.lower().replace(" ", "-")
-        skills = [s for s in skills if s.topic.lower().replace(" ", "-") == slug]
-
-    # Soft rotation: avoid immediate repeat of the very last attempted skill
-    if cooldown_runs >= 1 and last_skill_attempted:
-        skills = [s for s in skills if getattr(s, "id", None) != last_skill_attempted] or skills
+        want = _slug(preferred_topic)
+        constrained = [s for s in skills if _slug(s.topic) == want]
+        # If everything is excluded by rotation, relax exclude for the requested topic
+        if not constrained:
+            constrained = [s for s in list_candidates() if _slug(s.topic) == want and _fits_budget(s, caps)]
+        skills = constrained
 
     if not skills:
         return None
 
-    # Maximize utility
-    caps = {**u_caps, **limits_caps}
-    best = max(skills, key=lambda s: _utility(s, weights, caps, last_promoted))
+    # Apply topic-level exclude (rotation) first
+    rotated = [s for s in skills if _slug(s.topic) not in exclude_slugs]
+    if not rotated and not preferred_topic:
+        # If rotation filters out everything, relax the rotation and try again
+        rotated = skills[:]
 
-    strategy = topic_default_strategies(best.topic)[0]
+    # Avoid immediate repeat of the very last attempted *skill id* (finer than topic)
+    if cooldown_runs >= 1 and last_skill_attempted:
+        rotated2 = [s for s in rotated if getattr(s, "id", None) != last_skill_attempted]
+        if rotated2:
+            rotated = rotated2
+
+    if not rotated:
+        return None
+
+    # Maximize utility; tie-break by higher est_gain, then lower time, then lexicographic topic
+    def _score_tuple(s):
+        return (
+            _utility(s, weights, caps, last_promoted),
+            s.est_gain,
+            -float(s.time_min),
+            _slug(s.topic),
+        )
+
+    best = max(rotated, key=_score_tuple)
+
+    # Strategy default for the chosen topic
+    try:
+        strategies = topic_default_strategies(best.topic)
+        strategy = strategies[0] if strategies else "ace"
+    except Exception:
+        strategy = "ace"
+
+    # Reason string mirrors previous CLI messaging, adds a rotation hint
+    rotation_note = ""
+    if exclude_slugs:
+        rotation_note = f"; rotation applied (excluded={sorted(list(exclude_slugs))[:4]}{'…' if len(exclude_slugs) > 4 else ''})"
+
     return Plan(
         topic=best.topic,
         skill_id=best.id,
         skill_title=best.title,
         strategy=strategy,
-        reason=f"max utility under time/CPU/RAM caps (est_gain={best.est_gain:.2f})"
+        reason=f"max utility under time/CPU/RAM caps (est_gain={best.est_gain:.2f}){rotation_note}",
     )
