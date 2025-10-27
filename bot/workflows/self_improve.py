@@ -130,8 +130,6 @@ def run() -> int:
             )
 
         # --- 3) Auto-refactor & code improvement (guarded + gated), multiple attempts
-        attempts = 3
-        for i in range(attempts):
         # Try a few autocoder attempts; never crash if none apply
         attempts = 3
         ok2 = True  # default: no patch applied → baseline stays valid
