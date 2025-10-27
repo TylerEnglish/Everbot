@@ -38,6 +38,17 @@ except Exception:
 ENGINE_CHOICES = ("python", "go", "rust", "cpp")
 
 # ------------- helpers
+# ---- learn rotation helpers ----
+_HIST_FILE = _ROOT / "snapshots" / "metrics" / "learn_history.jsonl"
+def _record_topic(slug: str) -> None:
+    _HIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(_HIST_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": int(time.time()), "topic": slug}) + "\n")
+def _recent_topics(n: int = 5) -> list[str]:
+    if not _HIST_FILE.exists():
+        return []
+    lines = _HIST_FILE.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-n:]
+    return [json.loads(x).get("topic") for x in lines if x.strip()]
 
 
 def _copy_schema_registry(dst: pathlib.Path) -> None:
@@ -126,7 +137,13 @@ def learn(
     from bot.curriculum.priority import select_next
     def _resolve_topic():
         if pick_auto:
-            plan = select_next(None)
+            recent = set(_recent_topics(5))
+            try:
+                # prefer an overload that supports exclusion if present
+                plan = select_next(None, exclude=recent)  # type: ignore[arg-type]
+            except TypeError:
+                # fallback: plain select_next (may repeat); rotation comes from evaluator scoring
+                plan = select_next(None)
             if not plan:
                 print("[yellow]No eligible skills under current limits.[/yellow]")
                 return None
@@ -152,6 +169,10 @@ def learn(
             from bot.workflows import learn as wf
             code = wf.run(chosen, strategy=strategy)
             print(f"[cyan]learn[/cyan] → {chosen} [dim](snapshot created under snapshots/runs)[/dim]")
+            try:
+                _record_topic(chosen)
+            except Exception:
+                pass
 
         # 2) root eval (explicit print for visibility)
         root = run_all()
