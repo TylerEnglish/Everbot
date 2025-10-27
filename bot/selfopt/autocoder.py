@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Iterable
+from typing import List, Optional, Tuple
 import os, sys, pathlib, subprocess, time, json, re, difflib
 
 from bot.paths import get_project_root
@@ -352,21 +352,38 @@ def _pick_first_python(hotspots: List[pathlib.Path]) -> Optional[pathlib.Path]:
             return p
     return None
 
+def _make_unified_diff(rel_path: str, original: List[str], new_lines: List[str]) -> str:
+    """
+    Create a robust unified diff with each output line explicitly newline-terminated.
+    This avoids malformed hunks on Windows (git apply 'corrupt patch' errors).
+    """
+    # difflib sometimes returns hunk lines without line terminators; add them.
+    raw_lines = list(difflib.unified_diff(
+        original,
+        new_lines,
+        fromfile=f"a/{rel_path}",
+        tofile=f"b/{rel_path}",
+        lineterm="",   # emit without line ends; we’ll add '\n' to every line
+        n=3,
+    ))
+    body = "".join((ln if ln.endswith("\n") else (ln + "\n")) for ln in raw_lines)
+    return f"diff --git a/{rel_path} b/{rel_path}\n{body}"
+
 def _synthesize_python_module_comment_or_docstring(rel_path: str, abs_path: pathlib.Path) -> str:
     """
     Create a minimal, safe unified diff for a Python module:
       - If there is no module docstring at file top, insert one.
       - Else insert a top-level comment after the docstring.
-    Normalizes line endings to LF to produce a git-friendly patch on Windows.
+    Normalizes line endings to LF and ensures every hunk line ends with '\n'.
     """
     try:
         data = abs_path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return ""
 
-    # Normalize to LF for diff stability
+    # Normalize to LF; split without keeping ends (we’ll manage line ends in the diff)
     data = data.replace("\r\n", "\n").replace("\r", "\n")
-    original: List[str] = data.splitlines()  # no keepends
+    original: List[str] = data.splitlines()
     if not original:
         original = [""]
 
@@ -402,23 +419,7 @@ def _synthesize_python_module_comment_or_docstring(rel_path: str, abs_path: path
         ins_idx = i
 
     new_lines = original[:ins_idx] + [insert_line] + original[ins_idx:]
-
-    # Build proper unified diff with LF endings
-    diff_iter = difflib.unified_diff(
-        original,
-        new_lines,
-        fromfile=f"a/{rel_path}",
-        tofile=f"b/{rel_path}",
-        lineterm="\n",
-        n=3,  # default context
-    )
-    diff_text = "".join(diff_iter)
-    if not diff_text.strip():
-        return ""
-
-    # Prepend diff --git header
-    out = f"diff --git a/{rel_path} b/{rel_path}\n" + diff_text
-    return out
+    return _make_unified_diff(rel_path, original, new_lines)
 
 # ---------------- public API ----------------
 
