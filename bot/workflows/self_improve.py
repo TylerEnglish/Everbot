@@ -143,7 +143,9 @@ def run() -> int:
             if not auto_result:
                 print("[dim]autocoder produced no output.[/dim]")
                 break
-
+            else:
+                print(f"[dim]autocoder artifacts:[/dim] {auto_result.artifacts_dir}  [dim]patch:[/dim] {auto_result.patch_path}")
+ 
             if not auto_result.patch_applied:
                 print(f"[dim]autocoder attempt {i+1} produced no applicable patch ({auto_result.note}).[/dim]")
                 continue
