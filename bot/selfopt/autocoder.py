@@ -6,6 +6,7 @@ import os, sys, pathlib, subprocess, time, json, re, difflib
 from bot.paths import get_project_root
 from bot.llm.provider import ask, info, NotConfigured  # LLM interface
 
+# Optional kill-switch to disable synthesized fallback patches entirely.
 _NO_SYNTH = os.getenv("EVERABOT_AUTOCODE_NO_SYNTH", "").strip() == "1"
 
 @dataclass
@@ -30,8 +31,15 @@ _EXCLUDE_DIRS = {
 
 # explicitly avoid files that fight with idempotent markers / CLI churn
 _EXCLUDE_FILES = {"bot/cli.py"}
-_AUTOCODE_MARKER = "Autocode: non-functional comment"
- 
+
+# Marker used in our synthesized patch comment so hotspot scan will spread edits.
+_AUTOCODE_MARKER = "Autocode: non-functional"
+
+# Heuristics: treat added lines as "non-functional" if they’re obviously just comments or docstring fences.
+_DOC_OR_COMMENT_START = re.compile(r'^\+\s*(#|[rubfRUBF]?("""|\'\'\'))')
+_DOC_OR_COMMENT_END   = re.compile(r'^\+\s*("""|\'\'\')\s*$')
+
+
 def _llm_ok() -> bool:
     try:
         _ = info()  # raises NotConfigured if missing
@@ -39,9 +47,11 @@ def _llm_ok() -> bool:
     except NotConfigured:
         return False
 
+
 def _scan_hotspots(root: pathlib.Path, max_files: int = 5) -> List[pathlib.Path]:
     """
     Prefer longer files and those with TODO/FIXME; scan common languages; skip noisy/guarded dirs.
+    Penalize files we've already touched (marker present) to spread edits.
     """
     repo_dir = root / "bot"
     files: list[tuple[int, int, pathlib.Path]] = []
@@ -59,20 +69,20 @@ def _scan_hotspots(root: pathlib.Path, max_files: int = 5) -> List[pathlib.Path]
                 continue
             length = text.count("\n")
             todos = text.upper().count("TODO") + text.upper().count("FIXME")
-            # Strongly penalize files we already touched with our marker to spread edits.
             touched_penalty = 200000 if "Autocode:" in text else 0
             score = (3 * todos + length) - touched_penalty
             files.append((score, length, p))
     files.sort(reverse=True)
     return [p for _, __, p in files[:max_files]]
 
+
 def _build_prompt(file_paths: List[pathlib.Path]) -> str:
     header = (
         "You are Everabot's internal code refactorer.\n"
-        "Goals: safe, behavior-preserving improvements: stronger type hints, clearer names, input validation,"
-        " improved error messages, small helpers, and micro-optimizations. "
+        "Goals: safe, behavior-preserving improvements: stronger type hints, clearer names, input validation, "
+        "improved error messages, small helpers, and micro-optimizations. "
         "Avoid comment-only or docstring-only patches.\n"
-         "Constraints:\n"
+        "Constraints:\n"
         " - Only modify files under 'bot/'.\n"
         " - Hard-ban generated/build/vendor paths (target/, build/, dist/, node_modules/, __pycache__/ ...).\n"
         " - Do NOT touch 'ruleset/' or 'test/'.\n"
@@ -80,9 +90,8 @@ def _build_prompt(file_paths: List[pathlib.Path]) -> str:
         " - No commentary; ONLY the diff.\n"
         " - Keep changes focused; ~20-150 lines of diff total.\n"
         " - Avoid editing 'bot/cli.py'; prefer utility modules or helpers.\n"
-        " - Make at least one functional-neutral code improvement (e.g., add precise type hints to public functions,"
-        " replace ambiguous exceptions with ValueError/TypeError, or factor a small helper)."
-        " Do NOT submit patches that are only comments or docstrings.\n"
+        " - Make at least one functional-neutral code improvement (e.g., type hints on public functions, "
+        "   clearer exceptions, factoring a helper). Do NOT submit patches that are only comments or docstrings.\n"
         "If you cannot produce a valid unified diff, output exactly: #NOPATCH\n\n"
     )
     context = []
@@ -94,6 +103,7 @@ def _build_prompt(file_paths: List[pathlib.Path]) -> str:
             pass
     return header + "\n".join(context)
 
+
 def _clean_unicode(s: str) -> str:
     # Normalize line endings, strip BOM, and collapse NBSP to regular spaces.
     s = s.replace("\r\n", "\n").replace("\r", "\n")
@@ -101,6 +111,7 @@ def _clean_unicode(s: str) -> str:
     if s.startswith("\ufeff"):
         s = s.lstrip("\ufeff")
     return s
+
 
 def _strip_code_fences(s: str) -> str:
     """
@@ -111,14 +122,15 @@ def _strip_code_fences(s: str) -> str:
     s = re.sub(r"```", "", s)
     return s
 
+
 def _norm_sep(path: str) -> str:
     """
-    Normalize Git header paths to forward slashes; strip leading ./ and collapse a|b/ prefixes when needed.
+    Normalize Git header paths to forward slashes; strip leading ./ .
     """
     if not path:
         return path
-    p = path.replace("\\", "/").lstrip("./")
-    return p
+    return path.replace("\\", "/").lstrip("./")
+
 
 def _normalize_diff_git_headers(text: str) -> str:
     """
@@ -131,13 +143,13 @@ def _normalize_diff_git_headers(text: str) -> str:
         if ln.startswith("--- "):
             path = _norm_sep(ln[4:].strip())
             if not (path.startswith("a/") or path.startswith("/dev/null")):
-                path = "a/" + path.lstrip("./")
+                path = "a/" + path
             ln = f"--- {path}"
             last_minus = path[2:] if path.startswith("a/") else None
         elif ln.startswith("+++ "):
             path = _norm_sep(ln[4:].strip())
             if not (path.startswith("b/") or path.startswith("/dev/null")):
-                path = "b/" + path.lstrip("./")
+                path = "b/" + path
             ln = f"+++ {path}"
             last_plus = path[2:] if path.startswith("b/") else None
         elif ln.startswith("diff --git "):
@@ -145,15 +157,16 @@ def _normalize_diff_git_headers(text: str) -> str:
             if m:
                 a, b = _norm_sep(m.group(1).strip()), _norm_sep(m.group(2).strip())
                 if not a.startswith("a/"):
-                    a = f"a/{a.lstrip('./')}"
+                    a = f"a/{a}"
                 if not b.startswith("b/"):
-                    b = f"b/{b.lstrip('./')}"
+                    b = f"b/{b}"
                 ln = f"diff --git {a} {b}"
             else:
                 if last_minus and last_plus:
                     ln = f"diff --git a/{last_minus} b/{last_plus}"
         out_lines.append(ln)
     return "\n".join(out_lines)
+
 
 def _split_blocks(text: str) -> list[list[str]]:
     """Split a normalized diff into file blocks starting at 'diff --git'."""
@@ -170,6 +183,7 @@ def _split_blocks(text: str) -> list[list[str]]:
         blocks.append(cur)
     return blocks
 
+
 def _is_excluded_path(p: str) -> bool:
     # normalize slashes and strip potential a/ or b/ prefixes
     p = _norm_sep(p)
@@ -180,7 +194,36 @@ def _is_excluded_path(p: str) -> bool:
     if p in _EXCLUDE_FILES:
         return True
     return (not p.startswith("bot/")) or any(x in _EXCLUDE_DIRS for x in (set(parts) | pairs))
- 
+
+
+def _block_has_only_comment_or_doc_additions(hunk_lines: List[str]) -> bool:
+    """
+    True if every added line looks like a comment or a docstring fence/body.
+    Heuristic: treat empty/whitespace lines as non-functional too.
+    """
+    added = [ln for ln in hunk_lines if ln.startswith("+")]
+    if not added:
+        return False
+    # Fast-path: if any '+' line looks like code (def/class/import/raise/return/with/try/except/=),
+    # treat as functional-neutral code (allowed).
+    codeish = re.compile(r'^\+\s*(def |class |from |import |raise |return |with |try:|except |if |for |while |@|[A-Za-z_]\w*\s*=)')
+    for ln in added:
+        if codeish.match(ln):
+            return False
+    # Otherwise, if all are comments/doc fences/whitespace, mark as doc/comment-only.
+    for ln in added:
+        body = ln[1:]
+        if body.strip() == "":
+            continue
+        if _DOC_OR_COMMENT_START.match(ln) or _DOC_OR_COMMENT_END.match(ln):
+            continue
+        # Interior docstring text (no quotes) is hard to detect; allow if it contains obvious code tokens.
+        if any(tok in body for tok in ("()", "{}", "[]", " = ", " -> ", ": ", "lambda ", " yield", " except", " try:", " return ")):
+            return False
+        # Default: treat as doc/comment-ish (plain text) and continue
+    return True
+
+
 def _rebuild_block(blk: list[str]) -> Optional[str]:
     """
     Rebuild a single file diff block into a canonical minimal diff:
@@ -189,11 +232,8 @@ def _rebuild_block(blk: list[str]) -> Optional[str]:
       +++ b/X
       @@ hunk
       (hunk body)
-    - Normalizes backslashes to forward slashes
-    - Strips a/ and b/ prefixes only for path filtering
-    - Re-adds canonical a/ and b/ prefixes in the rebuilt output
+    Drops blocks that are exclusively docstring/comment additions.
     """
-    # Find and parse the diff head line
     head = next((x for x in blk if x.startswith("diff --git ")), None)
     if not head:
         return None
@@ -204,7 +244,6 @@ def _rebuild_block(blk: list[str]) -> Optional[str]:
 
     a_hdr, b_hdr = m.group(1).strip(), m.group(2).strip()
 
-    # Normalize path separators and remove leading ./, then strip a/|b/ for checks
     def _norm_body(p: str) -> str:
         p = p.replace("\\", "/").lstrip("./")
         if p.startswith("a/") or p.startswith("b/"):
@@ -214,7 +253,6 @@ def _rebuild_block(blk: list[str]) -> Optional[str]:
     a_body = _norm_body(a_hdr)
     b_body = _norm_body(b_hdr)
 
-    # Exclusion gate (expects raw repo-relative path without a/|b/)
     if _is_excluded_path(a_body) or _is_excluded_path(b_body):
         return None
 
@@ -229,7 +267,6 @@ def _rebuild_block(blk: list[str]) -> Optional[str]:
             in_hunk = True
             continue
         if in_hunk:
-            # Strict hunk body: ' ', '+', or '-'
             if ln.startswith((" ", "+", "-")):
                 lines.append(ln)
             else:
@@ -238,8 +275,11 @@ def _rebuild_block(blk: list[str]) -> Optional[str]:
     if not have_hunk or not lines:
         return None
 
-    # Rebuild canonical minimal block with normalized forward-slash paths
-    a_canon = a_body  # already forward slashes & repo-relative
+    # Reject doc/comment-only additions (prevents the docstring spam)
+    if _block_has_only_comment_or_doc_additions(lines):
+        return None
+
+    a_canon = a_body
     b_canon = b_body
     rebuilt = [
         f"diff --git a/{a_canon} b/{b_canon}",
@@ -262,10 +302,12 @@ def _canonicalize_blocks(text: str) -> str:
             out.append(rebuilt)
     return ("\n".join(out) + ("\n" if out else ""))
 
+
 def _sanitize_to_diff(raw: str) -> str:
     """
     Keep only diff-looking lines and valid hunk bodies; fix a/b prefixes if missing;
     then canonicalize into minimal per-file diffs.
+    Also drops blocks that are doc/comment-only.
     """
     raw = _strip_code_fences(raw)
     raw = _clean_unicode(raw)
@@ -279,20 +321,19 @@ def _sanitize_to_diff(raw: str) -> str:
     in_hunk = False
 
     def _ensure_ab(line: str) -> str:
-        # normalize ---/+++ headers to have a/ b/ prefixes when paths look relative
         if line.startswith("--- "):
-            path = line[4:].strip()
+            path = _norm_sep(line[4:].strip())
             if not (path.startswith("a/") or path.startswith("/dev/null")):
-                return "--- a/" + path.lstrip("./")
+                return "--- a/" + path
         if line.startswith("+++ "):
-            path = line[4:].strip()
+            path = _norm_sep(line[4:].strip())
             if not (path.startswith("b/") or path.startswith("/dev/null")):
-                return "+++ b/" + path.lstrip("./")
+                return "+++ b/" + path
         return line
 
     for ln in lines:
         if ln.startswith(_ALLOWED_DIFF_PREFIXES):
-            if ln.startswith("--- ") or ln.startswith("+++ "):
+            if ln.startswith(("--- ", "+++ ")):
                 ln = _ensure_ab(ln)
             out.append(ln)
             if ln.startswith("@@ "):
@@ -300,7 +341,6 @@ def _sanitize_to_diff(raw: str) -> str:
             continue
 
         if in_hunk:
-            # hunk body lines must be one of ' ', '+', '-'
             if ln.startswith((" ", "+", "-")):
                 out.append(ln)
                 continue
@@ -332,6 +372,7 @@ def _sanitize_to_diff(raw: str) -> str:
     text = _canonicalize_blocks(text) if text else ""
     return (text + "\n") if text else ""
 
+
 def _write_artifacts(prompt: str, raw: str, diff: str) -> Tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
     base = get_project_root() / "snapshots" / "selfopt" / "autocode" / time.strftime("%Y%m%d_%H%M%S")
     base.mkdir(parents=True, exist_ok=True)
@@ -345,13 +386,13 @@ def _write_artifacts(prompt: str, raw: str, diff: str) -> Tuple[pathlib.Path, pa
     if out and not out.endswith("\n"):
         out += "\n"
     diff_path.write_text(out, encoding="utf-8")
-    # Lightweight debug print
     try:
         print(f"[autocoder] artifacts -> {base}  (prompt.txt={ (base/'prompt.txt').stat().st_size }B, "
               f"raw.txt={ (base/'raw.txt').stat().st_size }B, patch.diff={ diff_path.stat().st_size }B)")
     except Exception:
         pass
     return base, diff_path, base / "raw.txt"
+
 
 def _git_apply(patch_path: pathlib.Path) -> bool:
     if not patch_path.exists() or patch_path.stat().st_size == 0:
@@ -372,6 +413,7 @@ def _git_apply(patch_path: pathlib.Path) -> bool:
             continue
     return False
 
+
 def _touch_list_from_diff(diff_text: str) -> List[str]:
     touched = []
     for line in diff_text.splitlines():
@@ -387,6 +429,7 @@ def _touch_list_from_diff(diff_text: str) -> List[str]:
                         touched.append(path)
     return touched
 
+
 def _generate_pr_md(diff_text: str) -> str:
     prompt = (
         "Write a crisp PR title and summary for the following unified diff. "
@@ -398,6 +441,7 @@ def _generate_pr_md(diff_text: str) -> str:
     except Exception:
         return "Autocode PR\n\n- Changes: refactors & cleanup\n- Risks: low\n- Test plan: root eval + basic builds"
 
+
 # ---------- synthesis fallback (ensures at least one safe change is made) ----------
 
 def _pick_first_python(hotspots: List[pathlib.Path]) -> Optional[pathlib.Path]:
@@ -406,45 +450,41 @@ def _pick_first_python(hotspots: List[pathlib.Path]) -> Optional[pathlib.Path]:
             return p
     return None
 
+
 def _make_unified_diff(rel_path: str, original: List[str], new_lines: List[str]) -> str:
     """
     Create a robust unified diff with each output line explicitly newline-terminated.
     This avoids malformed hunks on Windows (git apply 'corrupt patch' errors).
     """
-    # difflib sometimes returns hunk lines without line terminators; add them.
     raw_lines = list(difflib.unified_diff(
         original,
         new_lines,
         fromfile=f"a/{rel_path}",
         tofile=f"b/{rel_path}",
-        lineterm="",   # emit without line ends; we’ll add '\n' to every line
+        lineterm="",
         n=3,
     ))
     body = "".join((ln if ln.endswith("\n") else (ln + "\n")) for ln in raw_lines)
     return f"diff --git a/{rel_path} b/{rel_path}\n{body}"
 
-def _synthesize_python_module_comment_or_docstring(rel_path: str, abs_path: pathlib.Path) -> str:
+
+def _synthesize_python_type_checking_noop(rel_path: str, abs_path: pathlib.Path) -> str:
     """
-    Create a minimal, safe unified diff for a Python module:
-      - If there is no module docstring at file top, insert one.
-      - Else insert a top-level comment after the docstring.
-    Normalizes line endings to LF and ensures every hunk line ends with '\n'.
+    Synthesize a tiny, behavior-neutral code change that is NOT a docstring/comment:
+      * Insert a TYPE_CHECKING no-op block (no runtime effect) and tag with our marker comment.
     """
     try:
         data = abs_path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return ""
-
-    # Normalize to LF; split without keeping ends (we’ll manage line ends in the diff)
     data = data.replace("\r\n", "\n").replace("\r", "\n")
-    # Idempotency: if our marker already exists, skip producing a patch for this file
-    if "Autocode:" in data:
-        return ""
+    if "TYPE_CHECKING" in data and "Autocode:" in data:
+        return ""  # already has our no-op
     original: List[str] = data.splitlines()
     if not original:
         original = [""]
 
-    # Find insertion point: after shebang / coding lines
+    # Find insertion point: after shebang/coding and right after top import block if present.
     i = 0
     if original and original[0].startswith("#!"):
         i = 1
@@ -453,30 +493,37 @@ def _synthesize_python_module_comment_or_docstring(rel_path: str, abs_path: path
     if i < len(original) and re.match(r"#\s*coding[:=]\s*.*$", original[i]):
         i += 1
 
-    # Detect existing docstring at top
+    # Move past leading module docstring if present (we won't add another one).
     def _is_triple_quote_line(s: str) -> bool:
         s2 = s.lstrip()
         return s2.startswith('"""') or s2.startswith("'''")
 
-    insert_line: str
     j = i
     if j < len(original) and _is_triple_quote_line(original[j]):
-        # Skip past the closing triple-quote
         quote = '"""' if original[j].lstrip().startswith('"""') else "'''"
         j += 1
         while j < len(original):
             if quote in original[j]:
                 j += 1
                 break
-            j += 1
-        insert_line = "# Autocode: non-functional comment."
-        ins_idx = j
-    else:
-        insert_line = '"""Autocode: module-level docstring (non-functional)."""'
-        ins_idx = i
 
-    new_lines = original[:ins_idx] + [insert_line] + original[ins_idx:]
+    # Move past top import block (import/from), so we inject below imports.
+    k = j
+    while k < len(original) and re.match(r"\s*(from\s+\S+\s+import|import\s+\S+)", original[k]):
+        k += 1
+
+    insert_idx = k
+    lines_to_insert = []
+    # Ensure the TYPE_CHECKING import exists only once
+    has_tc_import = any(re.match(r"\s*from\s+typing\s+import\s+TYPE_CHECKING\b", ln) for ln in original)
+    if not has_tc_import:
+        lines_to_insert.append("from typing import TYPE_CHECKING")
+    lines_to_insert.append("if TYPE_CHECKING:")
+    lines_to_insert.append("    pass  # Autocode: non-functional type-only block")
+    # Build new file
+    new_lines = original[:insert_idx] + lines_to_insert + original[insert_idx:]
     return _make_unified_diff(rel_path, original, new_lines)
+
 
 # ---------------- public API ----------------
 
@@ -484,12 +531,12 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
     """
     1) Pick hotspot files under bot/
     2) Ask the LLM for a single unified diff (retry with a repair prompt if needed)
-    3) If still no valid diff, synthesize a minimal safe patch for a Python hotspot
+    3) If still no valid diff, synthesize a minimal safe patch (TYPE_CHECKING no-op)
     4) Save prompt/raw/diff under snapshots/selfopt/autocode/<ts>/
     5) Try to git-apply with fallbacks
     6) Save PR.md with title/summary derived from diff
     7) Return result (caller gates adoption behind tests/evals)
-     """
+    """
     if not _llm_ok():
         return None
 
@@ -516,6 +563,7 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
             " - Only output the diff, no commentary or code fences.\n"
             " - Every file must have 'diff --git a/… b/…' and matching '--- a/…' + '+++ b/…' headers.\n"
             " - Include at least one '@@' hunk per file with correct line numbers.\n"
+            " - Avoid comment-only or docstring-only changes.\n"
             "Minimal example:\n"
             "diff --git a/bot/autocoder.py b/bot/autocoder.py\n"
             "--- a/bot/autocoder.py\n"
@@ -531,9 +579,10 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
         diff = _sanitize_to_diff(raw2)
         if diff.strip():
             raw = raw2
+
     # Optional: disable synth fallback if user wants only LLM-derived diffs
     if not looks_like_diff(diff) and _NO_SYNTH:
-        art_dir, diff_path, raw_path = _write_artifacts(prompt, raw, "")
+        art_dir, diff_path, _ = _write_artifacts(prompt, raw, "")
         note = "LLM diff invalid; synth disabled via EVERABOT_AUTOCODE_NO_SYNTH=1"
         return AutoCodeResult(
             title="autocode-refactor", patch_path=str(diff_path), patch_applied=False,
@@ -547,21 +596,20 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
         if target is not None:
             rel = str(target.relative_to(root).as_posix())
             if rel.startswith("bot/") and not _is_excluded_path(rel):
-                synth = _synthesize_python_module_comment_or_docstring(rel, target)
+                synth = _synthesize_python_type_checking_noop(rel, target)
                 if synth.strip():
                     diff = synth
                     raw = synth
                     synth_used = True
 
-    art_dir, diff_path, raw_path = _write_artifacts(prompt, raw, diff)
+    art_dir, diff_path, _ = _write_artifacts(prompt, raw, diff)
     touched = _touch_list_from_diff(diff) if looks_like_diff(diff) else []
 
     applied = False
     if looks_like_diff(diff):
-        # First try the LLM-produced diff
         applied = _git_apply(diff_path)
 
-    # If nothing applied, synthesize a tiny safe patch on the first eligible Python file
+    # If nothing applied, try a synthesized TYPE_CHECKING no-op on the first eligible Python file
     if not applied:
         root = get_project_root()
         for cand in hotspots:
@@ -570,19 +618,20 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
             rel = str(cand.relative_to(root).as_posix())
             if _is_excluded_path(rel):
                 continue
-            synth = _synthesize_python_module_comment_or_docstring(rel, cand)
+            synth = _synthesize_python_type_checking_noop(rel, cand)
             if not synth.strip():
                 continue
-            # overwrite artifacts with the synthesized patch
             _, diff_path, _ = _write_artifacts(prompt, synth, synth)
             applied = _git_apply(diff_path)
             if applied:
                 touched = _touch_list_from_diff(synth)
                 raw = synth
+                synth_used = True
                 break
+
     note_bits = []
     if synth_used:
-        note_bits.append("used synth fallback (docstring/comment) due to invalid or non-applying LLM diff")
+        note_bits.append("used synth fallback (TYPE_CHECKING no-op) due to invalid or non-applying LLM diff")
     note_bits.append("patch applied via git apply" if applied else "patch did NOT apply (see .rej files if any)")
     note = "; ".join(note_bits)
 
