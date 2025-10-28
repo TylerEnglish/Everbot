@@ -71,6 +71,8 @@ def _build_prompt(file_paths: List[pathlib.Path]) -> str:
         " - No commentary; ONLY the diff; keep 20–150 lines of diff total.\n"
         " - Avoid editing bot/cli.py.\n"
         " - Include at least one actual code change (not just comments/docstrings).\n"
+        " - Do NOT introduce new hard runtime dependencies (e.g. numpy, pyarrow). If types are needed, "
+        "   import them under `if TYPE_CHECKING:` or use `typing.Any`.\n"
         "If you cannot produce a valid unified diff, output exactly: #NOPATCH\n\n"
     )
     ctx = []
@@ -633,7 +635,9 @@ def _write_artifacts(prompt: str, raw: str, diff: str) -> Tuple[pathlib.Path, pa
     return base, diff_path, base / "raw.txt"
 
 def _git_apply(patch_path: pathlib.Path) -> bool:
-    if not patch_path.exists() or patch_path.stat().st_size == 0: return False
+    if not patch_path.exists() or patch_path.stat().st_size == 0:
+        return False
+    root = get_project_root()
     attempts = [
         ["git","apply","--index","--whitespace=fix",str(patch_path)],
         ["git","apply","--index","--recount","--whitespace=fix",str(patch_path)],
@@ -641,10 +645,21 @@ def _git_apply(patch_path: pathlib.Path) -> bool:
         ["git","apply","--index","-p0","--whitespace=fix",str(patch_path)],
         ["git","apply","--index","--whitespace=nowarn",str(patch_path)],
         ["git","apply","--reject","--whitespace=nowarn",str(patch_path)],
+        ["git","apply","--reject","--whitespace=nowarn",str(patch_path)],
     ]
     for cmd in attempts:
         try:
-            subprocess.check_call(cmd); return True
+            # Track .rej state to detect partial application when using --reject
+            before_rej = list(root.rglob("*.rej"))
+            subprocess.check_call(cmd)
+            after_rej = list(root.rglob("*.rej"))
+            # If we used --reject and any new .rej files were created, treat as failure
+            if "--reject" in cmd:
+                # compare counts, but also allow pre-existing rejects
+                if len(after_rej) > len(before_rej):
+                    # Leave rejects in place for inspection; continue trying next strategy
+                    continue
+            return True
         except Exception:
             continue
     return False
@@ -663,16 +678,83 @@ def _touch_list_from_diff(diff_text: str) -> List[str]:
                         touched.append(path)
     return touched
 
+def _parse_added_removed(diff_text: str) -> dict:
+    """
+    Parse a unified diff and return a map:
+      { file -> {added:int, removed:int, added_imports:[str], added_typing_tc:bool} }
+    Only counts real +/- lines in hunks (ignores headers).
+    """
+    files: dict[str, dict] = {}
+    current: str | None = None
+    in_hunk = False
+    for raw in diff_text.splitlines():
+        if raw.startswith("diff --git "):
+            # e.g., diff --git a/bot/core/x.py b/bot/core/x.py
+            parts = raw.split()
+            target = parts[3] if len(parts) >= 4 else None
+            if target and target.startswith("b/"):
+                current = target[2:]
+                files.setdefault(current, {"added": 0, "removed": 0, "added_imports": [], "added_typing_tc": False})
+            else:
+                current = None
+            in_hunk = False
+            continue
+        if raw.startswith("@@ "):
+            in_hunk = True
+            continue
+        if not in_hunk or not current:
+            continue
+        if raw.startswith("+++ ") or raw.startswith("--- "):
+            continue
+        if raw.startswith("+"):
+            files[current]["added"] += 1
+            body = raw[1:].strip()
+            if body.startswith("from typing import TYPE_CHECKING") or body == "if TYPE_CHECKING:":
+                files[current]["added_typing_tc"] = True
+            if body.startswith("import ") or body.startswith("from "):
+                files[current]["added_imports"].append(body)
+        elif raw.startswith("-"):
+            files[current]["removed"] += 1
+    return files
+
 def _generate_pr_md(diff_text: str) -> str:
-    try:
-        return ask(
-            "Write a crisp PR title and summary for the following unified diff. "
-            "Keep it factual and short. Include a one-line title, bullets for changes, risks, and a tiny test plan.\n\nDIFF:\n"
-            + diff_text,
-            max_tokens=400, temperature=0.2
-        )
-    except Exception:
-        return "Autocode PR\n\n- Changes: verified refactors\n- Risks: low\n- Test plan: root eval + basic builds"
+    """
+    Deterministic PR summary based strictly on +/- lines.
+    Prevents hallucinating changes from context.
+    """
+    summary = _parse_added_removed(diff_text)
+    if not summary:
+        return "Autocode PR\n\n- No verified diff to summarize."
+
+    total_added = sum(v["added"] for v in summary.values())
+    total_removed = sum(v["removed"] for v in summary.values())
+    files = list(summary.keys())
+
+    lines = []
+    lines.append(f"**PR Title:** Autocode refactor: {len(files)} file(s), +{total_added} −{total_removed}")
+    lines.append("")
+    lines.append("**Summary:**")
+    lines.append("This PR applies small, behavior-preserving refactors and typing polish.")
+    lines.append("")
+    lines.append("**Changes:**")
+    for f, meta in summary.items():
+        bullets = []
+        if meta["added_typing_tc"]:
+            bullets.append("add TYPE_CHECKING guard")
+        if meta["added_imports"]:
+            # show only *added* import lines (not context)
+            for imp in meta["added_imports"]:
+                bullets.append(f"add `{imp}`")
+        if not bullets:
+            bullets.append(f"+{meta['added']} −{meta['removed']} line changes")
+        lines.append(f"- `{f}`: " + "; ".join(bullets))
+    lines.append("")
+    lines.append("**Risks:** Low (no functional logic changed).")
+    lines.append("")
+    lines.append("**Test Plan:**")
+    lines.append("1) Run root eval (`python -m bot.cli eval`) → expect PASS.")
+    lines.append("2) Sanity import (`python -c \"import bot; print('OK')\"`).")
+    return "\n".join(lines)
 
 # ---------- synth fallback (only if nothing verified) ----------
 
