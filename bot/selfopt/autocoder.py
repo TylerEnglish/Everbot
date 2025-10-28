@@ -324,6 +324,10 @@ def _parse_oldstart(hunk: List[str]) -> int:
         return 0
 
 def _fuzzy_anchor_index(hay: List[str], needle: List[str], around: int, window: int = 80) -> int:
+    """
+    Look near the expected 'around' line for the best matching equal block and
+    return its starting index in the 'b' side (j1), shifted back into the global 'hay'.
+    """
     L = len(hay)
     lo = max(0, around - window)
     hi = min(L, around + window)
@@ -341,7 +345,13 @@ def _fuzzy_anchor_index(hay: List[str], needle: List[str], around: int, window: 
             if base + len(needle) <= L and hay[base:base+len(needle)] == needle:
                 return base
     sm = difflib.SequenceMatcher(a="".join(needle), b="".join(sub), autojunk=False)
-    _, b1, _, _ = max(sm.get_opcodes(), key=lambda t: t[2]-t[1] if t[0]=="equal" else -1, default=(None,0,0,0))
+    # get_opcodes returns 5-tuples: (tag, i1, i2, j1, j2)
+    best = max(
+        (op for op in sm.get_opcodes() if op[0] == "equal"),
+        key=lambda t: t[2] - t[1],
+        default=("equal", 0, 0, 0, 0),
+    )
+    b1 = best[3] if len(best) >= 4 else 0
     return lo + b1
 
 def _verify_deletions_match(hunk: List[str], hay: List[str], start: int) -> bool:
