@@ -635,34 +635,96 @@ def _write_artifacts(prompt: str, raw: str, diff: str) -> Tuple[pathlib.Path, pa
     return base, diff_path, base / "raw.txt"
 
 def _git_apply(patch_path: pathlib.Path) -> bool:
+    """
+    Smarter patch application:
+      1) Parse touched paths from the diff.
+      2) Probe whether those paths are tracked and clean in index.
+      3) Try the safest strategy that fits:
+         a) If any new/untracked files or index mismatch → prefer working-tree apply (no --index), then stage.
+         b) Else try --index.
+         c) If that fails, try --3way (implies --index).
+         d) Last resort: --reject (treated as failure if any .rej created).
+    """
     if not patch_path.exists() or patch_path.stat().st_size == 0:
         return False
+
     root = get_project_root()
-    attempts = [
-        ["git","apply","--index","--whitespace=fix",str(patch_path)],
-        ["git","apply","--index","--recount","--whitespace=fix",str(patch_path)],
-        ["git","apply","--index","--unidiff-zero","--whitespace=fix",str(patch_path)],
-        ["git","apply","--index","-p0","--whitespace=fix",str(patch_path)],
-        ["git","apply","--index","--whitespace=nowarn",str(patch_path)],
-        ["git","apply","--reject","--whitespace=nowarn",str(patch_path)],
-        ["git","apply","--reject","--whitespace=nowarn",str(patch_path)],
-    ]
-    for cmd in attempts:
+    diff_txt = patch_path.read_text(encoding="utf-8", errors="replace")
+    touched = _touch_list_from_diff(diff_txt)
+
+    def _run(cmd: list[str]) -> tuple[int, str, str]:
         try:
-            # Track .rej state to detect partial application when using --reject
-            before_rej = list(root.rglob("*.rej"))
-            subprocess.check_call(cmd)
-            after_rej = list(root.rglob("*.rej"))
-            # If we used --reject and any new .rej files were created, treat as failure
-            if "--reject" in cmd:
-                # compare counts, but also allow pre-existing rejects
-                if len(after_rej) > len(before_rej):
-                    # Leave rejects in place for inspection; continue trying next strategy
-                    continue
+            p = subprocess.run(cmd, cwd=root, text=True, capture_output=True, check=False)
+            return p.returncode, p.stdout, p.stderr
+        except Exception as e:
+            return 999, "", str(e)
+
+    def _tracked(path: str) -> bool:
+        code, _, _ = _run(["git","ls-files","--error-unmatch","--",path])
+        return code == 0
+
+    def _paths_clean(paths: list[str]) -> bool:
+        # Are these paths identical in index & working tree? If any differ, --index will balk.
+        if not paths:
             return True
-        except Exception:
-            continue
+        code, _, _ = _run(["git","diff-index","--quiet","--", "HEAD", "--", *paths])
+        # diff-index returns 0 when no differences
+        return code == 0
+
+    # Update stat info without staging (helps --index consistency on Windows).
+    _run(["git","update-index","-q","--refresh"])
+
+    tracked_map = {p: _tracked(p) for p in touched}
+    has_untracked = any(not v for v in tracked_map.values())
+    index_clean = _paths_clean([p for p, t in tracked_map.items() if t])
+
+    def _check(cmd: list[str]) -> bool:
+        rc, _, _ = _run(cmd + ["--check", str(patch_path)])
+        return rc == 0
+
+    def _apply(cmd: list[str]) -> bool:
+        rc, _, _ = _run(cmd + [str(patch_path)])
+        return rc == 0
+
+    # Strategy candidates (ordered)
+    strategies: list[list[str]] = []
+
+    # If any new files or index isn’t perfectly clean for touched tracked paths, avoid --index first.
+    if has_untracked or not index_clean:
+        # Worktree apply; be tolerant of whitespace/CRLF, then fix whitespace where possible.
+        strategies.append(["git","apply","--whitespace=fix","--ignore-whitespace"])
+        # If that fails, try recount/unidiff-zero variants
+        strategies.append(["git","apply","--recount","--unidiff-zero","--whitespace=fix","--ignore-whitespace"])
+        # As a stronger fallback, attempt 3-way (implies --index). Note: incompatible with --reject.
+        strategies.append(["git","apply","--3way"])
+    else:
+        # Index + worktree in lockstep — start with --index
+        strategies.append(["git","apply","--index","--whitespace=fix"])
+        strategies.append(["git","apply","--index","--recount","--unidiff-zero","--whitespace=fix"])
+        # If straight apply fails, try 3-way merge (implies --index; incompatible with --reject)
+        strategies.append(["git","apply","--3way"])
+
+    # Last resort: accept partial application to .rej but treat as failure we can report
+    strategies.append(["git","apply","--reject","--whitespace=nowarn"])
+
+    # Try each strategy with --check probe first
+    for cmd in strategies:
+        if _check(cmd):
+            before_rej = list(root.rglob("*.rej"))
+            if _apply(cmd):
+                after_rej = list(root.rglob("*.rej"))
+                if "--reject" in cmd:
+                    # If --reject produced any new .rej, treat as failure (don’t half-apply)
+                    if len(after_rej) > len(before_rej):
+                        return False
+                # If we didn’t use --index, stage touched paths (including new files)
+                if "--index" not in cmd and "--3way" not in cmd:
+                    if touched:
+                        _run(["git","add","--"] + touched)
+                return True
+
     return False
+
 
 def _touch_list_from_diff(diff_text: str) -> List[str]:
     touched = []
