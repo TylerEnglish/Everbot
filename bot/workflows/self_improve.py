@@ -1,11 +1,16 @@
 from __future__ import annotations
-import json, subprocess, time, pathlib, tempfile, os, sys
+import json, subprocess, time, pathlib, tempfile, os, sys, re
+from typing import Dict, List, Tuple, Optional
+
 from bot.telemetry.tracing import get_tracer
 from bot.eval.harness import run_all
 from bot.selfopt.ab import ab_chunk
 from bot.accel.gate import set_chunk_preference
 from bot.paths import get_project_root
 from bot.selfopt.autocoder import propose_and_apply_refactor, AutoCodeResult
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    pass  # Autocode: non-functional type-only block
 
 
 def _git_safe_commit(msg: str, paths: list[str]) -> None:
@@ -74,14 +79,61 @@ def _lang_compile_checks(touched: list[str]) -> list[dict]:
     # ASM: no generic build step here
     return results
 
+
+# -------------------- New: bad-patch guardrails --------------------
+
+_DUP_EXCEPT_RE = re.compile(r'^\+\s*except\b[^:]*:', re.IGNORECASE)
+# Common “same line added multiple times” junk smell (e.g., raise NotConfigured lines repeated)
+_DUP_LINE_BUCKET: int = 3  # if the exact same added line appears ≥3 times across hunks → reject
+
+def _diff_has_duplicate_except_or_spam(diff_text: str) -> bool:
+    """
+    Return True if the proposed unified diff shows obviously bad patterns:
+      • Duplicated 'except …:' lines within a single file’s patch
+      • The exact same '+…' line added 3+ times across the whole patch
+    """
+    if not diff_text.strip():
+        return False
+    per_file_buckets: Dict[str, Dict[str, int]] = {}
+    global_added_count: Dict[str, int] = {}
+    cur_file: Optional[str] = None
+
+    for raw in diff_text.splitlines():
+        if raw.startswith("diff --git "):
+            parts = raw.split()
+            cur_file = parts[3][2:] if len(parts) >= 4 and parts[3].startswith("b/") else None
+            continue
+        if not cur_file:
+            continue
+        if raw.startswith("@@ "):
+            continue
+        if raw.startswith("+++ ") or raw.startswith("--- "):
+            continue
+        if raw.startswith("+"):
+            body = raw[1:].rstrip()
+            global_added_count[body] = global_added_count.get(body, 0) + 1
+            # per-file duplicate excepts
+            if _DUP_EXCEPT_RE.match(raw):
+                bucket = per_file_buckets.setdefault(cur_file, {})
+                key = body  # exact text of the except line
+                bucket[key] = bucket.get(key, 0) + 1
+                if bucket[key] >= 2:
+                    return True  # duplicate identical except within same file
+    # global spam line repeated many times
+    if any(cnt >= _DUP_LINE_BUCKET for cnt in global_added_count.values()):
+        return True
+    return False
+
+
 def run() -> int:
     """
     1) A/B the chunker (python vs {cpp|rust|go}) with equivalence checks.
        If equivalent and >=1.5x faster, adopt via gate and record marker.
     2) Run root eval to ensure we didn't regress.
-    3) Auto-refactor pass:
-       - Always writes artifacts (prompt/raw/diff) under snapshots/selfopt/autocode/<ts>/
-       - Applies patch if possible; runs tests; if PASS -> commit, else revert.
+    3) Auto-refactor pass with stricter adoption gate:
+       - Reject obviously junk patches (duplicate 'except' lines / spam).
+       - Only commit if baseline was failing and the patch makes tests PASS.
+         (If baseline already PASS, keep artifacts but don't commit.)
     """
     tracer = get_tracer("everabot.self_improve")
     with tracer.start_as_current_span("self_improve.entry"):
@@ -121,8 +173,9 @@ def run() -> int:
         print(f"[green]self-improve[/green] chunker: impl={res.accel_impl} eq={res.equivalent} speedup≈{(res.speedup_x or 0):.2f}x adopted={adopted}")
         print(f"[dim]note:[/dim] {out}")
 
-        ok_root = bool(root.get("overall") in ("PASS", "OK"))
-        if ok_root and adopted:
+        baseline_ok = bool(root.get("overall") in ("PASS", "OK"))
+
+        if baseline_ok and adopted:
             pref = pathlib.Path("snapshots") / "accel_prefs.json"
             _git_safe_commit(
                 f"selfopt: adopt chunk engine {res.accel_impl} (≈{(res.speedup_x or 0):.2f}x, equivalence OK)",
@@ -135,6 +188,7 @@ def run() -> int:
         for i in range(attempts):
             auto_result: AutoCodeResult | None = None
             try:
+                # Keep the underlying autocoder intact; we enforce quality here.
                 auto_result = propose_and_apply_refactor(max_files=3)
             except Exception as e:
                 print(f"[yellow]autocoder skipped[/yellow]: {e}")
@@ -145,9 +199,19 @@ def run() -> int:
                 break
             else:
                 print(f"[dim]autocoder artifacts:[/dim] {auto_result.artifacts_dir}  [dim]patch:[/dim] {auto_result.patch_path}")
- 
+
             if not auto_result.patch_applied:
                 print(f"[dim]autocoder attempt {i+1} produced no applicable patch ({auto_result.note}).[/dim]")
+                continue
+
+            # New: reject obviously junk patches (duplicate 'except', spam lines) before any eval
+            try:
+                diff_text = pathlib.Path(auto_result.patch_path).read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                diff_text = ""
+            if _diff_has_duplicate_except_or_spam(diff_text):
+                print("[red]autocoder change flagged as junk (duplicate 'except' or spam). Reverting.[/red]")
+                _git_safe_revert()
                 continue
 
             # Patch applied → re-run root eval and gate adoption
@@ -156,15 +220,17 @@ def run() -> int:
             ok2 = bool(root2.get("overall") in ("PASS", "OK"))
             print(f"[cyan]autocoder[/cyan] root eval: {root2.get('overall')}")
 
-            if ok2:
+            # New: Only commit if the patch *improves a failing baseline*.
+            # If baseline was already PASS, keep artifacts for review but don't commit “busywork” patches.
+            if ok2 and not baseline_ok:
                 _git_safe_commit(
-                    f"selfopt: autocode patch '{auto_result.title}' (tests PASS)",
+                    f"selfopt: autocode patch '{auto_result.title}' (fixed failing baseline → PASS)",
                     [str(p) for p in auto_result.touched_paths] + [auto_result.patch_path]
                 )
                 break  # success; no further attempts this cycle
             else:
-                print("[red]autocoder change failed tests; reverting[/red]")
+                print("[yellow]autocoder result did not improve baseline (or baseline already PASS); reverting.[/yellow]")
                 _git_safe_revert()
                 # keep artifacts for inspection; try another attempt
 
-        return 0 if ok_root else 1
+        return 0 if baseline_ok or ok2 else 1
