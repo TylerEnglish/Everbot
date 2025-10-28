@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Iterable
 import os, pathlib, subprocess, time, re, difflib
 
 from bot.paths import get_project_root
@@ -190,8 +190,13 @@ def _rebuild_block_headers_only(blk: list[str]) -> Optional[Tuple[str,str,list[l
         if any(x.startswith(("+","-"," ")) for x in h[1:]):
             if not _block_has_only_comment_or_doc_additions(h):
                 filtered_hunks.append(h)
-    if not filtered_hunks: return None
-    return a_body, b_body, filtered_hunks
+    if not filtered_hunks and a_body == b_body:
+        # allow header-only (e.g., LLM suggesting rename elsewhere)
+        return a_body, b_body, []
+    if not filtered_hunks and a_body != b_body:
+        # permit rename with zero hunks (pure move)
+        return a_body, b_body, []
+    return (a_body, b_body, filtered_hunks) if filtered_hunks or a_body != b_body else None
 
 def _sanitize_to_diff(raw: str) -> str:
     raw = _strip_code_fences(raw)
@@ -217,8 +222,7 @@ def _sanitize_to_diff(raw: str) -> str:
             continue
         if in_hunk:
             if ln.startswith((" ", "+", "-")):
-                out.append(ln)
-                continue
+                out.append(ln); continue
             else:
                 in_hunk = False
     text = "\n".join(out).strip()
@@ -246,19 +250,9 @@ class SuggestedFile:
     b_path: str
     hunks: List[List[str]]  # each begins with "@@" then hunk lines
 
-def _parse_suggestions(text: str) -> List[SuggestedFile]:
-    out: List[SuggestedFile] = []
-    for blk in _split_blocks(text):
-        parsed = _rebuild_block_headers_only(blk)
-        if not parsed: continue
-        a_body, b_body, hunks = parsed
-        out.append(SuggestedFile(a_body, b_body, hunks))
-    return out
-
 _hunk_header_re = re.compile(r"^@@\s+-([0-9]+)(?:,([0-9]+))?\s+\+([0-9]+)(?:,([0-9]+))?\s+@@")
 
 def _old_sequence_from_hunk(hunk: List[str]) -> List[str]:
-    # Lines present in the ORIGINAL file within the hunk range: ' ' and '-'
     seq: List[str] = []
     for ln in hunk[1:]:
         if ln.startswith(" ") or ln.startswith("-"):
@@ -266,22 +260,24 @@ def _old_sequence_from_hunk(hunk: List[str]) -> List[str]:
     return seq
 
 def _new_sequence_from_hunk(hunk: List[str], original_slice: List[str]) -> List[str]:
-    # Build replacement using original content for ' ' lines to preserve whitespace.
     new_seq: List[str] = []
-    idx = 0  # index into original_slice for ' ' and '-'
+    idx = 0
     for ln in hunk[1:]:
         tag = ln[:1]
         body = ln[1:] + "\n"
         if tag == " ":
-            new_seq.append(original_slice[idx]); idx += 1
+            if idx < len(original_slice):
+                new_seq.append(original_slice[idx])
+            else:
+                new_seq.append(body)  # safety
+            idx += 1
         elif tag == "-":
-            idx += 1  # drop it
+            idx += 1
         elif tag == "+":
             new_seq.append(body)
     return new_seq
 
 def _find_exact_subsequence(hay: List[str], needle: List[str], start_hint: int = 0) -> int:
-    # Fast exact search from hint forward; return start index or -1
     n = len(needle)
     if n == 0: return -1
     i = max(0, start_hint)
@@ -294,19 +290,16 @@ def _find_exact_subsequence(hay: List[str], needle: List[str], start_hint: int =
 def _parse_oldstart(hunk: List[str]) -> int:
     m = _hunk_header_re.match(hunk[0])
     if not m: return 0
-    s = m.group(1)
     try:
-        return max(0, int(s) - 1)  # convert to 0-based
+        return max(0, int(m.group(1)) - 1)
     except Exception:
         return 0
 
 def _fuzzy_anchor_index(hay: List[str], needle: List[str], around: int, window: int = 80) -> int:
-    # Use a fuzzy window around expected oldstart; require deletions to be exact later.
     L = len(hay)
     lo = max(0, around - window)
     hi = min(L, around + window)
     sub = hay[lo:hi]
-    # Quick try on first/last 2 context lines if available
     cand_keys: List[List[str]] = []
     if len(needle) >= 2:
         cand_keys.append([needle[0], needle[1]])
@@ -316,18 +309,14 @@ def _fuzzy_anchor_index(hay: List[str], needle: List[str], around: int, window: 
     for key in cand_keys:
         pos = _find_exact_subsequence(sub, key, 0)
         if pos >= 0:
-            # try to expand to full needle
             base = lo + pos
             if base + len(needle) <= L and hay[base:base+len(needle)] == needle:
                 return base
-    # fallback SequenceMatcher to approximate start; we still verify deletes later
     sm = difflib.SequenceMatcher(a="".join(needle), b="".join(sub), autojunk=False)
     _, b1, _, _ = max(sm.get_opcodes(), key=lambda t: t[2]-t[1] if t[0]=="equal" else -1, default=(None,0,0,0))
     return lo + b1
 
 def _verify_deletions_match(hunk: List[str], hay: List[str], start: int) -> bool:
-    # Ensure every '-' line matches exactly against hay at the appropriate relative index.
-    # Walk through needle mapping indexes.
     old_seq = _old_sequence_from_hunk(hunk)
     if start < 0 or start + len(old_seq) > len(hay):
         return False
@@ -342,21 +331,31 @@ def _verify_deletions_match(hunk: List[str], hay: List[str], start: int) -> bool
             j += 1
     return True
 
-def _apply_hunks_to_content(orig: List[str], hunks: List[List[str]]) -> Optional[List[str]]:
+@dataclass
+class ApplyReport:
+    applied: List[int]
+    skipped: List[int]
+    result: List[str]
+
+def _apply_hunks_to_content(orig: List[str], hunks: List[List[str]]) -> ApplyReport:
+    """
+    Apply hunks sequentially. If a hunk fails strict deletion verification or cannot be located,
+    we **skip just that hunk** and continue.
+    """
     cur = orig[:]
     cursor_hint = 0
-    for h in hunks:
+    applied_idx: List[int] = []
+    skipped_idx: List[int] = []
+    for i, h in enumerate(hunks):
         old_seq = _old_sequence_from_hunk(h)
         if not old_seq:
-            # Pure insertion: try to anchor using nearest context around header
+            # pure insertion: insert near header hint
             around = _parse_oldstart(h)
-            anchor = _fuzzy_anchor_index(cur, [], around)
-            # No clear anchor ⇒ insert at around index
             start_idx = max(0, min(len(cur), around if around else 0))
-            orig_slice = []
-            new_seq = _new_sequence_from_hunk(h, orig_slice)
+            new_seq = _new_sequence_from_hunk(h, [])
             cur = cur[:start_idx] + new_seq + cur[start_idx:]
             cursor_hint = start_idx + len(new_seq)
+            applied_idx.append(i)
             continue
 
         around = _parse_oldstart(h)
@@ -364,22 +363,25 @@ def _apply_hunks_to_content(orig: List[str], hunks: List[List[str]]) -> Optional
         if start_idx < 0:
             start_idx = _find_exact_subsequence(cur, old_seq, start_hint=max(0, around-10))
         if start_idx < 0:
-            # fuzzy anchor near header number
+            # fuzzy anchor near expected location; still require exact '-' match
             start_idx = _fuzzy_anchor_index(cur, old_seq, around=around)
-            # strict deletions: if deletes don't match exactly at fuzzy spot → give up this file
             if not _verify_deletions_match(h, cur, start_idx):
-                return None
-            # If fuzzy anchor not aligned to entire old_seq, try exact from that spot
+                skipped_idx.append(i)
+                continue
             if start_idx < 0 or start_idx + len(old_seq) > len(cur):
-                return None
+                skipped_idx.append(i)
+                continue
 
         if not _verify_deletions_match(h, cur, start_idx):
-            return None
+            skipped_idx.append(i)
+            continue
 
         repl = _new_sequence_from_hunk(h, cur[start_idx:start_idx+len(old_seq)])
         cur = cur[:start_idx] + repl + cur[start_idx+len(old_seq):]
         cursor_hint = start_idx + len(repl)
-    return cur
+        applied_idx.append(i)
+
+    return ApplyReport(applied=applied_idx, skipped=skipped_idx, result=cur)
 
 def _make_unified_diff(rel_path: str, original: List[str], new_lines: List[str]) -> str:
     raw_lines = list(difflib.unified_diff(
@@ -390,33 +392,226 @@ def _make_unified_diff(rel_path: str, original: List[str], new_lines: List[str])
     body = "".join((ln if ln.endswith("\n") else (ln + "\n")) for ln in raw_lines)
     return f"diff --git a/{rel_path} b/{rel_path}\n{body}"
 
+def _make_new_file_diff(rel_path: str, new_lines: List[str]) -> str:
+    # Construct a minimal new-file patch with /dev/null → b/…
+    # Hunk header: @@ -0,0 +1,N @@
+    n = len(new_lines)
+    hdr = f"@@ -0,0 +1,{n} @@\n" if n > 0 else "@@ -0,0 +1,0 @@\n"
+    plus = "".join("+" + (ln[:-1] if ln.endswith("\n") else ln) + "\n" for ln in new_lines)
+    return (
+        f"diff --git a/{rel_path} b/{rel_path}\n"
+        f"--- /dev/null\n"
+        f"+++ b/{rel_path}\n"
+        f"{hdr}{plus}"
+    )
+
+def _make_deleted_file_diff(rel_path: str, original: List[str]) -> str:
+    n = len(original)
+    hdr = f"@@ -1,{n} +0,0 @@\n" if n > 0 else "@@ -1,0 +0,0 @@\n"
+    minus = "".join("-" + (ln[:-1] if ln.endswith("\n") else ln) + "\n" for ln in original)
+    return (
+        f"diff --git a/{rel_path} b/{rel_path}\n"
+        f"--- a/{rel_path}\n"
+        f"+++ /dev/null\n"
+        f"{hdr}{minus}"
+    )
+
+def _parse_suggestions(text: str) -> List[SuggestedFile]:
+    out: List[SuggestedFile] = []
+    for blk in _split_blocks(text):
+        parsed = _rebuild_block_headers_only(blk)
+        if not parsed: continue
+        a_body, b_body, hunks = parsed
+        out.append(SuggestedFile(a_body, b_body, hunks))
+    return out
+
+# ---------- Python import graph + rewrite for renames ----------
+
+_py_import_from = re.compile(r'^\s*from\s+([a-zA-Z_][\w\.]*)\s+import\b')
+_py_import_direct = re.compile(r'^\s*import\s+([a-zA-Z_][\w\.]*)(?:\s+as\b|\s*$|\s*,)')
+
+def _py_module_from_path(rel_path: str) -> Optional[str]:
+    if not rel_path.endswith(".py"): return None
+    # Treat project root as a package root; module is path with slashes→dots (without .py)
+    return rel_path[:-3].replace("/", ".")
+
+def _collect_repo_py_files(root: pathlib.Path) -> List[pathlib.Path]:
+    lst: List[pathlib.Path] = []
+    for p in (root / "bot").rglob("*.py"):
+        parts = set(p.parts) | {"/".join(p.parts[i:i+2]) for i in range(len(p.parts)-1)}
+        if any(x in _EXCLUDE_DIRS for x in parts): continue
+        if p.relative_to(root).as_posix() in _EXCLUDE_FILES: continue
+        lst.append(p)
+    return lst
+
+def _rewrite_imports_py(lines: List[str], old_mod: str, new_mod: str) -> Tuple[List[str], bool]:
+    changed = False
+    out: List[str] = []
+    # replace prefixes safely in import statements only
+    pat_from = re.compile(rf'^(\s*from\s+){re.escape(old_mod)}(\.|[\s]+import\b)')
+    pat_imp1 = re.compile(rf'^(\s*import\s+){re.escape(old_mod)}(\s|$|,|\.|as\b)')
+    pat_imp2 = re.compile(rf'^(\s*import\s+)(.*)')
+    for ln in lines:
+        s = ln
+        m = pat_from.match(s)
+        if m:
+            s = s.replace(m.group(0), f"{m.group(1)}{new_mod}{m.group(2)}", 1)
+            changed = True
+        else:
+            m2 = pat_imp1.match(s)
+            if m2:
+                # handle multi-imports: import a, b, old_mod.sub as x
+                # we replace any prefix occurrences of old_mod(.[…]) in the imported list
+                def _rep_import_list(body: str) -> str:
+                    parts = [p.strip() for p in body.split(",")]
+                    new_parts = []
+                    for p in parts:
+                        if p.startswith(old_mod + ".") or p == old_mod:
+                            new_parts.append(new_mod + p[len(old_mod):])
+                            changed_local = True
+                        else:
+                            new_parts.append(p)
+                    return ", ".join(new_parts)
+                m_any = pat_imp2.match(s)
+                if m_any:
+                    prefix = m_any.group(1)
+                    rest = m_any.group(2)
+                    new_rest = _rep_import_list(rest)
+                    if new_rest != rest:
+                        s = prefix + new_rest
+                        changed = True
+        out.append(s)
+    return out, changed
+
+def _rewrite_imports_for_rename(root: pathlib.Path, old_rel: str, new_rel: str) -> List[Tuple[str, List[str], List[str]]]:
+    """
+    Returns list of (rel_path, old_lines, new_lines) for files whose imports changed.
+    """
+    results: List[Tuple[str, List[str], List[str]]] = []
+    old_mod = _py_module_from_path(old_rel)
+    new_mod = _py_module_from_path(new_rel)
+    if not old_mod or not new_mod:
+        return results  # only Python import graph for now
+    for p in _collect_repo_py_files(root):
+        rel = p.relative_to(root).as_posix()
+        try:
+            raw = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        orig = [ln + "\n" for ln in raw.split("\n")]
+        # normalize
+        if orig and orig[-1] == "\n" and not raw.endswith("\n"):
+            orig = orig[:-1]
+        new_lines, changed = _rewrite_imports_py(orig, old_mod, new_mod)
+        if changed:
+            results.append((rel, orig, new_lines))
+    return results
+
+# ---------- main verified-diff builder ----------
+
 def _verified_patch_from_llm_diff(diff_text: str) -> str:
-    """Build a brand-new, correct unified diff by applying suggested hunks to actual files."""
+    """
+    Build a brand-new, correct unified diff by applying suggested hunks to actual files.
+    Supports:
+      • per-hunk skipping on failure (don’t drop whole file),
+      • new files (from /dev/null),
+      • deletes (to /dev/null),
+      • renames (old→new as delete+add) + Python import rewrites for dependents.
+    """
     root = get_project_root()
     suggestions = _parse_suggestions(diff_text)
     file_diffs: List[str] = []
+
     for sug in suggestions:
-        # choose path under repo
-        rel = sug.b_path or sug.a_path
-        if rel.startswith(("a/","b/")): rel = rel[2:]
-        if _is_excluded_path(rel): continue
-        abs_path = (root / rel)
-        if not abs_path.exists():
-            # New file additions not supported in this strict mode (can be added later).
+        a_rel = sug.a_path
+        b_rel = sug.b_path
+        if a_rel.startswith(("a/","b/")): a_rel = a_rel[2:]
+        if b_rel.startswith(("a/","b/")): b_rel = b_rel[2:]
+        if _is_excluded_path(a_rel) or _is_excluded_path(b_rel): continue
+
+        a_abs = (root / a_rel)
+        b_abs = (root / b_rel)
+        a_exists = a_abs.exists()
+        b_exists = b_abs.exists()
+
+        # DELETE (b=/dev/null) or LLM implies delete by producing only '-' hunks
+        if b_rel == "/dev/null" or (a_exists and not sug.hunks and a_rel != b_rel and not b_exists and b_rel == ""):
+            try:
+                data = a_abs.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            orig = [ln + "\n" for ln in data.split("\n")]
+            if orig and orig[-1] == "\n" and not data.endswith("\n"): orig = orig[:-1]
+            file_diffs.append(_make_deleted_file_diff(a_rel, orig))
             continue
-        try:
-            data = abs_path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
+
+        # NEW FILE
+        if (not a_exists) and (not b_exists or b_rel):
+            # Reconstruct new content from '+' lines of hunks
+            new_lines: List[str] = []
+            for h in (sug.hunks or []):
+                for ln in h[1:]:
+                    if ln.startswith("+"):
+                        new_lines.append(ln[1:] + "\n")
+            # if LLM provided no hunks, skip
+            if not new_lines: 
+                continue
+            file_diffs.append(_make_new_file_diff(b_rel or a_rel, new_lines))
             continue
-        data = data.replace("\r\n","\n").replace("\r","\n")
-        original = [ln + "\n" for ln in data.split("\n")]
-        if original and original[-1] == "\n" and data.endswith("\n")==False:
-            original = original[:-1]  # normalize if split added an extra
-        applied = _apply_hunks_to_content(original, sug.hunks)
-        if applied is None or applied == original:
-            # if any hunk fails strict checks, skip this file entirely
+
+        # RENAME (old exists, new not exists, possibly with edits)
+        is_rename = (a_rel != b_rel) and a_exists and (not b_exists)
+        if is_rename:
+            try:
+                data = a_abs.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            data = data.replace("\r\n","\n").replace("\r","\n")
+            orig = [ln + "\n" for ln in data.split("\n")]
+            if orig and orig[-1] == "\n" and not data.endswith("\n"): orig = orig[:-1]
+
+            if sug.hunks:
+                rep = _apply_hunks_to_content(orig, sug.hunks)
+                new_content = rep.result
+            else:
+                new_content = orig[:]
+
+            # emit delete old + add new
+            file_diffs.append(_make_deleted_file_diff(a_rel, orig))
+            file_diffs.append(_make_new_file_diff(b_rel, new_content))
+
+            # propagate import rewrites across repo (Python)
+            rewrites = _rewrite_imports_for_rename(root, a_rel, b_rel)
+            for rel, old_lines, new_lines in rewrites:
+                # skip self diffs already covered
+                if rel in (a_rel, b_rel): 
+                    continue
+                if old_lines != new_lines:
+                    file_diffs.append(_make_unified_diff(rel, old_lines, new_lines))
             continue
-        file_diffs.append(_make_unified_diff(rel, original, applied))
+
+        # EXISTING FILE EDITS
+        if a_exists:
+            try:
+                data = a_abs.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            data = data.replace("\r\n","\n").replace("\r","\n")
+            original = [ln + "\n" for ln in data.split("\n")]
+            if original and original[-1] == "\n" and not data.endswith("\n"):
+                original = original[:-1]
+
+            rep = _apply_hunks_to_content(original, sug.hunks or [])
+            if rep.result != original and rep.applied:
+                # Honor target path b_rel if different (LLM may suggest move+edit but file already exists)
+                dst_rel = b_rel or a_rel
+                file_diffs.append(_make_unified_diff(dst_rel, original, rep.result))
+            # else: nothing applied, skip
+            continue
+
+        # Fallback: if we got here, nothing matched; skip this suggestion
+        continue
+
     return ("\n".join(file_diffs) + ("\n" if file_diffs else ""))
 
 # ---------- utilities ----------
@@ -497,7 +692,6 @@ def _synthesize_python_type_checking_noop(rel_path: str, abs_path: pathlib.Path)
     original = [ln + "\n" for ln in data.split("\n")]
     if original and original[-1] == "\n" and data.endswith("\n")==False:
         original = original[:-1]
-    # insert below imports
     i = 0
     if original and original[0].startswith("#!"): i = 1
     while i < len(original) and (original[i].lstrip().startswith("from ") or original[i].lstrip().startswith("import ")):
@@ -522,10 +716,6 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
     prompt = _build_prompt(hotspots)
     raw = ask(prompt, max_tokens=2800, temperature=0.15)
 
-    def looks_like_diff(d: str) -> bool:
-        return ("diff --git " in d and "+++ " in d and "--- " in d and "@@ " in d)
-
-    # 1) sanitize → 2) verified-patch rebuild
     sanitized = _sanitize_to_diff(raw)
     verified = _verified_patch_from_llm_diff(sanitized) if sanitized else ""
 
@@ -567,14 +757,12 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
     if verified:
         applied = _git_apply(diff_path)
 
-    # Last-chance: if our verified patch failed (shouldn’t), do nothing rather than spam files
     note_bits = []
     if synth_used:
         note_bits.append("used synth fallback (TYPE_CHECKING no-op) because LLM diff could not be verified")
     note_bits.append("patch applied via git apply" if applied else "no verified changes applied")
     note = "; ".join(note_bits)
 
-    # PR summary
     try:
         pr_text = _generate_pr_md(verified if verified else "")
         (pathlib.Path(art_dir) / "PR.md").write_text(pr_text, encoding="utf-8")
