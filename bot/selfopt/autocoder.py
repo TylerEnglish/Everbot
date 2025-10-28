@@ -6,6 +6,7 @@ import os, sys, pathlib, subprocess, time, json, re, difflib
 from bot.paths import get_project_root
 from bot.llm.provider import ask, info, NotConfigured  # LLM interface
 
+_NO_SYNTH = os.getenv("EVERABOT_AUTOCODE_NO_SYNTH", "").strip() == "1"
 
 @dataclass
 class AutoCodeResult:
@@ -68,9 +69,10 @@ def _scan_hotspots(root: pathlib.Path, max_files: int = 5) -> List[pathlib.Path]
 def _build_prompt(file_paths: List[pathlib.Path]) -> str:
     header = (
         "You are Everabot's internal code refactorer.\n"
-        "Goals: safe improvements (docstrings, type hints, clearer names, micro-opts, better errors) "
-        "without changing behavior. Multi-language is OK (Python/C/C++/Rust/Go/ASM) if helpful.\n"
-        "Constraints:\n"
+        "Goals: safe, behavior-preserving improvements: stronger type hints, clearer names, input validation,"
+        " improved error messages, small helpers, and micro-optimizations. "
+        "Avoid comment-only or docstring-only patches.\n"
+         "Constraints:\n"
         " - Only modify files under 'bot/'.\n"
         " - Hard-ban generated/build/vendor paths (target/, build/, dist/, node_modules/, __pycache__/ ...).\n"
         " - Do NOT touch 'ruleset/' or 'test/'.\n"
@@ -78,6 +80,9 @@ def _build_prompt(file_paths: List[pathlib.Path]) -> str:
         " - No commentary; ONLY the diff.\n"
         " - Keep changes focused; ~20-150 lines of diff total.\n"
         " - Avoid editing 'bot/cli.py'; prefer utility modules or helpers.\n"
+        " - Make at least one functional-neutral code improvement (e.g., add precise type hints to public functions,"
+        " replace ambiguous exceptions with ValueError/TypeError, or factor a small helper)."
+        " Do NOT submit patches that are only comments or docstrings.\n"
         "If you cannot produce a valid unified diff, output exactly: #NOPATCH\n\n"
     )
     context = []
@@ -106,6 +111,15 @@ def _strip_code_fences(s: str) -> str:
     s = re.sub(r"```", "", s)
     return s
 
+def _norm_sep(path: str) -> str:
+    """
+    Normalize Git header paths to forward slashes; strip leading ./ and collapse a|b/ prefixes when needed.
+    """
+    if not path:
+        return path
+    p = path.replace("\\", "/").lstrip("./")
+    return p
+
 def _normalize_diff_git_headers(text: str) -> str:
     """
     Ensure 'diff --git' headers use 'a/<path> b/<path>' and align with ---/+++.
@@ -115,13 +129,13 @@ def _normalize_diff_git_headers(text: str) -> str:
     last_plus: Optional[str] = None
     for ln in text.splitlines():
         if ln.startswith("--- "):
-            path = ln[4:].strip()
+            path = _norm_sep(ln[4:].strip())
             if not (path.startswith("a/") or path.startswith("/dev/null")):
                 path = "a/" + path.lstrip("./")
             ln = f"--- {path}"
             last_minus = path[2:] if path.startswith("a/") else None
         elif ln.startswith("+++ "):
-            path = ln[4:].strip()
+            path = _norm_sep(ln[4:].strip())
             if not (path.startswith("b/") or path.startswith("/dev/null")):
                 path = "b/" + path.lstrip("./")
             ln = f"+++ {path}"
@@ -129,7 +143,7 @@ def _normalize_diff_git_headers(text: str) -> str:
         elif ln.startswith("diff --git "):
             m = re.match(r"^diff --git\s+(.+?)\s+(.+)$", ln)
             if m:
-                a, b = m.group(1).strip(), m.group(2).strip()
+                a, b = _norm_sep(m.group(1).strip()), _norm_sep(m.group(2).strip())
                 if not a.startswith("a/"):
                     a = f"a/{a.lstrip('./')}"
                 if not b.startswith("b/"):
@@ -157,6 +171,10 @@ def _split_blocks(text: str) -> list[list[str]]:
     return blocks
 
 def _is_excluded_path(p: str) -> bool:
+    # normalize slashes and strip potential a/ or b/ prefixes
+    p = _norm_sep(p)
+    if p.startswith("a/") or p.startswith("b/"):
+        p = p[2:]
     parts = p.split("/")
     pairs = set("/".join(parts[i:i+2]) for i in range(len(parts)-1))
     if p in _EXCLUDE_FILES:
@@ -166,23 +184,41 @@ def _is_excluded_path(p: str) -> bool:
 def _rebuild_block(blk: list[str]) -> Optional[str]:
     """
     Rebuild a single file diff block into a canonical minimal diff:
-    diff --git a/X b/X
-    --- a/X
-    +++ b/X
-    @@ hunk
-    (hunk body)
+      diff --git a/X b/X
+      --- a/X
+      +++ b/X
+      @@ hunk
+      (hunk body)
+    - Normalizes backslashes to forward slashes
+    - Strips a/ and b/ prefixes only for path filtering
+    - Re-adds canonical a/ and b/ prefixes in the rebuilt output
     """
+    # Find and parse the diff head line
     head = next((x for x in blk if x.startswith("diff --git ")), None)
     if not head:
         return None
-    m = re.match(r"^diff --git\s+a/(.+?)\s+b/(.+?)$", head.strip())
+
+    m = re.match(r"^diff --git\s+(.+?)\s+(.+)$", head.strip())
     if not m:
         return None
-    a_path, b_path = m.group(1), m.group(2)
-    if _is_excluded_path(a_path) or _is_excluded_path(b_path):
+
+    a_hdr, b_hdr = m.group(1).strip(), m.group(2).strip()
+
+    # Normalize path separators and remove leading ./, then strip a/|b/ for checks
+    def _norm_body(p: str) -> str:
+        p = p.replace("\\", "/").lstrip("./")
+        if p.startswith("a/") or p.startswith("b/"):
+            p = p[2:]
+        return p
+
+    a_body = _norm_body(a_hdr)
+    b_body = _norm_body(b_hdr)
+
+    # Exclusion gate (expects raw repo-relative path without a/|b/)
+    if _is_excluded_path(a_body) or _is_excluded_path(b_body):
         return None
 
-    # Collect hunks and body
+    # Collect all hunks
     lines: list[str] = []
     have_hunk = False
     in_hunk = False
@@ -193,20 +229,26 @@ def _rebuild_block(blk: list[str]) -> Optional[str]:
             in_hunk = True
             continue
         if in_hunk:
+            # Strict hunk body: ' ', '+', or '-'
             if ln.startswith((" ", "+", "-")):
                 lines.append(ln)
             else:
                 in_hunk = False
 
-    if not have_hunk:
+    if not have_hunk or not lines:
         return None
 
-    rebuilt = []
-    rebuilt.append(f"diff --git a/{a_path} b/{b_path}")
-    rebuilt.append(f"--- a/{a_path}")
-    rebuilt.append(f"+++ b/{b_path}")
+    # Rebuild canonical minimal block with normalized forward-slash paths
+    a_canon = a_body  # already forward slashes & repo-relative
+    b_canon = b_body
+    rebuilt = [
+        f"diff --git a/{a_canon} b/{b_canon}",
+        f"--- a/{a_canon}",
+        f"+++ b/{b_canon}",
+    ]
     rebuilt.extend(lines)
     return "\n".join(rebuilt)
+
 
 def _canonicalize_blocks(text: str) -> str:
     """
@@ -489,6 +531,14 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
         diff = _sanitize_to_diff(raw2)
         if diff.strip():
             raw = raw2
+    # Optional: disable synth fallback if user wants only LLM-derived diffs
+    if not looks_like_diff(diff) and _NO_SYNTH:
+        art_dir, diff_path, raw_path = _write_artifacts(prompt, raw, "")
+        note = "LLM diff invalid; synth disabled via EVERABOT_AUTOCODE_NO_SYNTH=1"
+        return AutoCodeResult(
+            title="autocode-refactor", patch_path=str(diff_path), patch_applied=False,
+            touched_paths=[], artifacts_dir=str(art_dir), note=note
+        )
 
     # Fallback: synthesize a minimal safe patch so the pipeline always modifies something
     synth_used = False
@@ -531,6 +581,8 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
                 raw = synth
                 break
     note_bits = []
+    if synth_used:
+        note_bits.append("used synth fallback (docstring/comment) due to invalid or non-applying LLM diff")
     note_bits.append("patch applied via git apply" if applied else "patch did NOT apply (see .rej files if any)")
     note = "; ".join(note_bits)
 
