@@ -822,7 +822,6 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
     while (not verified) and attempt < max(2, retries):
         attempt += 1
         pre = []
-        if no_op_reason:
         # Rebuild hotspots (files may change between attempts) and prompt with stronger constraints.
         hotspots = _scan_hotspots(root, max_files=max_files)
         fresh_ctx = _build_prompt(hotspots)
