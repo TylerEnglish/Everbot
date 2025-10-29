@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Iterable
-import os, pathlib, subprocess, time, re, difflib, json, math
+import os, pathlib, subprocess, time, re, difflib, json, math, textwrap
 
 from bot.paths import get_project_root
 from bot.llm.provider import ask, info, NotConfigured
@@ -167,6 +167,23 @@ def _scan_hotspots(root: pathlib.Path, max_files: int = 5) -> List[pathlib.Path]
         if p not in top:
             top.append(p)
     return top[:max_files]
+
+def _write_status(art_dir: pathlib.Path, status: Dict[str, object]) -> None:
+    try:
+        (art_dir / "status.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def _empty_reason(raw: str, sanitized: str, verified: str, no_op_reason: str) -> str:
+    if not raw.strip():
+        return "llm_raw_empty"
+    if sanitized.strip() == "":
+        return "sanitizer_dropped_non_diff_text"
+    if no_op_reason:
+        return f"filtered_noop:{no_op_reason}"
+    if verified.strip() == "":
+        return "verified_patch_empty_after_filters"
+    return "unknown"
 
 def _build_prompt(file_paths: List[pathlib.Path]) -> str:
     header = (
@@ -783,10 +800,9 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
     hotspots = _scan_hotspots(root, max_files=max_files)
     if not hotspots: return None
 
-    prompt = _build_prompt(hotspots)
-
-    # First shot: low temperature for determinism
-    raw = ask(prompt, max_tokens=2800, temperature=0.15)
+    # Keep the original context prompt; repair attempts should use fresh context, not prior raw output.
+    origin_prompt = _build_prompt(hotspots)
+    raw = ask(origin_prompt, max_tokens=2800, temperature=0.15)
 
     sanitized = _sanitize_to_diff(raw)
     verified = _verified_patch_from_llm_diff(sanitized) if sanitized else ""
@@ -806,17 +822,25 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
     while (not verified) and attempt < max(2, retries):
         attempt += 1
         pre = []
-        if no_op_reason == "typing-only":
-            pre.append(
-                "Previous diff was rejected as typing-only (e.g., only TYPE_CHECKING scaffolding). "
-                "Produce a NEW diff with an actual small refactor (arg checks, helper extraction, "
-                "clearer names, micro-optimization). Do NOT add TYPE_CHECKING-only edits.\n"
-            )
-        if no_op_reason.startswith("too-large"):
-            pre.append(
-                f"Previous diff exceeded the line budget. Keep TOTAL added+removed <= {_MAX_DIFF_LINES} lines. "
-                "Prefer focused, surgical edits.\n"
-            )
+        if no_op_reason:
+        # Rebuild hotspots (files may change between attempts) and prompt with stronger constraints.
+        hotspots = _scan_hotspots(root, max_files=max_files)
+        fresh_ctx = _build_prompt(hotspots)
+        guard = [
+            "If your prior suggestion was rejected, it was likely non-functional:",
+            " - typing-only (TYPE_CHECKING) or comment/doc-only edits are disallowed;",
+            " - diffs without at least one '@@' hunk are invalid;",
+            " - keep paths under bot/ and avoid bot/cli.py.",
+            "",
+            "Now produce ONE VALID unified diff that makes a tiny, behavior-preserving code improvement",
+            "(e.g., input validation, tighter error handling, small helper extraction, minor micro-optimization).",
+            "Absolute rules:",
+            " - Only output the diff; no prose.",
+            " - Must include 'diff --git a/... b/...', '---', '+++', and at least one '@@' hunk per file.",
+            " - Do NOT add TYPE_CHECKING-only or docstring-only changes.",
+        ]
+        repair_prompt = textwrap.dedent("\n".join(guard)) + "\n\n" + fresh_ctx
+        raw2 = ask(repair_prompt, max_tokens=2400, temperature=0.1)
         pre.append(
             "Convert to a VALID unified diff (no prose). Each file needs 'diff --git a/... b/...' "
             "+ headers and at least one '@@' hunk. Avoid comment/docstring-only edits.\nOUTPUT:\n"
@@ -833,6 +857,7 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
                 is_noop = _STRICT_NOOP and _diff_is_typing_noop(v2)
                 if not over and not is_noop:
                     raw = raw2
+                    raw, sanitized, verified = raw2, sanitized2, v2
                     verified = v2
                     break
         no_op_reason = ""
@@ -851,7 +876,14 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
                     raw = synth
                     synth_used = True
 
-    art_dir, diff_path, _ = _write_artifacts(prompt, raw, verified)
+    art_dir, diff_path, _ = _write_artifacts(origin_prompt, raw, verified)
+    # Persist a small status block explaining empties and bookkeeping details.
+    _write_status(art_dir, {
+        "reason": _empty_reason(raw, sanitized, verified, no_op_reason),
+        "sizes": {"raw": len(raw or ""), "sanitized": len(sanitized or ""), "verified": len(verified or "")},
+        "strict_noop": bool(_STRICT_NOOP),
+        "synth_used": bool(synth_used)
+    })
     touched = _touch_list_from_diff(verified) if verified else []
 
     applied = False
