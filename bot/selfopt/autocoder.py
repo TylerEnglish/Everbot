@@ -273,6 +273,8 @@ def _split_blocks(text: str) -> list[list[str]]:
 
 def _is_excluded_path(p: str) -> bool:
     p = _norm_sep(p)
+    if p == "/dev/null":
+        return False  # special case: allow devnull as sentinel
     if p.startswith(("a/","b/")): p = p[2:]
     parts = p.split("/")
     pairs = set("/".join(parts[i:i+2]) for i in range(len(parts)-1))
@@ -315,11 +317,24 @@ def _rebuild_block_headers_only(blk: list[str]) -> Optional[Tuple[str,str,list[l
     m = re.match(r"^diff --git\s+(.+?)\s+(.+)$", head.strip())
     if not m: return None
     a_hdr, b_hdr = m.group(1).strip(), m.group(2).strip()
+
+    # detect devnull from --- / +++ lines
+    minus_line = next((x for x in blk if x.startswith("--- ")), "")
+    plus_line  = next((x for x in blk if x.startswith("+++ ")), "")
+    minus_path = _norm_sep(minus_line[4:].strip()) if minus_line else ""
+    plus_path  = _norm_sep(plus_line[4:].strip()) if plus_line  else ""
+
     def _norm_body(p: str) -> str:
         p = p.replace("\\","/").lstrip("./")
         if p.startswith(("a/","b/")): p = p[2:]
         return p
+
     a_body, b_body = _norm_body(a_hdr), _norm_body(b_hdr)
+    if minus_path == "/dev/null":
+        a_body = "/dev/null"
+    if plus_path == "/dev/null":
+        b_body = "/dev/null"
+
     if _is_excluded_path(a_body) or _is_excluded_path(b_body): return None
 
     # collect hunks
@@ -334,6 +349,7 @@ def _rebuild_block_headers_only(blk: list[str]) -> Optional[Tuple[str,str,list[l
                 break
             cur.append(ln)
     if cur: hunks.append(cur)
+
     # drop useless blocks
     filtered_hunks = []
     for h in hunks:
@@ -343,11 +359,11 @@ def _rebuild_block_headers_only(blk: list[str]) -> Optional[Tuple[str,str,list[l
             if _block_is_typechecking_noop(h):
                 continue
             filtered_hunks.append(h)
+
     if not filtered_hunks and a_body == b_body:
-        # allow header-only (e.g., LLM suggesting rename elsewhere)
         return a_body, b_body, []
     if not filtered_hunks and a_body != b_body:
-        # permit rename with zero hunks (pure move)
+        # permit pure rename/create/delete headers
         return a_body, b_body, []
     return (a_body, b_body, filtered_hunks) if filtered_hunks or a_body != b_body else None
 
@@ -359,6 +375,7 @@ def _sanitize_to_diff(raw: str) -> str:
     lines = raw.splitlines()
     out: list[str] = []
     in_hunk = False
+
     def _ensure_ab(line: str) -> str:
         if line.startswith("--- "):
             path = _norm_sep(line[4:].strip())
@@ -367,6 +384,7 @@ def _sanitize_to_diff(raw: str) -> str:
             path = _norm_sep(line[4:].strip())
             if not (path.startswith("b/") or path.startswith("/dev/null")): return "+++ b/" + path
         return line
+
     for ln in lines:
         if ln.startswith(_ALLOWED_DIFF_PREFIXES):
             if ln.startswith(("--- ","+++ ")): ln = _ensure_ab(ln)
@@ -594,6 +612,7 @@ _py_import_direct = re.compile(r'^\s*import\s+([a-zA-Z_][\w\.]*)(?:\s+as\b|\s*$|
 
 def _py_module_from_path(rel_path: str) -> Optional[str]:
     if not rel_path.endswith(".py"): return None
+    if rel_path == "/dev/null": return None
     return rel_path[:-3].replace("/", ".")
 
 def _collect_repo_py_files(root: pathlib.Path) -> List[pathlib.Path]:
@@ -695,6 +714,8 @@ def _parse_added_removed(diff_text: str) -> dict:
             continue
         if not in_hunk or not current:
             continue
+        if raw.startswith("+++ ") or raw.startswith("--- "):
+            continue
         if raw.startswith("+"):
             files[current]["added"] += 1
             body = raw[1:].strip()
@@ -707,18 +728,29 @@ def _parse_added_removed(diff_text: str) -> dict:
     return files
 
 def _diff_is_typing_noop(diff_text: str) -> bool:
-    summary = _parse_added_removed(diff_text)
-    if not summary:
+    """Robustly detect TYPE_CHECKING-only diffs (no other code changes)."""
+    has_removals = False
+    has_typing_scaffold = False
+    substantive_additions = 0
+
+    for raw in diff_text.splitlines():
+        if raw.startswith("diff --git ") or raw.startswith(("--- ", "+++ ", "@@ ")):
+            continue
+        if raw.startswith("-"):
+            has_removals = True
+        elif raw.startswith("+"):
+            body = raw[1:].strip()
+            if body in ("",):
+                continue
+            if body.startswith("from typing import TYPE_CHECKING") or body == "if TYPE_CHECKING:" or "Autocode: non-functional" in body:
+                has_typing_scaffold = True
+                continue
+            # any other added code counts as substantive
+            substantive_additions += 1
+
+    if has_removals:
         return False
-    if any(v["removed"] > 0 for v in summary.values()):
-        return False
-    return all(
-        v["added_typing_tc"] and all(
-            not (imp.strip() and not imp.strip().startswith("from typing import TYPE_CHECKING"))
-            for imp in v["added_imports"]
-        )
-        for v in summary.values()
-    )
+    return has_typing_scaffold and substantive_additions == 0
 
 def _diff_line_count(diff_text: str) -> int:
     s = _parse_added_removed(diff_text)
@@ -828,15 +860,15 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
         if b_rel.startswith(("a/","b/")): b_rel = b_rel[2:]
         if _is_excluded_path(a_rel) or _is_excluded_path(b_rel): continue
 
-        a_abs = (root / a_rel)
-        b_abs = (root / b_rel)
-        a_exists = a_abs.exists()
-        b_exists = b_abs.exists()
+        a_abs = (root / a_rel) if a_rel != "/dev/null" else None
+        b_abs = (root / b_rel) if b_rel != "/dev/null" else None
+        a_exists = a_abs.exists() if a_abs else False
+        b_exists = b_abs.exists() if b_abs else False
 
-        # DELETE
-        if b_rel == "/dev/null":
+        # DELETE: a -> /dev/null
+        if b_rel == "/dev/null" and a_rel != "/dev/null" and a_exists:
             try:
-                data = a_abs.read_text(encoding="utf-8", errors="replace")
+                data = (a_abs).read_text(encoding="utf-8", errors="replace")
             except Exception:
                 continue
             orig = [ln + "\n" for ln in data.split("\n")]
@@ -844,23 +876,22 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
             file_diffs.append(_make_deleted_file_diff(a_rel, orig))
             continue
 
-        # NEW FILE
-        if (not a_exists) and b_rel and (not b_exists):
+        # NEW FILE: /dev/null -> b
+        if a_rel == "/dev/null" and b_rel != "/dev/null" and not b_exists:
             new_lines: List[str] = []
             for h in (sug.hunks or []):
                 for ln in h[1:]:
                     if ln.startswith("+"):
                         new_lines.append(ln[1:] + "\n")
-            if not new_lines:
-                continue
+            # allow header-only create (empty file)
             file_diffs.append(_make_new_file_diff(b_rel, new_lines))
             continue
 
-        # RENAME (old exists, new does not)
-        is_rename = (a_rel != b_rel) and a_exists and (not b_exists)
+        # RENAME (with or without edits)
+        is_rename = (a_rel != b_rel) and a_rel != "/dev/null" and b_rel != "/dev/null" and a_exists and (not b_exists)
         if is_rename:
             try:
-                data = a_abs.read_text(encoding="utf-8", errors="replace")
+                data = (a_abs).read_text(encoding="utf-8", errors="replace")
             except Exception:
                 continue
             data = data.replace("\r\n","\n").replace("\r","\n")
@@ -888,7 +919,7 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
         # EXISTING FILE EDITS
         if a_exists:
             try:
-                data = a_abs.read_text(encoding="utf-8", errors="replace")
+                data = (a_abs).read_text(encoding="utf-8", errors="replace")
             except Exception:
                 continue
             data = data.replace("\r\n","\n").replace("\r","\n")
@@ -1031,7 +1062,7 @@ def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, v
       3) Try the safest strategy that fits:
          a) If any new/untracked files or index mismatch → prefer working-tree apply (no --index), then stage.
          b) Else try --index.
-         c) If that fails, try --3way (this implies an index-based apply).
+         c) If that fails, try --3way (implies --index).
          d) Last resort: --reject (treated as failure if any .rej created).
     Writes a JSON report (apply.json) when artifacts_dir is set.
     """
@@ -1056,21 +1087,16 @@ def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, v
         return code == 0
 
     def _paths_clean(paths: list[str]) -> bool:
-        """
-        Are these paths identical in index & working tree relative to HEAD?
-        Use: git diff-index --quiet HEAD -- <paths>
-        Returns True when no differences are found.
-        """
+        # Are these paths identical in index & working tree? If any differ, --index will balk.
         if not paths:
             return True
-        # Refresh stat info to avoid false mismatches (Windows / network fs).
-        _run(["git","update-index","-q","--refresh"])  # docs: refresh stat info only
-        # Correct ordering per git docs: git diff-index --quiet HEAD -- <paths>
+        # Correct arg order: HEAD before pathspec separator
         code, _, _ = _run(["git","diff-index","--quiet","HEAD","--", *paths])
+        # diff-index returns 0 when no differences
         return code == 0
 
-    # Initial refresh before probing (defensive; see above comment).
-    _run(["git","update-index","-q","--refresh"])  # refresh stat info only
+    # Refresh stat info to avoid false index mismatches on Windows.
+    _run(["git","update-index","-q","--refresh"])
 
     tracked_map = {p: _tracked(p) for p in touched}
     has_untracked = any(not v for v in tracked_map.values())
@@ -1092,4 +1118,55 @@ def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, v
     strategies: list[list[str]] = []
     if has_untracked or not index_clean:
         strategies.append(["git","apply","--whitespace=fix","--ignore-whitespace"])
-        strategies.append(["git","apply","--recount","--unidiff-zero","--whitespace=fix","--ignore-wh
+        strategies.append(["git","apply","--recount","--unidiff-zero","--whitespace=fix","--ignore-whitespace"])
+        strategies.append(["git","apply","--3way"])
+    else:
+        strategies.append(["git","apply","--index","--whitespace=fix"])
+        strategies.append(["git","apply","--index","--recount","--unidiff-zero","--whitespace=fix"])
+        strategies.append(["git","apply","--3way"])
+    strategies.append(["git","apply","--reject","--whitespace=nowarn"])
+
+    chosen = None
+    for cmd in strategies:
+        attempt: Dict[str, object] = {"cmd": _summarize_cmd(cmd), "check_ok": False, "applied": False, "rej_delta": 0}
+        check_ok = _check(cmd)
+        attempt["check_ok"] = bool(check_ok)
+        if not check_ok:
+            report["attempts"].append(attempt)
+            continue
+        before_rej = list(root.rglob("*.rej"))
+        applied = _apply_cmd(cmd)
+        after_rej = list(root.rglob("*.rej"))
+        attempt["applied"] = bool(applied)
+        attempt["rej_delta"] = max(0, len(after_rej) - len(before_rej))
+        report["attempts"].append(attempt)
+        if applied:
+            if "--reject" in cmd and attempt["rej_delta"]:
+                # treat partial apply as failure
+                continue
+            chosen = cmd
+            break
+
+    if chosen and ("--index" not in chosen and "--3way" not in chosen) and touched:
+        # stage touched files explicitly if we didn’t use an index strategy
+        _run(["git","add","--"] + touched)
+
+    ok = chosen is not None
+    report["chosen"] = _summarize_cmd(chosen) if chosen else None
+    if verbose:
+        ch = report["chosen"] or "NONE"
+        print(f"[autocoder][apply] result={ok} strategy={ch}")
+    if artifacts_dir:
+        try:
+            summary = (
+                f"chosen={report['chosen']}\n"
+                f"touched={len(touched)} has_untracked={has_untracked} index_clean={index_clean}\n"
+                + "\n".join(
+                    f"- try: {a['cmd']} check_ok={a['check_ok']} applied={a['applied']} rej_delta={a['rej_delta']}"
+                    for a in report["attempts"]
+                ) + "\n"
+            )
+            pathlib.Path(artifacts_dir, "apply.txt").write_text(summary, encoding="utf-8")
+        except Exception:
+            pass
+    return ok, report
