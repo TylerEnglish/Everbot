@@ -30,7 +30,6 @@ class AutoCodeResult:
     note: str
 
 # ---------- config / guards ----------
-# Accept more header lines so we don't drop otherwise-correct diffs (rename, modes, similarity, etc.)
 _ALLOWED_DIFF_PREFIXES = (
     "diff --git", "index ", "--- ", "+++ ", "@@ ",
     "new file mode ", "deleted file mode ", "old mode ", "new mode ",
@@ -47,6 +46,14 @@ _AUTOCODE_MARKER = "Autocode: non-functional"
 _DOC_OR_COMMENT_START = re.compile(r'^\+\s*(#|[rubfRUBF]?("""|\'\'\'))')
 _DOC_OR_COMMENT_END   = re.compile(r'^\+\s*("""|\'\'\')\s*$')
 
+# Heuristics for extracting "File: bot/x.py" around code blocks
+_FILE_HINT_PATTERNS = [
+    re.compile(r'(?im)^[>\-\*\s#]*file(?:name)?\s*:\s*(bot/[^\s:]+)\s*$', re.MULTILINE),
+    re.compile(r'(?im)^[>\-\*\s#]*path\s*:\s*(bot/[^\s:]+)\s*$', re.MULTILINE),
+    re.compile(r'(?im)^\s*(bot/[A-Za-z0-9_\-./]+)\s*:?$', re.MULTILINE),
+    re.compile(r'(?im)^[>\-\*\s#]*(?:updated|edit|replace)\s+(bot/[A-Za-z0-9_\-./]+)\s*:?$', re.MULTILINE),
+]
+
 def _llm_ok() -> bool:
     try:
         _ = info()
@@ -56,10 +63,6 @@ def _llm_ok() -> bool:
 
 # ---------- bookkeeping to avoid thrashing ----------
 def _recent_autocode_touches(root: pathlib.Path) -> Dict[str, float]:
-    """
-    Scan snapshots/selfopt/autocode/*/apply.json and build a map:
-      { 'bot/relative/path' : last_touched_epoch_seconds }
-    """
     base = root / "snapshots" / "selfopt" / "autocode"
     out: Dict[str, float] = {}
     if not base.exists():
@@ -92,10 +95,6 @@ def _recent_autocode_touches(root: pathlib.Path) -> Dict[str, float]:
     return out
 
 def _targets_from_env(root: pathlib.Path) -> List[pathlib.Path]:
-    """
-    If EVERABOT_AUTOCODE_TARGETS is set (comma-separated globs relative to project root),
-    return those files (filtered to bot/* and not excluded). Used to bias hotspot selection.
-    """
     if not _TARGETS_ENV:
         return []
     raw_globs = [g.strip() for g in _TARGETS_ENV.split(",") if g.strip()]
@@ -117,10 +116,6 @@ def _targets_from_env(root: pathlib.Path) -> List[pathlib.Path]:
     return picks
 
 def _scan_hotspots(root: pathlib.Path, max_files: int = 5) -> List[pathlib.Path]:
-    """
-    Heuristic: prioritize (1) explicit targets, (2) many TODOs, (3) longer files,
-    with cooldown penalties for recently-autocoded files.
-    """
     repo_dir = root / "bot"
     files: list[tuple[float, int, pathlib.Path]] = []
 
@@ -139,7 +134,6 @@ def _scan_hotspots(root: pathlib.Path, max_files: int = 5) -> List[pathlib.Path]
         todos = text.upper().count("TODO") + text.upper().count("FIXME")
         touched_penalty = 250000 if "Autocode:" in text else 0
 
-        # Cooldown: penalize files touched in last _COOLDOWN_HOURS
         cd_pen = 0.0
         last = cooldown.get(rel_posix)
         if last:
@@ -179,8 +173,8 @@ def _write_status(art_dir: pathlib.Path, status: Dict[str, object]) -> None:
 def _empty_reason(raw: str, sanitized: str, verified: str, no_op_reason: str) -> str:
     if not (raw or "").strip():
         return "llm_raw_empty"
-    if (sanitized or "").strip() == "":
-        return "sanitizer_dropped_non_diff_text"
+    if (sanitized or "").strip() == "" and (verified or "").strip() == "":
+        return "no_diff_and_no_salvage"
     if no_op_reason:
         return f"filtered_noop:{no_op_reason}"
     if (verified or "").strip() == "":
@@ -201,10 +195,9 @@ def _build_prompt(file_paths: List[pathlib.Path]) -> str:
         " - Avoid editing bot/cli.py.\n"
         " - Include at least ONE meaningful code change (e.g., arg checks, helper extraction, clearer names,\n"
         "   error message improvements, tiny performance wins). Not just imports.\n"
-        " - DO NOT produce a typing-only patch (e.g., only adding `from typing import TYPE_CHECKING` with\n"
+        " - Do NOT produce a typing-only patch (e.g., only adding `from typing import TYPE_CHECKING` with\n"
         "   an `if TYPE_CHECKING:` block). Such diffs will be rejected.\n"
-        " - Do NOT introduce new hard runtime deps (e.g., numpy, pyarrow). If types are needed, use `Any`\n"
-        "   or guard imports under `if TYPE_CHECKING:`.\n"
+        " - Do NOT introduce new hard runtime deps.\n"
         "If you cannot produce a valid unified diff, output exactly: #NOPATCH\n\n"
     )
     ctx = []
@@ -224,7 +217,7 @@ def _clean_unicode(s: str) -> str:
 
 def _strip_code_fences(s: str) -> str:
     s = _clean_unicode(s)
-    s = re.sub(r"```(?:[a-zA-Z0-9_-]+)?\n", "", s)
+    s = re.sub(r"```(?:[a-zA-Z0-9_.+\-]+)?\n", "", s)
     s = re.sub(r"```", "", s)
     return s
 
@@ -274,7 +267,7 @@ def _split_blocks(text: str) -> list[list[str]]:
 def _is_excluded_path(p: str) -> bool:
     p = _norm_sep(p)
     if p == "/dev/null":
-        return False  # special case: allow devnull as sentinel
+        return False
     if p.startswith(("a/","b/")): p = p[2:]
     parts = p.split("/")
     pairs = set("/".join(parts[i:i+2]) for i in range(len(parts)-1))
@@ -296,12 +289,6 @@ def _block_has_only_comment_or_doc_additions(hunk_lines: List[str]) -> bool:
     return True
 
 def _block_is_typechecking_noop(hunk_lines: List[str]) -> bool:
-    """
-    True if all '+' lines are the canonical typing scaffold we consider a no-op:
-      - 'from typing import TYPE_CHECKING'
-      - 'if TYPE_CHECKING:' + the 'Autocode: non-functional' pass block
-    and nothing else.
-    """
     plus = [ln[1:].rstrip("\n") for ln in hunk_lines[1:] if ln.startswith("+")]
     if not plus:
         return False
@@ -318,7 +305,6 @@ def _rebuild_block_headers_only(blk: list[str]) -> Optional[Tuple[str,str,list[l
     if not m: return None
     a_hdr, b_hdr = m.group(1).strip(), m.group(2).strip()
 
-    # detect devnull from --- / +++ lines
     minus_line = next((x for x in blk if x.startswith("--- ")), "")
     plus_line  = next((x for x in blk if x.startswith("+++ ")), "")
     minus_path = _norm_sep(minus_line[4:].strip()) if minus_line else ""
@@ -337,7 +323,6 @@ def _rebuild_block_headers_only(blk: list[str]) -> Optional[Tuple[str,str,list[l
 
     if _is_excluded_path(a_body) or _is_excluded_path(b_body): return None
 
-    # collect hunks
     hunks: list[list[str]] = []
     cur: list[str] = []
     for ln in blk:
@@ -345,12 +330,11 @@ def _rebuild_block_headers_only(blk: list[str]) -> Optional[Tuple[str,str,list[l
             if cur: hunks.append(cur)
             cur = [ln]
         elif cur:
-            if ln.startswith("diff --git "):  # safety
+            if ln.startswith("diff --git "):
                 break
             cur.append(ln)
     if cur: hunks.append(cur)
 
-    # drop useless blocks
     filtered_hunks = []
     for h in hunks:
         if any(x.startswith(("+","-"," ")) for x in h[1:]):
@@ -363,7 +347,6 @@ def _rebuild_block_headers_only(blk: list[str]) -> Optional[Tuple[str,str,list[l
     if not filtered_hunks and a_body == b_body:
         return a_body, b_body, []
     if not filtered_hunks and a_body != b_body:
-        # permit pure rename/create/delete headers
         return a_body, b_body, []
     return (a_body, b_body, filtered_hunks) if filtered_hunks or a_body != b_body else None
 
@@ -414,7 +397,6 @@ def _sanitize_to_diff(raw: str) -> str:
     return (text + "\n") if text else ""
 
 # ---------- Verified patcher (apply LLM hunks to real files, then re-diff) ----------
-
 @dataclass
 class SuggestedFile:
     a_path: str
@@ -440,7 +422,7 @@ def _new_sequence_from_hunk(hunk: List[str], original_slice: List[str]) -> List[
             if idx < len(original_slice):
                 new_seq.append(original_slice[idx])
             else:
-                new_seq.append(body)  # safety
+                new_seq.append(body)
             idx += 1
         elif tag == "-":
             idx += 1
@@ -467,10 +449,6 @@ def _parse_oldstart(hunk: List[str]) -> int:
         return 0
 
 def _fuzzy_anchor_index(hay: List[str], needle: List[str], around: int, window: int = 80) -> int:
-    """
-    Look near the expected 'around' line for the best matching equal block and
-    return its starting index in the 'b' side (j1), shifted back into the global 'hay'.
-    """
     L = len(hay)
     lo = max(0, around - window)
     hi = min(L, around + window)
@@ -518,10 +496,6 @@ class ApplyReport:
     result: List[str]
 
 def _apply_hunks_to_content(orig: List[str], hunks: List[List[str]]) -> ApplyReport:
-    """
-    Apply hunks sequentially. If a hunk fails strict deletion verification or cannot be located,
-    we **skip just that hunk** and continue.
-    """
     cur = orig[:]
     cursor_hint = 0
     applied_idx: List[int] = []
@@ -529,7 +503,6 @@ def _apply_hunks_to_content(orig: List[str], hunks: List[List[str]]) -> ApplyRep
     for i, h in enumerate(hunks):
         old_seq = _old_sequence_from_hunk(h)
         if not old_seq:
-            # pure insertion: insert near header hint
             around = _parse_oldstart(h)
             start_idx = max(0, min(len(cur), around if around else 0))
             new_seq = _new_sequence_from_hunk(h, [])
@@ -543,7 +516,6 @@ def _apply_hunks_to_content(orig: List[str], hunks: List[List[str]]) -> ApplyRep
         if start_idx < 0:
             start_idx = _find_exact_subsequence(cur, old_seq, start_hint=max(0, around-10))
         if start_idx < 0:
-            # fuzzy anchor near expected location; still require exact '-' match
             start_idx = _fuzzy_anchor_index(cur, old_seq, around=around)
             if not _verify_deletions_match(h, cur, start_idx):
                 skipped_idx.append(i)
@@ -573,8 +545,6 @@ def _make_unified_diff(rel_path: str, original: List[str], new_lines: List[str])
     return f"diff --git a/{rel_path} b/{rel_path}\n{body}"
 
 def _make_new_file_diff(rel_path: str, new_lines: List[str]) -> str:
-    # Construct a minimal new-file patch with /dev/null → b/…
-    # Hunk header: @@ -0,0 +1,N @@
     n = len(new_lines)
     hdr = f"@@ -0,0 +1,{n} @@\n" if n > 0 else "@@ -0,0 +1,0 @@\n"
     plus = "".join("+" + (ln[:-1] if ln.endswith("\n") else ln) + "\n" for ln in new_lines)
@@ -606,7 +576,6 @@ def _parse_suggestions(text: str) -> List[SuggestedFile]:
     return out
 
 # ---------- Python import graph + rewrite for renames ----------
-
 _py_import_from = re.compile(r'^\s*from\s+([a-zA-Z_][\w\.]*)\s+import\b')
 _py_import_direct = re.compile(r'^\s*import\s+([a-zA-Z_][\w\.]*)(?:\s+as\b|\s*$|\s*,)')
 
@@ -728,7 +697,6 @@ def _parse_added_removed(diff_text: str) -> dict:
     return files
 
 def _diff_is_typing_noop(diff_text: str) -> bool:
-    """Robustly detect TYPE_CHECKING-only diffs (no other code changes)."""
     has_removals = False
     has_typing_scaffold = False
     substantive_additions = 0
@@ -745,7 +713,6 @@ def _diff_is_typing_noop(diff_text: str) -> bool:
             if body.startswith("from typing import TYPE_CHECKING") or body == "if TYPE_CHECKING:" or "Autocode: non-functional" in body:
                 has_typing_scaffold = True
                 continue
-            # any other added code counts as substantive
             substantive_additions += 1
 
     if has_removals:
@@ -822,8 +789,74 @@ def _synthesize_python_type_checking_noop(rel_path: str, abs_path: pathlib.Path)
     insert += ["if TYPE_CHECKING:\n","    pass  # Autocode: non-functional type-only block\n"]
     return _make_unified_diff(rel_path, original, new_lines=original[:i] + insert + original[i:])
 
+# ---------- code-block → diff salvage ----------
+_CODE_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_.+\-]*)\n([\s\S]*?)```", re.MULTILINE)
+
+def _guess_path_from_context(whole: str, start_idx: int, code_text: str) -> Optional[str]:
+    # look 500 chars back for "File: bot/x.py" style hints
+    lo = max(0, start_idx - 500)
+    ctx = whole[lo:start_idx]
+    for pat in _FILE_HINT_PATTERNS:
+        m = pat.search(ctx)
+        if m:
+            candidate = _norm_sep(m.group(1))
+            if candidate.startswith("bot/") and not _is_excluded_path(candidate):
+                return candidate
+
+    # also inspect first few lines of the code block for a "FILE:" hint
+    top_lines = "\n".join(code_text.splitlines()[:5])
+    m = re.search(r'(?im)^\s*(?:#\s*)?(?:file|path)\s*:\s*(bot/[^\s:]+)\s*$', top_lines)
+    if m:
+        candidate = _norm_sep(m.group(1))
+        if candidate.startswith("bot/") and not _is_excluded_path(candidate):
+            return candidate
+
+    # last resort: find a bare "bot/..." on a dedicated line inside ctx
+    m = re.search(r'(?m)^\s*(bot/[A-Za-z0-9_\-./]+)\s*:?$', ctx)
+    if m:
+        candidate = _norm_sep(m.group(1))
+        if candidate.startswith("bot/") and not _is_excluded_path(candidate):
+            return candidate
+
+    return None
+
+def _diff_from_code_blocks(raw: str, root: pathlib.Path) -> Tuple[str, List[str]]:
+    """
+    Extract code fences, locate intended target paths, and build a single
+    concatenated unified diff across all recognized files.
+    Returns (diff_text, touched_paths).
+    """
+    diffs: List[str] = []
+    touched: List[str] = []
+    for m in _CODE_FENCE_RE.finditer(raw):
+        code_text = m.group(1)
+        rel = _guess_path_from_context(raw, m.start(), code_text)
+        if not rel:
+            continue
+        abs_path = root / rel
+        try:
+            if abs_path.exists():
+                original_text = abs_path.read_text(encoding="utf-8", errors="replace").replace("\r\n","\n").replace("\r","\n")
+                original = [ln + "\n" for ln in original_text.split("\n")]
+                if original and original[-1] == "\n" and not original_text.endswith("\n"):
+                    original = original[:-1]
+                new_lines = [(ln if ln.endswith("\n") else ln + "\n") for ln in code_text.replace("\r\n","\n").replace("\r","\n").split("\n")]
+                if new_lines and new_lines[-1] == "\n" and not code_text.endswith("\n"):
+                    new_lines = new_lines[:-1]
+                diffs.append(_make_unified_diff(rel, original, new_lines))
+            else:
+                new_lines = [(ln if ln.endswith("\n") else ln + "\n") for ln in code_text.replace("\r\n","\n").replace("\r","\n").split("\n")]
+                if new_lines and new_lines[-1] == "\n" and not code_text.endswith("\n"):
+                    new_lines = new_lines[:-1]
+                diffs.append(_make_new_file_diff(rel, new_lines))
+            touched.append(rel)
+        except Exception:
+            continue
+    joined = ("\n".join(diffs) + ("\n" if diffs else ""))
+    return joined, touched
+
 # ---------- artifact helpers ----------
-def _write_artifacts(prompt: str, raw: str, diff: str) -> Tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+def _write_artifacts(prompt: str, raw: str, diff: str, salvage: str = "") -> Tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
     base = get_project_root() / "snapshots" / "selfopt" / "autocode" / time.strftime("%Y%m%d_%H%M%S")
     base.mkdir(parents=True, exist_ok=True)
     (base / "prompt.txt").write_text(prompt, encoding="utf-8")
@@ -833,6 +866,8 @@ def _write_artifacts(prompt: str, raw: str, diff: str) -> Tuple[pathlib.Path, pa
     out = out.replace("\r\n","\n").replace("\r","\n")
     if out and not out.endswith("\n"): out += "\n"
     diff_path.write_text(out, encoding="utf-8")
+    if salvage:
+        (base / "salvage.diff").write_text(salvage, encoding="utf-8")
     try:
         print(f"[autocoder] artifacts -> {base}  (prompt.txt={ (base/'prompt.txt').stat().st_size }B, raw.txt={ (base/'raw.txt').stat().st_size }B, patch.diff={ diff_path.stat().st_size }B)")
     except Exception:
@@ -841,14 +876,6 @@ def _write_artifacts(prompt: str, raw: str, diff: str) -> Tuple[pathlib.Path, pa
 
 # ---------- build a verified, repo-accurate patch ----------
 def _verified_patch_from_llm_diff(diff_text: str) -> str:
-    """
-    Build a brand-new, correct unified diff by applying suggested hunks to actual files.
-    Supports:
-      • per-hunk skipping on failure (don’t drop whole file),
-      • new files (from /dev/null),
-      • deletes (to /dev/null),
-      • renames (old→new as delete+add) + Python import rewrites for dependents.
-    """
     root = get_project_root()
     suggestions = _parse_suggestions(diff_text)
     file_diffs: List[str] = []
@@ -865,7 +892,6 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
         a_exists = a_abs.exists() if a_abs else False
         b_exists = b_abs.exists() if b_abs else False
 
-        # DELETE: a -> /dev/null
         if b_rel == "/dev/null" and a_rel != "/dev/null" and a_exists:
             try:
                 data = (a_abs).read_text(encoding="utf-8", errors="replace")
@@ -876,18 +902,15 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
             file_diffs.append(_make_deleted_file_diff(a_rel, orig))
             continue
 
-        # NEW FILE: /dev/null -> b
         if a_rel == "/dev/null" and b_rel != "/dev/null" and not b_exists:
             new_lines: List[str] = []
             for h in (sug.hunks or []):
                 for ln in h[1:]:
                     if ln.startswith("+"):
                         new_lines.append(ln[1:] + "\n")
-            # allow header-only create (empty file)
             file_diffs.append(_make_new_file_diff(b_rel, new_lines))
             continue
 
-        # RENAME (with or without edits)
         is_rename = (a_rel != b_rel) and a_rel != "/dev/null" and b_rel != "/dev/null" and a_exists and (not b_exists)
         if is_rename:
             try:
@@ -907,7 +930,6 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
             file_diffs.append(_make_deleted_file_diff(a_rel, orig))
             file_diffs.append(_make_new_file_diff(b_rel, new_content))
 
-            # propagate import rewrites across repo (Python)
             rewrites = _rewrite_imports_for_rename(root, a_rel, b_rel)
             for rel, old_lines, new_lines in rewrites:
                 if rel in (a_rel, b_rel):
@@ -916,7 +938,6 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
                     file_diffs.append(_make_unified_diff(rel, old_lines, new_lines))
             continue
 
-        # EXISTING FILE EDITS
         if a_exists:
             try:
                 data = (a_abs).read_text(encoding="utf-8", errors="replace")
@@ -933,7 +954,6 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
                 file_diffs.append(_make_unified_diff(dst_rel, original, rep.result))
             continue
 
-        # Fallback: nothing matched; skip
         continue
 
     return ("\n".join(file_diffs) + ("\n" if file_diffs else ""))
@@ -946,14 +966,14 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
     hotspots = _scan_hotspots(root, max_files=max_files)
     if not hotspots: return None
 
-    # Base prompt with initial hotspots
+    # 1) Ask once with the standard prompt
     origin_prompt = _build_prompt(hotspots)
     raw = ask(origin_prompt, max_tokens=2800, temperature=0.15)
 
+    # Try to use a real diff first
     sanitized = _sanitize_to_diff(raw)
     verified = _verified_patch_from_llm_diff(sanitized) if sanitized else ""
 
-    # Reject typing-only or oversized patches
     no_op_reason = ""
     if verified:
         if _STRICT_NOOP and _diff_is_typing_noop(verified):
@@ -963,42 +983,56 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
             verified = ""
             no_op_reason = f"too-large ({_diff_line_count(verified)}>{_MAX_DIFF_LINES})"
 
-    # repair loop if nothing verified yet
-    attempt = 0
-    while (not verified) and attempt < max(2, retries):
-        attempt += 1
-        # Rebuild hotspots and prompt with stronger constraints; DO NOT reuse prior raw output.
-        hotspots = _scan_hotspots(root, max_files=max_files)
-        fresh_ctx = _build_prompt(hotspots)
-        guard_lines = [
-            "If your prior suggestion was rejected, it was likely non-functional:",
-            " - typing-only (TYPE_CHECKING) or comment/doc-only edits are disallowed;",
-            " - diffs without at least one '@@' hunk are invalid;",
-            " - keep paths under bot/ and avoid bot/cli.py.",
-            "",
-            "Now produce ONE VALID unified diff that makes a tiny, behavior-preserving code improvement",
-            "(e.g., input validation, tighter error handling, small helper extraction, minor micro-optimization).",
-            "",
-            "Absolute rules:",
-            " - Only output the diff; no prose.",
-            " - Must include 'diff --git a/... b/...', '---', '+++', and at least one '@@' hunk per file.",
-            " - Do NOT add TYPE_CHECKING-only or docstring-only changes.",
-        ]
-        repair_prompt = textwrap.dedent("\n".join(guard_lines)) + "\n\n" + fresh_ctx
-        raw2 = ask(repair_prompt, max_tokens=2400, temperature=0.2)
-        sanitized2 = _sanitize_to_diff(raw2)
-        if sanitized2:
-            v2 = _verified_patch_from_llm_diff(sanitized2)
+    # 2) If no diff verified, attempt CODE SALVAGE (convert code blocks → diffs)
+    salvage_diff, salvage_touched = ("", [])
+    if not verified:
+        salvage_diff, salvage_touched = _diff_from_code_blocks(raw, root)
+        if salvage_diff.strip():
+            v2 = _verified_patch_from_llm_diff(salvage_diff)
             if v2:
                 over = _MAX_DIFF_LINES > 0 and _diff_line_count(v2) > _MAX_DIFF_LINES
                 is_noop = _STRICT_NOOP and _diff_is_typing_noop(v2)
                 if not over and not is_noop:
-                    raw, sanitized, verified = raw2, sanitized2, v2
-                    break
+                    verified = v2
+                    sanitized = ""  # we used salvage path
+
+    # 3) Repair loop: if still nothing, re-ask more strictly
+    attempt = 0
+    while (not verified) and attempt < max(2, retries):
+        attempt += 1
+        hotspots = _scan_hotspots(root, max_files=max_files)
+        fresh_ctx = _build_prompt(hotspots)
+        guard_lines = [
+            "Your last answer lacked a usable patch.",
+            "Rules:",
+            " - Output ONE VALID unified diff that modifies only files under bot/ .",
+            " - Include 'diff --git a/... b/...', '---', '+++', and at least one '@@' hunk per file.",
+            " - If you cannot produce a diff, paste FULL updated file contents **preceded** by a line 'File: bot/relative/path.py'.",
+            " - No prose or commentary besides those file lines or the diff.",
+        ]
+        repair_prompt = textwrap.dedent("\n".join(guard_lines)) + "\n\n" + fresh_ctx
+        raw2 = ask(repair_prompt, max_tokens=2400, temperature=0.2)
+
+        sanitized2 = _sanitize_to_diff(raw2)
+        v2 = _verified_patch_from_llm_diff(sanitized2) if sanitized2 else ""
+
+        if not v2:
+            # retry salvage on the new response
+            salv2, _ = _diff_from_code_blocks(raw2, root)
+            if salv2.strip():
+                v2 = _verified_patch_from_llm_diff(salv2)
+
+        if v2:
+            over = _MAX_DIFF_LINES > 0 and _diff_line_count(v2) > _MAX_DIFF_LINES
+            is_noop = _STRICT_NOOP and _diff_is_typing_noop(v2)
+            if not over and not is_noop:
+                raw, sanitized, verified = raw2, sanitized2, v2
+                salvage_diff = salv2 if sanitized2 == "" else ""
+                break
+
         no_op_reason = ""
 
-    # If still nothing and synth not disabled, try tiny no-op once,
-    # BUT NEVER when _STRICT_NOOP is enabled (prevents TYPE_CHECKING loop).
+    # 4) Optional synth fallback (disabled if STRICT)
     synth_used = False
     if (not verified) and (not _NO_SYNTH) and (not _STRICT_NOOP):
         target = _pick_first_python(hotspots)
@@ -1011,12 +1045,16 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
                     raw = synth
                     synth_used = True
 
-    art_dir, diff_path, _ = _write_artifacts(origin_prompt, raw, verified)
+    # 5) Artifacts & status
+    art_dir, diff_path, _ = _write_artifacts(origin_prompt, raw, verified, salvage=salvage_diff)
+    status_reason = _empty_reason(raw, sanitized, verified, no_op_reason)
     _write_status(art_dir, {
-        "reason": _empty_reason(raw, sanitized, verified, no_op_reason),
+        "reason": status_reason,
         "sizes": {"raw": len(raw or ""), "sanitized": len(sanitized or ""), "verified": len(verified or "")},
         "strict_noop": bool(_STRICT_NOOP),
-        "synth_used": bool(synth_used)
+        "synth_used": bool(synth_used),
+        "salvage_used": bool(bool(salvage_diff)),
+        "salvage_touched": salvage_touched,
     })
     touched = _touch_list_from_diff(verified) if verified else []
 
@@ -1031,7 +1069,9 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
 
     note_bits = []
     if synth_used:
-        note_bits.append("used synth fallback (TYPE_CHECKING no-op) because LLM diff could not be verified")
+        note_bits.append("used synth fallback (TYPE_CHECKING no-op)")
+    if salvage_diff:
+        note_bits.append("converted code blocks → diff")
     note_bits.append("patch applied via git apply" if applied else "no verified changes applied")
     note = "; ".join(note_bits)
 
@@ -1056,15 +1096,14 @@ def _summarize_cmd(cmd: List[str]) -> str:
 
 def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, verbose: bool=False) -> Tuple[bool, Dict[str, object]]:
     """
-    Smarter patch application with a strategy report:
+    Strategy:
       1) Parse touched paths from the diff.
       2) Probe path tracking + index cleanliness.
-      3) Try the safest strategy that fits:
-         a) If any new/untracked files or index mismatch → prefer working-tree apply (no --index), then stage.
-         b) Else try --index.
-         c) If that fails, try --3way (implies --index).
-         d) Last resort: --reject (treated as failure if any .rej created).
-    Writes a JSON report (apply.json) when artifacts_dir is set.
+      3) Try (in order):
+         a) working-tree apply (when untracked/dirty) with whitespace forgiveness;
+         b) --index variants when clean;
+         c) --3way (for conflicts);
+         d) --reject (final check; treated as failure if any .rej created).
     """
     report: Dict[str, object] = {"touched": [], "has_untracked": False, "index_clean": True, "attempts": []}
     if not patch_path.exists() or patch_path.stat().st_size == 0:
@@ -1087,15 +1126,12 @@ def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, v
         return code == 0
 
     def _paths_clean(paths: list[str]) -> bool:
-        # Are these paths identical in index & working tree? If any differ, --index will balk.
         if not paths:
             return True
-        # Correct arg order: HEAD before pathspec separator
+        # correct order: HEAD before the pathspec separator
         code, _, _ = _run(["git","diff-index","--quiet","HEAD","--", *paths])
-        # diff-index returns 0 when no differences
         return code == 0
 
-    # Refresh stat info to avoid false index mismatches on Windows.
     _run(["git","update-index","-q","--refresh"])
 
     tracked_map = {p: _tracked(p) for p in touched}
@@ -1114,7 +1150,6 @@ def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, v
         rc, _, _ = _run(cmd + [str(patch_path)])
         return rc == 0
 
-    # Strategy candidates (ordered)
     strategies: list[list[str]] = []
     if has_untracked or not index_clean:
         strategies.append(["git","apply","--whitespace=fix","--ignore-whitespace"])
@@ -1142,13 +1177,11 @@ def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, v
         report["attempts"].append(attempt)
         if applied:
             if "--reject" in cmd and attempt["rej_delta"]:
-                # treat partial apply as failure
                 continue
             chosen = cmd
             break
 
     if chosen and ("--index" not in chosen and "--3way" not in chosen) and touched:
-        # stage touched files explicitly if we didn’t use an index strategy
         _run(["git","add","--"] + touched)
 
     ok = chosen is not None
