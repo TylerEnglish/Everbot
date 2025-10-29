@@ -577,7 +577,7 @@ def _apply_hunks_to_content(orig: List[str], hunks: List[List[str]]) -> ApplyRep
     return ApplyReport(applied=applied_idx, skipped=skipped_idx, result=cur)
 
 def _make_unified_diff(rel_path: str, original: List[str], new_lines: List[str]) -> str:
-    raw_lines = list(diflib.unified_diff(
+    raw_lines = list(difflib.unified_diff(
         original, new_lines,
         fromfile=f"a/{rel_path}", tofile=f"b/{rel_path}",
         lineterm="", n=3,
