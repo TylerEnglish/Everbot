@@ -1,7 +1,8 @@
 from __future__ import annotations
 import difflib, io, json, locale, os, pathlib, re, subprocess, textwrap, time
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, DefaultDict
+from collections import defaultdict
 
 from bot.paths import get_project_root
 from bot.llm.provider import ask, info, NotConfigured
@@ -28,11 +29,14 @@ _CREATE_TEMP_BRANCH        = os.getenv("EVERABOT_AUTOCODE_GIT_BRANCH", "1").stri
 _DRY_RUN_ONLY              = os.getenv("EVERABOT_AUTOCODE_DRYRUN", "").strip().lower() in ("1","true","yes")
 _SUBPROC_ENCODING_ENV      = os.getenv("EVERABOT_SUBPROC_ENCODING", "").strip()  # e.g. "utf-8"
 _FORCE_UTF8_ENV            = os.getenv("EVERABOT_FORCE_UTF8", "").strip().lower() in ("1","true","yes")
+_APPLY_PER_FILE            = os.getenv("EVERABOT_AUTOCODE_APPLY_PER_FILE", "1").strip().lower() in ("1","true","yes")
+_REVERSE_PROBE             = os.getenv("EVERABOT_AUTOCODE_REVERSE_PROBE", "1").strip().lower() in ("1","true","yes")
+_REPACK_AFTER_REJ          = os.getenv("EVERABOT_AUTOCODE_REPACK_AFTER_REJ", "1").strip().lower() in ("1","true","yes")
 
-# Encourage UTF-8 I/O for Python child processes (safe no-op if already set)
+# Encourage UTF-8 I/O for Python child processes
 if _FORCE_UTF8_ENV:
-    os.environ.setdefault("PYTHONUTF8", "1")          # Python UTF-8 mode (3.11+) – stdio, filesystem, TextIOWrapper, etc.
-    os.environ.setdefault("PYTHONIOENCODING", "utf-8") # Force stdio to UTF-8 specifically
+    os.environ.setdefault("PYTHONUTF8", "1")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 # ======================================================================================
 # Constants / filters
@@ -84,11 +88,10 @@ class ApplyReport:
     result: List[str]
 
 # ======================================================================================
-# Encoding helpers (prevents cp1252 crashes on Windows when reading subprocess output)
+# Encoding helpers
 # ======================================================================================
 def _preferred_locale_encoding() -> str:
     try:
-        # 3.11: getpreferredencoding(False) ignores UTF-8 mode override per PEP 686 changes.
         return locale.getpreferredencoding(False) or "utf-8"
     except Exception:
         return "utf-8"
@@ -97,7 +100,6 @@ def _safe_decode(b: bytes) -> str:
     encs = []
     if _SUBPROC_ENCODING_ENV:
         encs.append(_SUBPROC_ENCODING_ENV)
-    # Try utf-8 first (most Git/Python tooling emit UTF-8)
     encs += ["utf-8", _preferred_locale_encoding(), "cp1252"]
     for enc in encs:
         try:
@@ -142,11 +144,8 @@ def _ensure_eof_newline(lines: List[str]) -> List[str]:
     return lines
 
 def _norm_sep(path: str) -> str:
-    if not path: 
+    if not path or path == "/dev/null":
         return path
-    if path == "/dev/null":
-        return path
-    # Normalize to forward slashes for git/unified diff; lowercase on Windows
     s = path.replace("\\", "/").lstrip("./")
     if os.name == "nt":
         return s.lower()
@@ -154,6 +153,7 @@ def _norm_sep(path: str) -> str:
 
 # ======================================================================================
 # Recent touches → cooldown
+# (unchanged from your version, omitted for brevity in this comment block)
 # ======================================================================================
 def _recent_autocode_touches(root: pathlib.Path) -> Dict[str, float]:
     base = root / "snapshots" / "selfopt" / "autocode"
@@ -182,7 +182,7 @@ def _recent_autocode_touches(root: pathlib.Path) -> Dict[str, float]:
     return out
 
 # ======================================================================================
-# Scan hotspots
+# Scan hotspots (same logic, kept)
 # ======================================================================================
 def _targets_from_env(root: pathlib.Path) -> List[pathlib.Path]:
     if not _TARGETS_ENV:
@@ -265,7 +265,7 @@ def _scan_hotspots(root: pathlib.Path, max_files: int = 5) -> List[pathlib.Path]
     return top[:max_files]
 
 # ======================================================================================
-# Prompt + sanitation
+# Prompt construction (unchanged)
 # ======================================================================================
 def _build_prompt(file_paths: List[pathlib.Path]) -> str:
     header = (
@@ -299,10 +299,21 @@ def _clean_unicode(s: str) -> str:
         s = s.lstrip("\ufeff")
     return s.replace("\u00A0", " ")
 
+# ======================================================================================
+# Diff doctor / normalization / splitting
+# ======================================================================================
+_DIFF_REJECTED_TAIL = re.compile(r"\s*\(rejected hunks?\)\s*$", re.IGNORECASE)
+
 def _normalize_diff_git_headers(text: str) -> str:
     out: List[str] = []
     last_minus = last_plus = None
     for ln in text.splitlines():
+        # Fix non-standard 'diff a/... b/...' into 'diff --git a/... b/...'
+        if ln.startswith("diff ") and not ln.startswith("diff --git "):
+            m = re.match(r"^diff\s+([ab]/\S+)\s+([ab]/\S+)\s*(\(rejected hunks?\))?$", ln.strip(), re.IGNORECASE)
+            if m:
+                a, b = _norm_sep(m.group(1)), _norm_sep(m.group(2))
+                ln = f"diff --git {a} {b}"
         if ln.startswith("--- "):
             p = _norm_sep(ln[4:].strip())
             if not (p.startswith("a/") or p.startswith("/dev/null")): p = "a/" + p
@@ -314,6 +325,7 @@ def _normalize_diff_git_headers(text: str) -> str:
             ln = f"+++ {p}"
             last_plus = p[2:] if p.startswith("b/") else None
         elif ln.startswith("diff --git "):
+            ln = _DIFF_REJECTED_TAIL.sub("", ln)  # strip "(rejected hunks)"
             m = re.match(r"^diff --git\s+(.+?)\s+(.+)$", ln)
             if m:
                 a,b = _norm_sep(m.group(1)), _norm_sep(m.group(2))
@@ -324,7 +336,8 @@ def _normalize_diff_git_headers(text: str) -> str:
                 if last_minus and last_plus:
                     ln = f"diff --git a/{last_minus} b/{last_plus}"
         out.append(ln)
-    return "\n".join(out)
+    txt = "\n".join(out)
+    return (txt + ("\n" if txt and not txt.endswith("\n") else "")) if txt else ""
 
 def _split_blocks(text: str) -> list[list[str]]:
     blocks: list[list[str]] = []
@@ -337,6 +350,50 @@ def _split_blocks(text: str) -> list[list[str]]:
             cur.append(ln)
     if cur: blocks.append(cur)
     return blocks
+
+def _extract_paths_from_block(blk: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    head = next((x for x in blk if x.startswith("diff --git ")), None)
+    if not head: return None, None
+    m = re.match(r"^diff --git\s+(.+?)\s+(.+)$", head.strip())
+    if not m: return None, None
+    a_hdr, b_hdr = m.group(1).strip(), m.group(2).strip()
+    def _norm_body(p: str) -> str:
+        p = p.replace("\\","/").lstrip("./")
+        if p.startswith(("a/","b/")): p = p[2:]
+        return p
+    return _norm_body(a_hdr), _norm_body(b_hdr)
+
+def _block_contains_nested_headers(blk: List[str]) -> bool:
+    # Detect accidental '--- a/X'/'+++ b/X' lines INSIDE a hunk
+    count = 0
+    for ln in blk[1:]:
+        if ln.startswith("--- a/") or ln.startswith("+++ b/") or ln.startswith("diff --git "):
+            count += 1
+    return count > 2
+
+def _explode_nested_headers(blk: List[str]) -> List[List[str]]:
+    """
+    If the LLM jammed another file's '---/+++' inside a hunk,
+    split those out into their own proper blocks.
+    """
+    out: List[List[str]] = []
+    current: List[str] = []
+    seen_head = False
+    for ln in blk:
+        if ln.startswith("diff --git "):
+            if current: out.append(current)
+            current = [ln]; seen_head = True; continue
+        if (ln.startswith("--- a/") or ln.startswith("+++ b/")) and seen_head:
+            # Start of a new file header sequence inside an existing block → split
+            if current and any(x.startswith("@@ ") for x in current[1:]):
+                out.append(current)
+                current = []
+            current.append(ln)
+        else:
+            current.append(ln)
+    if current:
+        out.append(current)
+    return out
 
 def _is_excluded_path(p: str) -> bool:
     p = _norm_sep(p)
@@ -414,49 +471,108 @@ def _rebuild_block_headers_only(blk: list[str]) -> Optional[Tuple[str,str,list[l
             if _block_is_typechecking_noop(h) and _STRICT_NOOP: continue
             filtered_hunks.append(h)
 
-    # Keep rename/new/delete even without hunks
     return (a_body, b_body, filtered_hunks)
 
-def _sanitize_to_diff(raw: str) -> str:
+def _doctor_diff(raw: str) -> str:
+    """
+    Normalize and repair common LLM diff mistakes, then split nested headers.
+    """
     raw = _clean_unicode(raw)
-    if raw.strip() == "#NOPATCH":
+    if not raw.strip():
         return ""
-    if "diff --git " in raw and "--- " in raw and "+++ " in raw:
+    # If it already looks like a diff, normalize headers
+    if "diff " in raw or ("--- " in raw and "+++ " in raw):
         txt = _normalize_diff_git_headers(raw)
-        return (txt + ("\n" if txt and not txt.endswith("\n") else "")) if txt else ""
-
-    stitched = []
-    for m in re.finditer(r"```(?:diff|patch)\n([\s\S]*?)```", raw, re.MULTILINE): stitched.append(m.group(1))
-    for m in re.finditer(r"~~~(?:diff|patch)\n([\s\S]*?)~~~", raw, re.MULTILINE): stitched.append(m.group(1))
-    if stitched:
-        txt = _normalize_diff_git_headers("\n".join(stitched))
-        return (txt + ("\n" if txt and not txt.endswith("\n") else "")) if txt else ""
-
-    if ("--- " in raw and "+++ " in raw and "@@ " in raw):
-        lines, out = raw.splitlines(), []
-        i = 0
-        while i < len(lines):
-            ln = lines[i]
-            if ln.startswith("--- "):
-                minus_path = _norm_sep(ln[4:].strip())
-                plus_line = None
-                j = i + 1
-                while j < len(lines) and not lines[j].startswith("+++ "):
-                    j += 1
-                if j < len(lines):
-                    plus_line = lines[j]
-                if plus_line:
-                    plus_path = _norm_sep(plus_line[4:].strip())
-                    a = minus_path if minus_path.startswith("a/") else ("a/" + minus_path)
-                    b = plus_path if plus_path.startswith("b/") else ("b/" + plus_path)
-                    out.append(f"diff --git {a} {b}")
-            out.append(ln); i += 1
-        txt = _normalize_diff_git_headers("\n".join(out))
-        return (txt + ("\n" if txt and not txt.endswith("\n") else "")) if txt else ""
-    return ""
+    else:
+        txt = raw
+    # Split and explode nested headers if any
+    blocks = _split_blocks(txt)
+    fixed: List[List[str]] = []
+    for blk in blocks:
+        if _block_contains_nested_headers(blk):
+            fixed.extend(_explode_nested_headers(blk))
+        else:
+            fixed.append(blk)
+    final = "\n".join("\n".join(b) for b in fixed)
+    return (final + ("\n" if final and not final.endswith("\n") else "")) if final else ""
 
 # ======================================================================================
-# Verified patcher
+# Suggestion parsing (unchanged except using doctor’d blocks)
+# ======================================================================================
+def _parse_suggestions(text: str) -> List[SuggestedFile]:
+    out: List[SuggestedFile] = []
+    for blk in _split_blocks(text):
+        parsed = _rebuild_block_headers_only(blk)
+        if not parsed: continue
+        a_body, b_body, hunks = parsed
+        out.append(SuggestedFile(a_body or "/dev/null", b_body or "/dev/null", hunks or []))
+    return out
+
+# ======================================================================================
+# Py import rewrite on rename (unchanged)
+# ======================================================================================
+def _py_module_from_path(rel_path: str) -> Optional[str]:
+    if not rel_path.endswith(".py"): return None
+    if rel_path == "/dev/null": return None
+    return rel_path[:-3].replace("/", ".")
+
+def _collect_repo_py_files(root: pathlib.Path) -> List[pathlib.Path]:
+    lst: List[pathlib.Path] = []
+    for p in (root / "bot").rglob("*.py"):
+        parts = set(p.parts) | {"/".join(p.parts[i:i+2]) for i in range(len(p.parts)-1)}
+        if any(x in _EXCLUDE_DIRS for x in parts): continue
+        if _norm_sep(p.relative_to(root).as_posix()) in _EXCLUDE_FILES: continue
+        lst.append(p)
+    return lst
+
+def _rewrite_imports_py(lines: List[str], old_mod: str, new_mod: str) -> Tuple[List[str], bool]:
+    changed = False; out: List[str] = []
+    pat_from = re.compile(rf'^(\s*from\s+){re.escape(old_mod)}(\.|[\s]+import\b)')
+    pat_imp1 = re.compile(rf'^(\s*import\s+){re.escape(old_mod)}(\s|$|,|\.|as\b)')
+    pat_imp2 = re.compile(r'^(\s*import\s+)(.*)')
+    for ln in lines:
+        s = ln
+        m = pat_from.match(s)
+        if m:
+            s = s.replace(m.group(0), f"{m.group(1)}{new_mod}{m.group(2)}", 1); changed = True
+        else:
+            m2 = pat_imp1.match(s)
+            if m2:
+                def _rep_import_list(body: str) -> str:
+                    parts = [p.strip() for p in body.split(",")]
+                    new_parts = []
+                    for p in parts:
+                        if p.startswith(old_mod + ".") or p == old_mod:
+                            new_parts.append(new_mod + p[len(old_mod):])
+                        else:
+                            new_parts.append(p)
+                    return ", ".join(new_parts)
+                m_any = pat_imp2.match(s)
+                if m_any:
+                    prefix, rest = m_any.group(1), m_any.group(2)
+                    new_rest = _rep_import_list(rest)
+                    if new_rest != rest:
+                        s = prefix + new_rest; changed = True
+        out.append(s)
+    return out, changed
+
+def _rewrite_imports_for_rename(root: pathlib.Path, old_rel: str, new_rel: str) -> List[Tuple[str, List[str], List[str]]]:
+    results: List[Tuple[str, List[str], List[str]]] = []
+    old_mod = _py_module_from_path(old_rel); new_mod = _py_module_from_path(new_rel)
+    if not old_mod or not new_mod: return results
+    for p in _collect_repo_py_files(root):
+        rel = _norm_sep(p.relative_to(root).as_posix())
+        raw = _read_text_all(p)
+        if not raw: continue
+        orig = [ln + "\n" for ln in raw.split("\n")]
+        if orig and orig[-1] == "\n" and not raw.endswith("\n"): orig = orig[:-1]
+        new_lines, changed = _rewrite_imports_py(orig, old_mod, new_mod)
+        if changed:
+            results.append((rel, orig, new_lines))
+    return results
+
+# ======================================================================================
+# Unified diff helpers + fuzzy hunk applier (as in your version)
 # ======================================================================================
 def _old_sequence_from_hunk(hunk: List[str]) -> List[str]:
     seq: List[str] = []
@@ -588,80 +704,8 @@ def _make_deleted_file_diff(rel_path: str, original: List[str]) -> str:
     minus = "".join("-" + (ln[:-1] if ln.endswith("\n") else ln) + "\n" for ln in original)
     return f"diff --git a/{rel_path} b/{rel_path}\n--- a/{rel_path}\n+++ /dev/null\n{hdr}{minus}"
 
-def _parse_suggestions(text: str) -> List[SuggestedFile]:
-    out: List[SuggestedFile] = []
-    for blk in _split_blocks(text):
-        parsed = _rebuild_block_headers_only(blk)
-        if not parsed: continue
-        a_body, b_body, hunks = parsed
-        out.append(SuggestedFile(a_body or "/dev/null", b_body or "/dev/null", hunks or []))
-    return out
-
 # ======================================================================================
-# Import rewrite on rename
-# ======================================================================================
-def _py_module_from_path(rel_path: str) -> Optional[str]:
-    if not rel_path.endswith(".py"): return None
-    if rel_path == "/dev/null": return None
-    return rel_path[:-3].replace("/", ".")
-
-def _collect_repo_py_files(root: pathlib.Path) -> List[pathlib.Path]:
-    lst: List[pathlib.Path] = []
-    for p in (root / "bot").rglob("*.py"):
-        parts = set(p.parts) | {"/".join(p.parts[i:i+2]) for i in range(len(p.parts)-1)}
-        if any(x in _EXCLUDE_DIRS for x in parts): continue
-        if _norm_sep(p.relative_to(root).as_posix()) in _EXCLUDE_FILES: continue
-        lst.append(p)
-    return lst
-
-def _rewrite_imports_py(lines: List[str], old_mod: str, new_mod: str) -> Tuple[List[str], bool]:
-    changed = False; out: List[str] = []
-    pat_from = re.compile(rf'^(\s*from\s+){re.escape(old_mod)}(\.|[\s]+import\b)')
-    pat_imp1 = re.compile(rf'^(\s*import\s+){re.escape(old_mod)}(\s|$|,|\.|as\b)')
-    pat_imp2 = re.compile(r'^(\s*import\s+)(.*)')
-    for ln in lines:
-        s = ln
-        m = pat_from.match(s)
-        if m:
-            s = s.replace(m.group(0), f"{m.group(1)}{new_mod}{m.group(2)}", 1); changed = True
-        else:
-            m2 = pat_imp1.match(s)
-            if m2:
-                def _rep_import_list(body: str) -> str:
-                    parts = [p.strip() for p in body.split(",")]
-                    new_parts = []
-                    for p in parts:
-                        if p.startswith(old_mod + ".") or p == old_mod:
-                            new_parts.append(new_mod + p[len(old_mod):])
-                        else:
-                            new_parts.append(p)
-                    return ", ".join(new_parts)
-                m_any = pat_imp2.match(s)
-                if m_any:
-                    prefix, rest = m_any.group(1), m_any.group(2)
-                    new_rest = _rep_import_list(rest)
-                    if new_rest != rest:
-                        s = prefix + new_rest; changed = True
-        out.append(s)
-    return out, changed
-
-def _rewrite_imports_for_rename(root: pathlib.Path, old_rel: str, new_rel: str) -> List[Tuple[str, List[str], List[str]]]:
-    results: List[Tuple[str, List[str], List[str]]] = []
-    old_mod = _py_module_from_path(old_rel); new_mod = _py_module_from_path(new_rel)
-    if not old_mod or not new_mod: return results
-    for p in _collect_repo_py_files(root):
-        rel = _norm_sep(p.relative_to(root).as_posix())
-        raw = _read_text_all(p)
-        if not raw: continue
-        orig = [ln + "\n" for ln in raw.split("\n")]
-        if orig and orig[-1] == "\n" and not raw.endswith("\n"): orig = orig[:-1]
-        new_lines, changed = _rewrite_imports_py(orig, old_mod, new_mod)
-        if changed:
-            results.append((rel, orig, new_lines))
-    return results
-
-# ======================================================================================
-# Diff size / no-op detection
+# Diff size / no-op detection (unchanged)
 # ======================================================================================
 def _touch_list_from_diff(diff_text: str) -> List[str]:
     touched = []
@@ -769,7 +813,7 @@ def _generate_pr_md(diff_text: str) -> str:
     return "\n".join(lines)
 
 # ======================================================================================
-# Code/FILE-block salvage → diff
+# Code/FILE-block salvage → diff (unchanged)
 # ======================================================================================
 def _candidate_repo_files(root: pathlib.Path) -> List[pathlib.Path]:
     candidates: List[pathlib.Path] = []
@@ -881,47 +925,27 @@ def _diff_from_code_blocks(raw: str, root: pathlib.Path) -> Tuple[str, List[str]
         except Exception as e:
             reasons.append(f"file-block error for {rel}: {e}")
 
-    for m in _CODE_FENCE_RE.finditer(raw):
-        code_text = m.group(1)
-        rel = _guess_path_from_context(raw, m.start(), code_text, root, reasons)
-        if not rel: continue
-        abs_path = root / rel
-        try:
-            if abs_path.exists():
-                original_text = _read_text_all(abs_path)
-                original = [ln + "\n" for ln in original_text.split("\n")]
-                if original and original[-1] == "\n" and not original_text.endswith("\n"): original = original[:-1]
-                new_lines = [(ln if ln.endswith("\n") else ln + "\n") for ln in code_text.replace("\r\n","\n").replace("\r","\n").split("\n")]
-                if new_lines and new_lines[-1] == "\n" and not code_text.endswith("\n"): new_lines = new_lines[:-1]
-                diffs.append(_make_unified_diff(rel, original, new_lines))
-            else:
-                new_lines = [(ln if ln.endswith("\n") else ln + "\n") for ln in code_text.replace("\r\n","\n").replace("\r","\n").split("\n")]
-                if new_lines and new_lines[-1] == "\n" and not code_text.endswith("\n"): new_lines = new_lines[:-1]
-                diffs.append(_make_new_file_diff(rel, new_lines))
-            touched.append(_norm_sep(rel))
-        except Exception as e:
-            reasons.append(f"code-fence error for {rel}: {e}")
-
-    for m in _TILDE_FENCE_RE.finditer(raw):
-        code_text = m.group(1)
-        rel = _guess_path_from_context(raw, m.start(), code_text, root, reasons)
-        if not rel: continue
-        abs_path = root / rel
-        try:
-            if abs_path.exists():
-                original_text = _read_text_all(abs_path)
-                original = [ln + "\n" for ln in original_text.split("\n")]
-                if original and original[-1] == "\n" and not original_text.endswith("\n"): original = original[:-1]
-                new_lines = [(ln if ln.endswith("\n") else ln + "\n") for ln in code_text.replace("\r\n","\n").replace("\r","\n").split("\n")]
-                if new_lines and new_lines[-1] == "\n" and not code_text.endswith("\n"): new_lines = new_lines[:-1]
-                diffs.append(_make_unified_diff(rel, original, new_lines))
-            else:
-                new_lines = [(ln if ln.endswith("\n") else ln + "\n") for ln in code_text.replace("\r\n","\n").replace("\r","\n").split("\n")]
-                if new_lines and new_lines[-1] == "\n" and not code_text.endswith("\n"): new_lines = new_lines[:-1]
-                diffs.append(_make_new_file_diff(rel, new_lines))
-            touched.append(_norm_sep(rel))
-        except Exception as e:
-            reasons.append(f"tilde-fence error for {rel}: {e}")
+    for fence in (_CODE_FENCE_RE, _TILDE_FENCE_RE):
+        for m in fence.finditer(raw):
+            code_text = m.group(1)
+            rel = _guess_path_from_context(raw, m.start(), code_text, root, reasons)
+            if not rel: continue
+            abs_path = root / rel
+            try:
+                if abs_path.exists():
+                    original_text = _read_text_all(abs_path)
+                    original = [ln + "\n" for ln in original_text.split("\n")]
+                    if original and original[-1] == "\n" and not original_text.endswith("\n"): original = original[:-1]
+                    new_lines = [(ln if ln.endswith("\n") else ln + "\n") for ln in code_text.replace("\r\n","\n").replace("\r","\n").split("\n")]
+                    if new_lines and new_lines[-1] == "\n" and not code_text.endswith("\n"): new_lines = new_lines[:-1]
+                    diffs.append(_make_unified_diff(rel, original, new_lines))
+                else:
+                    new_lines = [(ln if ln.endswith("\n") else ln + "\n") for ln in code_text.replace("\r\n","\n").replace("\r","\n").split("\n")]
+                    if new_lines and new_lines[-1] == "\n" and not code_text.endswith("\n"): new_lines = new_lines[:-1]
+                    diffs.append(_make_new_file_diff(rel, new_lines))
+                touched.append(_norm_sep(rel))
+            except Exception as e:
+                reasons.append(f"code-fence error for {rel}: {e}")
 
     if diffs:
         by_path: Dict[str, str] = {}
@@ -938,33 +962,12 @@ def _diff_from_code_blocks(raw: str, root: pathlib.Path) -> Tuple[str, List[str]
     return joined, touched, reasons
 
 # ======================================================================================
-# Artifacts
-# ======================================================================================
-def _write_artifacts(prompt: str, raw: str, diff: str, salvage: str = "", salvage_reasons: Optional[List[str]]=None) -> Tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
-    base = get_project_root() / "snapshots" / "selfopt" / "autocode" / time.strftime("%Y%m%d_%H%M%S")
-    base.mkdir(parents=True, exist_ok=True)
-    (base / "prompt.txt").write_text(prompt, encoding="utf-8")
-    (base / "raw.txt").write_text(raw, encoding="utf-8")
-    diff_path = base / "patch.diff"
-    out = diff if diff else "# empty (no valid unified diff detected)\n"
-    out = out.replace("\r\n","\n").replace("\r","\n")
-    if out and not out.endswith("\n"): out += "\n"
-    diff_path.write_text(out, encoding="utf-8")
-    if salvage:
-        (base / "salvage.diff").write_text(salvage, encoding="utf-8")
-    if salvage_reasons:
-        (base / "salvage_reasons.txt").write_text("\n".join(salvage_reasons), encoding="utf-8")
-    try:
-        print(f"[autocoder] artifacts -> {base}  (prompt.txt={ (base/'prompt.txt').stat().st_size }B, raw.txt={ (base/'raw.txt').stat().st_size }B, patch.diff={ diff_path.stat().st_size }B)")
-    except Exception:
-        pass
-    return base, diff_path, base / "raw.txt"
-
-# ======================================================================================
-# Verified patch from LLM diff
+# Verified patch from LLM diff (uses doctor)
 # ======================================================================================
 def _verified_patch_from_llm_diff(diff_text: str) -> str:
     root = get_project_root()
+    # doctor & normalize first
+    diff_text = _doctor_diff(diff_text)
     suggestions = _parse_suggestions(diff_text)
     file_diffs: List[str] = []
 
@@ -1029,24 +1032,87 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
     return joined
 
 # ======================================================================================
-# Git apply (bytes I/O, safe decode, temp branch/commit optional)
+# Git apply with per-file strategies, reverse probe, and .rej repack
 # ======================================================================================
 def _summarize_cmd(cmd: List[str]) -> str:
     return " ".join(cmd)
 
+def _list_rej(root: pathlib.Path) -> List[pathlib.Path]:
+    return list(root.rglob("*.rej"))
+
+def _per_file_patches(diff_text: str) -> Dict[str, str]:
+    """
+    Split a multi-file diff into {b/rel_path: full_patch_for_that_file}.
+    Order files: renames -> new -> edits -> deletes (stable).
+    """
+    blocks = _split_blocks(diff_text)
+    groups: Dict[str, List[str]] = {}
+    meta: Dict[str, int] = {}  # ordering class
+    for blk in blocks:
+        a_rel, b_rel = _extract_paths_from_block(blk)
+        if not a_rel and not b_rel:
+            continue
+        if b_rel == "/dev/null":
+            key = a_rel or b_rel
+            meta[key] = 3  # delete
+        elif a_rel == "/dev/null":
+            key = b_rel
+            meta[key] = 1  # new
+        elif a_rel != b_rel:
+            key = b_rel
+            meta[key] = 0  # rename
+        else:
+            key = b_rel
+            meta[key] = 2  # edit
+        groups.setdefault(key, []).append("\n".join(blk))
+    # assemble single-patch per file
+    out: Dict[str, str] = {}
+    for key, pieces in groups.items():
+        txt = "\n".join(pieces)
+        out[_norm_sep(key)] = (txt + ("\n" if txt and not txt.endswith("\n") else "")) if txt else ""
+    # return sorted by class then path
+    return dict(sorted(out.items(), key=lambda kv: (meta.get(kv[0], 2), kv[0])))
+
+def _repack_patch_against_worktree(root: pathlib.Path, file_patch: str) -> Optional[str]:
+    """
+    When .rej appears, rebuild a per-file patch by:
+      - parsing its suggestions
+      - reading current worktree
+      - re-applying hunks fuzzily
+      - re-emitting a fresh unified diff (recounted hunks)
+    """
+    sug = _parse_suggestions(file_patch)
+    if not sug:
+        return None
+    s = sug[0]
+    rel = s.b_path if s.b_path != "/dev/null" else s.a_path
+    rel = _norm_sep(rel)
+    abs_path = root / rel if rel and rel != "/dev/null" else None
+    if not abs_path or not abs_path.exists():
+        return None
+    data = _read_text_all(abs_path)
+    if not data:
+        return None
+    orig = [ln + "\n" for ln in data.split("\n")]
+    if orig and orig[-1] == "\n" and not data.endswith("\n"): orig = orig[:-1]
+    rep = _apply_hunks_to_content(orig, s.hunks or [])
+    if rep.result == orig:
+        return None
+    return _make_unified_diff(rel, orig, rep.result)
+
 def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, verbose: bool=False) -> Tuple[bool, Dict[str, object]]:
     """
-    Strategy:
-      1) Parse touched paths from diff. Refresh index.
-      2) Probe path tracking + index cleanliness.
-      3) Try (order):
-         a) --index (clean trees) or working-tree apply with whitespace forgiveness;
-         b) --recount/--unidiff-zero variants;
-         c) --3way;
-         d) --reject (treated as failure if .rej created).
-      4) If apply OK and _CREATE_TEMP_BRANCH, create temp branch and commit.
+    Strategy (enhanced):
+      1) If enabled, split into per-file patches, try each with a ladder:
+         --index/--3way first, then --recount/--unidiff-zero/--inaccurate-eof and whitespace forgiveness.
+         If check fails, try --reverse --check and apply with -R.
+      2) If any attempt produces *.rej and repack is enabled, rebuild hunks vs worktree and retry once.
+      3) Fallback to whole-patch apply using the same ladder.
     """
-    report: Dict[str, object] = {"touched": [], "has_untracked": False, "index_clean": True, "attempts": [], "chosen": None, "branch": None, "commit": None}
+    report: Dict[str, object] = {
+        "touched": [], "has_untracked": False, "index_clean": True, "attempts": [],
+        "chosen": None, "branch": None, "commit": None, "per_file": []
+    }
     if not patch_path.exists() or patch_path.stat().st_size == 0:
         return False, report
 
@@ -1087,62 +1153,152 @@ def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, v
     if verbose:
         print(f"[autocoder][apply] touched={len(touched)} has_untracked={has_untracked} index_clean={index_clean}")
 
-    def _check(cmd: list[str]) -> bool:
-        rc, _, _ = _run_bytes(["git","apply","--check", *cmd[2:], str(patch_path)])
+    # Strategy builders --------------------------------------------------------
+    def _check(cmd: list[str], patch: pathlib.Path) -> bool:
+        rc, _, _ = _run_bytes(["git","apply","--check", *cmd[2:], str(patch)])
         return rc == 0
 
-    def _apply_cmd(cmd: list[str]) -> bool:
-        rc, out, err = _run_bytes(cmd + [str(patch_path)])
+    def _apply_cmd(cmd: list[str], patch: pathlib.Path) -> bool:
+        rc, out, err = _run_bytes(cmd + [str(patch)])
         if verbose and (out or err):
             print(out.strip() or "")
             print(err.strip() or "")
         return rc == 0
 
-    strategies: list[list[str]] = []
-    if has_untracked or not index_clean:
-        strategies.append(["git","apply","--whitespace=fix","--ignore-whitespace"])
-        strategies.append(["git","apply","--recount","--unidiff-zero","--whitespace=fix","--ignore-whitespace"])
-        strategies.append(["git","apply","--3way"])
-    else:
-        strategies.append(["git","apply","--index","--whitespace=fix"])
-        strategies.append(["git","apply","--index","--recount","--unidiff-zero","--whitespace=fix"])
-        strategies.append(["git","apply","--3way"])
-    strategies.append(["git","apply","--reject","--whitespace=nowarn"])
+    def _strategy_ladder(for_index_clean: bool, forgiving: bool) -> List[List[str]]:
+        base: List[List[str]] = []
+        if for_index_clean:
+            base.append(["git","apply","--index","--whitespace=fix"])
+            base.append(["git","apply","--index","--recount","--unidiff-zero","--whitespace=fix"])
+            base.append(["git","apply","--3way"])
+        else:
+            base.append(["git","apply","--whitespace=fix","--ignore-whitespace"])
+            base.append(["git","apply","--recount","--unidiff-zero","--whitespace=fix","--ignore-whitespace"])
+            base.append(["git","apply","--3way"])
+        # extra forgiveness toggles
+        if forgiving:
+            base.append(["git","apply","--inaccurate-eof","--whitespace=fix","--ignore-whitespace"])
+        # last chance: --reject (if chosen, we will inspect .rej)
+        base.append(["git","apply","--reject","--whitespace=nowarn"])
+        return base
 
-    chosen = None
-    for cmd in strategies:
-        attempt: Dict[str, object] = {"cmd": _summarize_cmd(cmd), "check_ok": False, "applied": False, "rej_delta": 0}
-        check_ok = _check(cmd); attempt["check_ok"] = bool(check_ok)
-        if not check_ok:
-            report["attempts"].append(attempt); continue
-        before_rej = list(root.rglob("*.rej"))
-        applied = _apply_cmd(cmd)
-        after_rej  = list(root.rglob("*.rej"))
-        attempt["applied"]   = bool(applied)
-        attempt["rej_delta"] = max(0, len(after_rej) - len(before_rej))
-        report["attempts"].append(attempt)
-        if applied:
-            if "--reject" in cmd and attempt["rej_delta"]:
-                continue
-            chosen = cmd; break
+    def _reverse_probe_ok(patch: pathlib.Path, cmd: List[str]) -> bool:
+        if not _REVERSE_PROBE:
+            return False
+        # Try check with reverse
+        rc, _, _ = _run_bytes(["git","apply","--check","-R", *cmd[2:], str(patch)])
+        return rc == 0
 
-    if chosen and ("--index" not in chosen and "--3way" not in chosen) and touched:
-        _run_bytes(["git","add","--"] + touched)
+    # Per-file apply -----------------------------------------------------------
+    def _apply_single_patch(tmp_patch_path: pathlib.Path, for_index_clean: bool, forgiving: bool) -> Tuple[bool, dict]:
+        attempts_local: List[dict] = []
+        chosen_local = None
+        for cmd in _strategy_ladder(for_index_clean, forgiving):
+            attempt: Dict[str, object] = {"cmd": _summarize_cmd(cmd), "check_ok": False, "applied": False, "rej_delta": 0, "reversed": False}
+            if not _check(cmd, tmp_patch_path):
+                # reverse probe
+                if _REVERSE_PROBE and _reverse_probe_ok(tmp_patch_path, cmd):
+                    attempt["reversed"] = True
+                    rc, out, err = _run_bytes(["git","apply","-R","--check", *cmd[2:], str(tmp_patch_path)])
+                    ok = (rc == 0)
+                else:
+                    attempts_local.append(attempt); continue
+            before_rej = _list_rej(root)
+            # normal or reversed apply
+            if attempt.get("reversed"):
+                applied = _apply_cmd(["git","apply","-R", *cmd[2:]], tmp_patch_path)
+            else:
+                applied = _apply_cmd(cmd, tmp_patch_path)
+            after_rej  = _list_rej(root)
+            attempt["applied"]   = bool(applied)
+            attempt["rej_delta"] = max(0, len(after_rej) - len(before_rej))
+            attempt["check_ok"]  = True
+            attempts_local.append(attempt)
+            if applied:
+                if "--reject" in cmd and attempt["rej_delta"]:
+                    # not good enough; continue trying better strategies
+                    continue
+                chosen_local = cmd
+                break
+        return chosen_local is not None, {"attempts": attempts_local, "chosen": _summarize_cmd(chosen_local) if chosen_local else None}
 
-    ok = chosen is not None
-    report["chosen"] = _summarize_cmd(chosen) if chosen else None
+    overall_ok = True
+    per_file_report: List[dict] = []
 
-    # Optional: create temp branch and commit
-    if ok and not _DRY_RUN_ONLY:
+    if _APPLY_PER_FILE:
+        per = _per_file_patches(diff_txt)
+        for rel, ptxt in per.items():
+            # write temp patch file for this file alone
+            pf = (pathlib.Path(artifacts_dir) if artifacts_dir else get_project_root() / "snapshots") / f"__single_{rel.replace('/','_')}.patch"
+            pf.parent.mkdir(parents=True, exist_ok=True)
+            pf.write_text(ptxt, encoding="utf-8")
+            ok, detail = _apply_single_patch(pf, index_clean, forgiving=True)
+            # If REJ and allowed, repack and retry once
+            if (not ok) and _REPACK_AFTER_REJ and detail.get("attempts"):
+                had_rej = any(a.get("rej_delta") for a in detail["attempts"])
+                if had_rej:
+                    rebuilt = _repack_patch_against_worktree(root, ptxt)
+                    if rebuilt:
+                        pf.write_text(rebuilt, encoding="utf-8")
+                        ok2, detail2 = _apply_single_patch(pf, index_clean, forgiving=True)
+                        per_file_report.append({"file": rel, "ok": ok2, "detail": detail2})
+                        overall_ok = overall_ok and ok2
+                        continue
+            per_file_report.append({"file": rel, "ok": ok, "detail": detail})
+            overall_ok = overall_ok and ok
+        report["per_file"] = per_file_report
+
+        # If anything failed, try whole patch as a final fallback
+        if not overall_ok:
+            if _VERBOSE:
+                print("[autocoder][apply] per-file path had failures; attempting whole-patch fallback.")
+            overall_ok = False  # will set by fallback below
+
+    # Whole patch fallback -----------------------------------------------------
+    if (not _APPLY_PER_FILE) or (not overall_ok):
+        strategies = _strategy_ladder(index_clean, forgiving=True)
+        chosen = None
+        for cmd in strategies:
+            attempt: Dict[str, object] = {"cmd": _summarize_cmd(cmd), "check_ok": False, "applied": False, "rej_delta": 0, "reversed": False}
+            if not _check(cmd, patch_path):
+                if _REVERSE_PROBE and _reverse_probe_ok(patch_path, cmd):
+                    attempt["reversed"] = True
+                    rc, out, err = _run_bytes(["git","apply","-R","--check", *cmd[2:], str(patch_path)])
+                    if rc != 0:
+                        report["attempts"].append(attempt); continue
+                else:
+                    report["attempts"].append(attempt); continue
+            before_rej = _list_rej(root)
+            if attempt.get("reversed"):
+                applied = _apply_cmd(["git","apply","-R", *cmd[2:]], patch_path)
+            else:
+                applied = _apply_cmd(cmd, patch_path)
+            after_rej  = _list_rej(root)
+            attempt["applied"]   = bool(applied)
+            attempt["rej_delta"] = max(0, len(after_rej) - len(before_rej))
+            attempt["check_ok"]  = True
+            report["attempts"].append(attempt)
+            if applied:
+                if "--reject" in cmd and attempt["rej_delta"]:
+                    continue
+                chosen = cmd; break
+
+        if chosen and ("--index" not in chosen and "--3way" not in chosen) and touched:
+            _run_bytes(["git","add","--"] + touched)
+
+        ok = chosen is not None
+        report["chosen"] = _summarize_cmd(chosen) if chosen else None
+        overall_ok = ok
+
+    # Optional: create temp branch & commit
+    if overall_ok and not _DRY_RUN_ONLY:
         if _CREATE_TEMP_BRANCH:
-            # figure out current branch
             _, cur_branch, _ = _run_bytes(["git","rev-parse","--abbrev-ref","HEAD"])
             cur_branch = cur_branch.strip() or "HEAD"
             temp_branch = f"autocode/{time.strftime('%Y%m%d_%H%M%S')}"
             rc, _, _ = _run_bytes(["git","checkout","-b", temp_branch])
             if rc == 0:
                 report["branch"] = temp_branch
-            # commit
             pr_md = (pathlib.Path(artifacts_dir) / "PR.md") if artifacts_dir else None
             msg = "autocode: behavior-preserving refactor"
             if pr_md and pr_md.exists():
@@ -1156,23 +1312,85 @@ def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, v
                 report["commit"] = sha.strip()
 
     if verbose:
-        ch = report["chosen"] or "NONE"
-        print(f"[autocoder][apply] result={ok} strategy={ch}")
+        ch = report.get("chosen") or "PER-FILE" if report.get("per_file") else "NONE"
+        print(f"[autocoder][apply] result={overall_ok} strategy={ch}")
     if artifacts_dir:
         try:
-            summary = (
-                f"chosen={report['chosen']}\n"
-                f"touched={len(touched)} has_untracked={has_untracked} index_clean={index_clean}\n"
-                + "\n".join(f"- try: {a['cmd']} check_ok={a['check_ok']} applied={a['applied']} rej_delta={a['rej_delta']}" for a in report["attempts"]) + "\n"
-            )
-            pathlib.Path(artifacts_dir, "apply.txt").write_text(summary, encoding="utf-8")
+            summary_lines = []
+            if report.get("per_file"):
+                for pf in report["per_file"]:
+                    summary_lines.append(f"- file={pf['file']} ok={pf['ok']} chosen={pf['detail'].get('chosen')}")
+                    for a in pf["detail"].get("attempts", []):
+                        summary_lines.append(f"   * try: {a['cmd']} check_ok={a['check_ok']} applied={a['applied']} reversed={a.get('reversed')} rej_delta={a['rej_delta']}")
+            else:
+                for a in report["attempts"]:
+                    summary_lines.append(f"- try: {a['cmd']} check_ok={a['check_ok']} applied={a['applied']} reversed={a.get('reversed')} rej_delta={a['rej_delta']}")
+            pathlib.Path(artifacts_dir, "apply.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
         except Exception:
             pass
-    return ok, report
+    return overall_ok, report
 
 # ======================================================================================
 # Public API
 # ======================================================================================
+def _sanitize_to_diff(raw: str) -> str:
+    raw = _clean_unicode(raw)
+    if raw.strip() == "#NOPATCH":
+        return ""
+    if "diff --git " in raw and "--- " in raw and "+++ " in raw:
+        txt = _doctor_diff(raw)
+        return (txt + ("\n" if txt and not txt.endswith("\n") else "")) if txt else ""
+
+    stitched = []
+    for m in re.finditer(r"```(?:diff|patch)\n([\s\S]*?)```", raw, re.MULTILINE): stitched.append(m.group(1))
+    for m in re.finditer(r"~~~(?:diff|patch)\n([\s\S]*?)~~~", raw, re.MULTILINE): stitched.append(m.group(1))
+    if stitched:
+        txt = _doctor_diff("\n".join(stitched))
+        return (txt + ("\n" if txt and not txt.endswith("\n") else "")) if txt else ""
+
+    if ("--- " in raw and "+++ " in raw and "@@ " in raw):
+        lines, out = raw.splitlines(), []
+        i = 0
+        while i < len(lines):
+            ln = lines[i]
+            if ln.startswith("--- "):
+                minus_path = _norm_sep(ln[4:].strip())
+                plus_line = None
+                j = i + 1
+                while j < len(lines) and not lines[j].startswith("+++ "):
+                    j += 1
+                if j < len(lines):
+                    plus_line = lines[j]
+                if plus_line:
+                    plus_path = _norm_sep(plus_line[4:].strip())
+                    a = minus_path if minus_path.startswith("a/") else ("a/" + minus_path)
+                    b = plus_path if plus_path.startswith("b/") else ("b/" + plus_path)
+                    out.append(f"diff --git {a} {b}")
+            out.append(ln); i += 1
+        txt = _doctor_diff("\n".join(out))
+        return (txt + ("\n" if txt and not txt.endswith("\n") else "")) if txt else ""
+    return ""
+
+def _write_artifacts(prompt: str, raw: str, diff: str, salvage: str = "", salvage_reasons: Optional[List[str]]=None) -> Tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    base = get_project_root() / "snapshots" / "selfopt" / "autocode" / time.strftime("%Y%m%d_%H%M%S")
+    base.mkdir(parents=True, exist_ok=True)
+    (base / "prompt.txt").write_text(prompt, encoding="utf-8")
+    (base / "raw.txt").write_text(raw, encoding="utf-8")
+    diff_path = base / "patch.diff"
+    out = diff if diff else "# empty (no valid unified diff detected)\n"
+    out = out.replace("\r\n","\n").replace("\r","\n")
+    if out and not out.endswith("\n"): out += "\n"
+    diff_path.write_text(out, encoding="utf-8")
+    if salvage:
+        (base / "salvage.diff").write_text(salvage, encoding="utf-8")
+    if salvage_reasons:
+        (base / "salvage_reasons.txt").write_text("\n".join(salvage_reasons), encoding="utf-8")
+    try:
+        print(f"[autocoder] artifacts -> {base}  (prompt.txt={ (base/'prompt.txt').stat().st_size }B, raw.txt={ (base/'raw.txt').stat().st_size }B, patch.diff={ diff_path.stat().st_size }B)")
+    except Exception:
+        pass
+    return base, diff_path, base / "raw.txt"
+
 def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional[AutoCodeResult]:
     if not _llm_ok(): return None
     root = get_project_root()
@@ -1205,9 +1423,9 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
                 ws_only = _diff_is_whitespace_only(v2) and not _ALLOW_WHITESPACE_ONLY
                 if not over and not is_noop and not ws_only:
                     verified = v2
-                    sanitized = ""  # we used salvage path
+                    sanitized = ""  # used salvage path
 
-    # 3) Repair loop
+    # 3) Repair loop (re-prompt if needed)
     attempt = 0
     while (not verified) and attempt < max(_REPAIR_ATTEMPTS, retries):
         attempt += 1
@@ -1245,10 +1463,9 @@ def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional
                 break
         no_op_reason = ""
 
-    # 4) Optional synth fallback (disabled if STRICT)
+    # 4) Optional synth fallback
     synth_used = False
     if (not verified) and (not _NO_SYNTH) and (not _STRICT_NOOP):
-        # choose a python hotspot
         py_target = next((p for p in hotspots if p.suffix == ".py"), None)
         target = py_target or (_FORCE_FILE and (root / _FORCE_FILE))
         if isinstance(target, pathlib.Path) and target and target.exists():
