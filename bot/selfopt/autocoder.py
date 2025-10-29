@@ -695,8 +695,6 @@ def _parse_added_removed(diff_text: str) -> dict:
             continue
         if not in_hunk or not current:
             continue
-        if raw.startswith("+++ ") or raw.startswith("--- "):
-            continue
         if raw.startswith("+"):
             files[current]["added"] += 1
             body = raw[1:].strip()
@@ -836,7 +834,7 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
         b_exists = b_abs.exists()
 
         # DELETE
-        if b_rel == "/dev/null" or (a_exists and not sug.hunks and a_rel != b_rel and not b_exists and b_rel == ""):
+        if b_rel == "/dev/null":
             try:
                 data = a_abs.read_text(encoding="utf-8", errors="replace")
             except Exception:
@@ -847,7 +845,7 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
             continue
 
         # NEW FILE
-        if (not a_exists) and (not b_exists or b_rel):
+        if (not a_exists) and b_rel and (not b_exists):
             new_lines: List[str] = []
             for h in (sug.hunks or []):
                 for ln in h[1:]:
@@ -855,10 +853,10 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
                         new_lines.append(ln[1:] + "\n")
             if not new_lines:
                 continue
-            file_diffs.append(_make_new_file_diff(b_rel or a_rel, new_lines))
+            file_diffs.append(_make_new_file_diff(b_rel, new_lines))
             continue
 
-        # RENAME
+        # RENAME (old exists, new does not)
         is_rename = (a_rel != b_rel) and a_exists and (not b_exists)
         if is_rename:
             try:
@@ -1033,7 +1031,7 @@ def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, v
       3) Try the safest strategy that fits:
          a) If any new/untracked files or index mismatch → prefer working-tree apply (no --index), then stage.
          b) Else try --index.
-         c) If that fails, try --3way (implies --index).
+         c) If that fails, try --3way (this implies an index-based apply).
          d) Last resort: --reject (treated as failure if any .rej created).
     Writes a JSON report (apply.json) when artifacts_dir is set.
     """
@@ -1058,15 +1056,21 @@ def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, v
         return code == 0
 
     def _paths_clean(paths: list[str]) -> bool:
-        # Are these paths identical in index & working tree? If any differ, --index will balk.
+        """
+        Are these paths identical in index & working tree relative to HEAD?
+        Use: git diff-index --quiet HEAD -- <paths>
+        Returns True when no differences are found.
+        """
         if not paths:
             return True
-        code, _, _ = _run(["git","diff-index","--quiet","--", "HEAD", "--", *paths])
-        # diff-index returns 0 when no differences
+        # Refresh stat info to avoid false mismatches (Windows / network fs).
+        _run(["git","update-index","-q","--refresh"])  # docs: refresh stat info only
+        # Correct ordering per git docs: git diff-index --quiet HEAD -- <paths>
+        code, _, _ = _run(["git","diff-index","--quiet","HEAD","--", *paths])
         return code == 0
 
-    # Refresh stat info to avoid false index mismatches on Windows.
-    _run(["git","update-index","-q","--refresh"])
+    # Initial refresh before probing (defensive; see above comment).
+    _run(["git","update-index","-q","--refresh"])  # refresh stat info only
 
     tracked_map = {p: _tracked(p) for p in touched}
     has_untracked = any(not v for v in tracked_map.values())
@@ -1088,55 +1092,4 @@ def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, v
     strategies: list[list[str]] = []
     if has_untracked or not index_clean:
         strategies.append(["git","apply","--whitespace=fix","--ignore-whitespace"])
-        strategies.append(["git","apply","--recount","--unidiff-zero","--whitespace=fix","--ignore-whitespace"])
-        strategies.append(["git","apply","--3way"])
-    else:
-        strategies.append(["git","apply","--index","--whitespace=fix"])
-        strategies.append(["git","apply","--index","--recount","--unidiff-zero","--whitespace=fix"])
-        strategies.append(["git","apply","--3way"])
-    strategies.append(["git","apply","--reject","--whitespace=nowarn"])
-
-    chosen = None
-    for cmd in strategies:
-        attempt: Dict[str, object] = {"cmd": _summarize_cmd(cmd), "check_ok": False, "applied": False, "rej_delta": 0}
-        check_ok = _check(cmd)
-        attempt["check_ok"] = bool(check_ok)
-        if not check_ok:
-            report["attempts"].append(attempt)
-            continue
-        before_rej = list(root.rglob("*.rej"))
-        applied = _apply_cmd(cmd)
-        after_rej = list(root.rglob("*.rej"))
-        attempt["applied"] = bool(applied)
-        attempt["rej_delta"] = max(0, len(after_rej) - len(before_rej))
-        report["attempts"].append(attempt)
-        if applied:
-            if "--reject" in cmd and attempt["rej_delta"]:
-                # treat partial apply as failure
-                continue
-            chosen = cmd
-            break
-
-    if chosen and ("--index" not in chosen and "--3way" not in chosen) and touched:
-        # stage touched files explicitly if we didn’t use an index strategy
-        _run(["git","add","--"] + touched)
-
-    ok = chosen is not None
-    report["chosen"] = _summarize_cmd(chosen) if chosen else None
-    if verbose:
-        ch = report["chosen"] or "NONE"
-        print(f"[autocoder][apply] result={ok} strategy={ch}")
-    if artifacts_dir:
-        try:
-            summary = (
-                f"chosen={report['chosen']}\n"
-                f"touched={len(touched)} has_untracked={has_untracked} index_clean={index_clean}\n"
-                + "\n".join(
-                    f"- try: {a['cmd']} check_ok={a['check_ok']} applied={a['applied']} rej_delta={a['rej_delta']}"
-                    for a in report["attempts"]
-                ) + "\n"
-            )
-            pathlib.Path(artifacts_dir, "apply.txt").write_text(summary, encoding="utf-8")
-        except Exception:
-            pass
-    return ok, report
+        strategies.append(["git","apply","--recount","--unidiff-zero","--whitespace=fix","--ignore-wh
