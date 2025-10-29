@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict
-import os, pathlib, subprocess, time, re, difflib, json, textwrap
+from typing import List, Optional, Tuple, Dict, Iterable
+import os, pathlib, subprocess, time, re, difflib, json, textwrap, math
 
 from bot.paths import get_project_root
 from bot.llm.provider import ask, info, NotConfigured
@@ -29,6 +29,15 @@ _FORCE_FILE = os.getenv("EVERABOT_AUTOCODE_FORCE_FILE", "").strip()
 
 # Repair attempts override
 _REPAIR_ATTEMPTS = int(os.getenv("EVERABOT_AUTOCODE_REPAIR_ATTEMPTS", "3"))
+
+# Similarity search when code fences lack a path hint
+_SIM_MIN = float(os.getenv("EVERABOT_AUTOCODE_SIM_MIN", "0.33"))    # choose conservative floor
+_SIM_TOPK = int(os.getenv("EVERABOT_AUTOCODE_SIM_TOPK", "5"))
+_SIM_BYTES_CAP = int(os.getenv("EVERABOT_AUTOCODE_SIM_BYTES_CAP", str(512 * 1024)))  # per file
+_SIM_BLOCK_BYTES = int(os.getenv("EVERABOT_AUTOCODE_SIM_BLOCK_BYTES", str(256 * 1024)))  # from code fence
+
+# Verified patch hunk fuzzing
+_HUNK_FUZZ_WINDOW = int(os.getenv("EVERABOT_AUTOCODE_HUNK_FUZZ_WINDOW", "120"))
 
 @dataclass
 class AutoCodeResult:
@@ -73,6 +82,31 @@ def _llm_ok() -> bool:
         return True
     except NotConfigured:
         return False
+
+# ---------- safe IO helpers ----------
+def _read_text_cap(p: pathlib.Path, cap_bytes: int) -> str:
+    try:
+        data = p.read_bytes()
+        if len(data) > cap_bytes:
+            data = data[:cap_bytes]
+        s = data.decode("utf-8", errors="replace")
+        return s.replace("\r\n","\n").replace("\r","\n")
+    except Exception:
+        return ""
+
+def _read_text_all(p: pathlib.Path) -> str:
+    try:
+        s = p.read_text(encoding="utf-8", errors="replace")
+        return s.replace("\r\n","\n").replace("\r","\n")
+    except Exception:
+        return ""
+
+def _ensure_eof_newline(lines: List[str]) -> List[str]:
+    if not lines:
+        return ["\n"]
+    if not lines[-1].endswith("\n"):
+        lines[-1] = lines[-1] + "\n"
+    return lines
 
 # ---------- bookkeeping to avoid thrashing ----------
 def _recent_autocode_touches(root: pathlib.Path) -> Dict[str, float]:
@@ -128,9 +162,15 @@ def _targets_from_env(root: pathlib.Path) -> List[pathlib.Path]:
             picks.append(p)
     return picks
 
+def _mtime_score(p: pathlib.Path) -> float:
+    try:
+        return float(p.stat().st_mtime)
+    except Exception:
+        return 0.0
+
 def _scan_hotspots(root: pathlib.Path, max_files: int = 5) -> List[pathlib.Path]:
     repo_dir = root / "bot"
-    files: list[tuple[float, int, pathlib.Path]] = []
+    files: list[tuple[float, pathlib.Path]] = []
 
     cooldown = _recent_autocode_touches(root)
     now = time.time()
@@ -139,10 +179,7 @@ def _scan_hotspots(root: pathlib.Path, max_files: int = 5) -> List[pathlib.Path]
 
     def score_for(p: pathlib.Path) -> float:
         rel_posix = p.relative_to(root).as_posix()
-        try:
-            text = p.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            return -1e12
+        text = _read_text_cap(p, 256 * 1024)
         length = text.count("\n")
         todos = text.upper().count("TODO") + text.upper().count("FIXME")
         touched_penalty = 250000 if "Autocode:" in text else 0
@@ -155,7 +192,9 @@ def _scan_hotspots(root: pathlib.Path, max_files: int = 5) -> List[pathlib.Path]
                 scale = max(0.0, (_COOLDOWN_HOURS - hours) / _COOLDOWN_HOURS)
                 cd_pen = 200000.0 * scale
 
-        base = (3 * todos + length) - touched_penalty - cd_pen
+        # Favor recency a bit (fresh files may be mid-refactor)
+        recency = 0.0001 * _mtime_score(p)
+        base = (3 * todos + length) - touched_penalty - cd_pen + recency
         if p in targeted:
             base += 50000.0
         return base
@@ -168,10 +207,10 @@ def _scan_hotspots(root: pathlib.Path, max_files: int = 5) -> List[pathlib.Path]
             rel_posix = p.relative_to(root).as_posix()
             if rel_posix in _EXCLUDE_FILES:
                 continue
-            files.append((score_for(p), 0, p))
+            files.append((score_for(p), p))
 
     files.sort(reverse=True, key=lambda t: t[0])
-    top = [p for _, __, p in files[:max_files]]
+    top = [p for _, p in files[:max_files]]
     for p in targeted:
         if p not in top:
             top.append(p)
@@ -179,7 +218,10 @@ def _scan_hotspots(root: pathlib.Path, max_files: int = 5) -> List[pathlib.Path]
     if _FORCE_FILE:
         forced = root / _FORCE_FILE
         if forced.exists() and forced not in top:
-            top[-1:] = [forced]
+            if len(top) >= max_files:
+                top[-1] = forced
+            else:
+                top.append(forced)
     return top[:max_files]
 
 def _write_status(art_dir: pathlib.Path, status: Dict[str, object]) -> None:
@@ -223,11 +265,8 @@ def _build_prompt(file_paths: List[pathlib.Path]) -> str:
     )
     ctx = []
     for p in file_paths:
-        try:
-            txt = p.read_text(encoding="utf-8", errors="replace")
-            ctx.append(f"--- FILE: {p.as_posix()} ---\n{txt}\n")
-        except Exception:
-            pass
+        txt = _read_text_cap(p, 256 * 1024)
+        ctx.append(f"--- FILE: {p.as_posix()} ---\n{txt}\n")
     return header + "\n".join(ctx)
 
 def _clean_unicode(s: str) -> str:
@@ -247,6 +286,8 @@ def _strip_code_fences(s: str) -> str:
 
 def _norm_sep(path: str) -> str:
     if not path: return path
+    if path == "/dev/null":
+        return path
     return path.replace("\\", "/").lstrip("./")
 
 def _normalize_diff_git_headers(text: str) -> str:
@@ -302,19 +343,16 @@ def _block_has_only_comment_or_doc_additions(hunk_lines: List[str]) -> bool:
     added = [ln for ln in hunk_lines if ln.startswith("+")]
     if not added: return False
     codeish = re.compile(r'^\+\s*(def |class |from |import |raise |return |with |try:|except |if |for |while |@|[A-Za-z_]\w*\s*=)')
-    has_code = False
-    for ln in added:
-        if codeish.match(ln):
-            has_code = True
-            break
+    has_code = any(codeish.match(ln) for ln in added)
     if has_code:
         return False
     for ln in added:
         body = ln[1:]
-        if body.strip() == "": 
+        if body.strip() == "":
             continue
         if _DOC_OR_COMMENT_START.match(ln) or _DOC_OR_COMMENT_END.match(ln):
             continue
+        # Obvious code tokens → consider as substantive
         if any(tok in body for tok in ("()", "{}", "[]", " = ", " -> ", ": ", "lambda ", " yield", " except", " try:", " return ")):
             return False
     return True
@@ -375,27 +413,27 @@ def _rebuild_block_headers_only(blk: list[str]) -> Optional[Tuple[str,str,list[l
                 continue
             filtered_hunks.append(h)
 
-    # If a pure rename or new/delete, keep it even if hunks filtered out
-    if not filtered_hunks and a_body == b_body:
-        return a_body, b_body, []
+    # Keep pure rename/new/delete, even without hunks
     if not filtered_hunks and a_body != b_body:
+        return a_body, b_body, []
+    if not filtered_hunks and a_body == b_body:
         return a_body, b_body, []
     return (a_body, b_body, filtered_hunks) if filtered_hunks or a_body != b_body else None
 
 def _sanitize_to_diff(raw: str) -> str:
     """
     Accepts true diffs, possibly missing some headers; repairs to a usable
-    unified diff that git can parse.
+    unified diff that git can parse (unified format with ---/+++/@@). See GNU diffutils.  # noqa
     """
     raw = _clean_unicode(raw)
     if raw.strip() == "#NOPATCH":
         return ""
-    # Fast path: if it already has diff headers, normalize and return
+    # Fast path
     if "diff --git " in raw and "--- " in raw and "+++ " in raw:
         txt = _normalize_diff_git_headers(raw)
         return (txt + ("\n" if txt and not txt.endswith("\n") else "")) if txt else ""
 
-    # Extract ```diff or ```patch blocks and stitch them
+    # Extract fenced diff/patch blocks and stitch
     stitched = []
     for m in re.finditer(r"```(?:diff|patch)\n([\s\S]*?)```", raw, re.MULTILINE):
         stitched.append(m.group(1))
@@ -406,9 +444,8 @@ def _sanitize_to_diff(raw: str) -> str:
         txt = _normalize_diff_git_headers("\n".join(stitched))
         return (txt + ("\n" if txt and not txt.endswith("\n") else "")) if txt else ""
 
-    # Try to recover when only ---/+++ pairs exist (no 'diff --git' lines)
+    # Try to recover when only ---/+++ pairs exist (no 'diff --git')
     if ("--- " in raw and "+++ " in raw and "@@ " in raw):
-        # inject missing 'diff --git' lines before each ---/+++ pair
         lines = raw.splitlines()
         out: List[str] = []
         i = 0
@@ -427,9 +464,6 @@ def _sanitize_to_diff(raw: str) -> str:
                     a = minus_path if minus_path.startswith("a/") else ("a/" + minus_path)
                     b = plus_path if plus_path.startswith("b/") else ("b/" + plus_path)
                     out.append(f"diff --git {a} {b}")
-                else:
-                    # unable to pair, just pass through
-                    out.append(ln)
             out.append(ln)
             i += 1
         txt = _normalize_diff_git_headers("\n".join(out))
@@ -489,7 +523,7 @@ def _parse_oldstart(hunk: List[str]) -> int:
     except Exception:
         return 0
 
-def _fuzzy_anchor_index(hay: List[str], needle: List[str], around: int, window: int = 80) -> int:
+def _fuzzy_anchor_index(hay: List[str], needle: List[str], around: int, window: int = _HUNK_FUZZ_WINDOW) -> int:
     L = len(hay)
     lo = max(0, around - window)
     hi = min(L, around + window)
@@ -509,7 +543,7 @@ def _fuzzy_anchor_index(hay: List[str], needle: List[str], around: int, window: 
     sm = difflib.SequenceMatcher(a="".join(needle), b="".join(sub), autojunk=False)
     best = max(
         (op for op in sm.get_opcodes() if op[0] == "equal"),
-        key=lambda t: t[2] - t[1],
+        key=lambda t: (t[2] - t[1]) if len(t) >= 3 else 0,
         default=("equal", 0, 0, 0, 0),
     )
     b1 = best[3] if len(best) >= 4 else 0
@@ -526,7 +560,9 @@ def _verify_deletions_match(hunk: List[str], hay: List[str], start: int) -> bool
             line_in_file = hay[start + j]
             if tag == "-":
                 if line_in_file != (ln[1:] + "\n"):
-                    return False
+                    # Try relaxed whitespace compare
+                    if line_in_file.strip() != (ln[1:] + "\n").strip():
+                        return False
             j += 1
     return True
 
@@ -574,7 +610,7 @@ def _apply_hunks_to_content(orig: List[str], hunks: List[List[str]]) -> ApplyRep
         cursor_hint = start_idx + len(repl)
         applied_idx.append(i)
 
-    return ApplyReport(applied=applied_idx, skipped=skipped_idx, result=cur)
+    return ApplyReport(applied=applied_idx, skipped=skipped_idx, result=_ensure_eof_newline(cur))
 
 def _make_unified_diff(rel_path: str, original: List[str], new_lines: List[str]) -> str:
     raw_lines = list(difflib.unified_diff(
@@ -586,6 +622,7 @@ def _make_unified_diff(rel_path: str, original: List[str], new_lines: List[str])
     return f"diff --git a/{rel_path} b/{rel_path}\n{body}"
 
 def _make_new_file_diff(rel_path: str, new_lines: List[str]) -> str:
+    new_lines = _ensure_eof_newline(new_lines)
     n = len(new_lines)
     hdr = f"@@ -0,0 +1,{n} @@\n" if n > 0 else "@@ -0,0 +1,0 @@\n"
     plus = "".join("+" + (ln[:-1] if ln.endswith("\n") else ln) + "\n" for ln in new_lines)
@@ -597,6 +634,7 @@ def _make_new_file_diff(rel_path: str, new_lines: List[str]) -> str:
     )
 
 def _make_deleted_file_diff(rel_path: str, original: List[str]) -> str:
+    original = _ensure_eof_newline(original)
     n = len(original)
     hdr = f"@@ -1,{n} +0,0 @@\n" if n > 0 else "@@ -1,0 +0,0 @@\n"
     minus = "".join("-" + (ln[:-1] if ln.endswith("\n") else ln) + "\n" for ln in original)
@@ -677,9 +715,8 @@ def _rewrite_imports_for_rename(root: pathlib.Path, old_rel: str, new_rel: str) 
         return results
     for p in _collect_repo_py_files(root):
         rel = p.relative_to(root).as_posix()
-        try:
-            raw = p.read_text(encoding="utf-8", errors="replace")
-        except Exception:
+        raw = _read_text_all(p)
+        if not raw:
             continue
         orig = [ln + "\n" for ln in raw.split("\n")]
         if orig and orig[-1] == "\n" and not raw.endswith("\n"):
@@ -767,7 +804,6 @@ def _diff_is_whitespace_only(diff_text: str) -> bool:
     meta = _parse_added_removed(diff_text)
     if not meta:
         return False
-    # if every added line is whitespace-only and no removals, classify as whitespace-only
     total_added = sum(v["added"] for v in meta.values())
     total_removed = sum(v["removed"] for v in meta.values())
     total_non_ws_adds = sum(v["non_ws_adds"] for v in meta.values())
@@ -815,6 +851,53 @@ def _generate_pr_md(diff_text: str) -> str:
     lines.append('2) Sanity import (`python -c "import bot; print(\'OK\')"`).')
     return "\n".join(lines)
 
+# ---------- similarity-based path guessing for code fences ----------
+def _candidate_repo_files(root: pathlib.Path) -> List[pathlib.Path]:
+    candidates: List[pathlib.Path] = []
+    for glob in _CODE_GLOBS:
+        for p in (root / "bot").rglob(glob):
+            parts = set(p.parts) | {"/".join(p.parts[i:i+2]) for i in range(len(p.parts)-1)}
+            if any(x in _EXCLUDE_DIRS for x in parts): continue
+            rel = p.relative_to(root).as_posix()
+            if rel in _EXCLUDE_FILES: continue
+            candidates.append(p)
+    return candidates
+
+def _similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    # bound inputs
+    a = a[:_SIM_BLOCK_BYTES]
+    b = b[:_SIM_BYTES_CAP]
+    sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
+    return float(sm.quick_ratio() * 0.25 + sm.ratio() * 0.75)  # bias toward full ratio
+
+def _guess_path_by_similarity(raw: str, code_text: str, root: pathlib.Path) -> Optional[str]:
+    """
+    If a fenced code block lacks a path hint, compare its text against repo
+    candidates and pick the highest ratio above _SIM_MIN.
+    """
+    cands = _candidate_repo_files(root)
+    if not cands:
+        return None
+    block = code_text.replace("\r\n","\n").replace("\r","\n")
+    scored: List[Tuple[float, pathlib.Path]] = []
+    for p in cands:
+        repo_txt = _read_text_cap(p, _SIM_BYTES_CAP)
+        if not repo_txt:
+            continue
+        r = _similarity(block, repo_txt)
+        if r > 0:
+            scored.append((r, p))
+    if not scored:
+        return None
+    scored.sort(key=lambda t: t[0], reverse=True)
+    top = scored[:_SIM_TOPK]
+    best_ratio, best_path = top[0]
+    if best_ratio >= _SIM_MIN:
+        return best_path.relative_to(root).as_posix()
+    return None
+
 # ---------- synth fallback (only if nothing verified) ----------
 def _pick_first_python(hotspots: List[pathlib.Path]) -> Optional[pathlib.Path]:
     for p in hotspots:
@@ -822,11 +905,9 @@ def _pick_first_python(hotspots: List[pathlib.Path]) -> Optional[pathlib.Path]:
     return None
 
 def _synthesize_python_type_checking_noop(rel_path: str, abs_path: pathlib.Path) -> str:
-    try:
-        data = abs_path.read_text(encoding="utf-8", errors="replace")
-    except Exception:
+    data = _read_text_all(abs_path)
+    if not data:
         return ""
-    data = data.replace("\r\n","\n").replace("\r","\n")
     if "TYPE_CHECKING" in data and "Autocode:" in data:
         return ""
     original = [ln + "\n" for ln in data.split("\n")]
@@ -849,7 +930,7 @@ _TILDE_FENCE_RE = re.compile(r"~~~(?:[a-zA-Z0-9_.+\-]*)\n([\s\S]*?)~~~", re.MULT
 _FILE_BLOCK_RE = re.compile(r"<<<?FILE\s+(bot/[A-Za-z0-9_\-./]+)>>?>\s*\n([\s\S]*?)\n<<<?END>>?>", re.MULTILINE)
 _PLAIN_FILE_HEADER_RE = re.compile(r'(?im)^File\s*:\s*(bot/[A-Za-z0-9_\-./]+)\s*$')
 
-def _guess_path_from_context(whole: str, start_idx: int, code_text: str) -> Optional[str]:
+def _guess_path_from_context(whole: str, start_idx: int, code_text: str, root: pathlib.Path, salvage_reasons: List[str]) -> Optional[str]:
     lo = max(0, start_idx - 500)
     ctx = whole[lo:start_idx]
     for pat in _FILE_HINT_PATTERNS:
@@ -859,7 +940,7 @@ def _guess_path_from_context(whole: str, start_idx: int, code_text: str) -> Opti
             if candidate.startswith("bot/") and not _is_excluded_path(candidate):
                 return candidate
 
-    # also inspect first few lines of the code block for a "FILE:" hint
+    # inspect first few lines of the code block for a "FILE:" hint
     top_lines = "\n".join(code_text.splitlines()[:5])
     m = re.search(r'(?im)^\s*(?:#\s*)?(?:file|path)\s*:\s*(bot/[^\s:]+)\s*$', top_lines)
     if m:
@@ -867,13 +948,20 @@ def _guess_path_from_context(whole: str, start_idx: int, code_text: str) -> Opti
         if candidate.startswith("bot/") and not _is_excluded_path(candidate):
             return candidate
 
-    # last resort: bare "bot/..." line
+    # last resort: bare "bot/..." line in context
     m = re.search(r'(?m)^\s*(bot/[A-Za-z0-9_\-./]+)\s*:?$', ctx)
     if m:
         candidate = _norm_sep(m.group(1))
         if candidate.startswith("bot/") and not _is_excluded_path(candidate):
             return candidate
 
+    # NEW: similarity-based guess if no hints present
+    guessed = _guess_path_by_similarity(whole, code_text, root)
+    if guessed:
+        salvage_reasons.append(f"code fence without path hint → guessed by similarity: {guessed}")
+        return guessed
+
+    salvage_reasons.append("code fence without path hint")
     return None
 
 def _collect_file_blocks_from_plaintext(raw: str) -> List[Tuple[str, str]]:
@@ -926,7 +1014,7 @@ def _diff_from_code_blocks(raw: str, root: pathlib.Path) -> Tuple[str, List[str]
         abs_path = root / rel
         try:
             if abs_path.exists():
-                original_text = abs_path.read_text(encoding="utf-8", errors="replace").replace("\r\n","\n").replace("\r","\n")
+                original_text = _read_text_all(abs_path)
                 original = [ln + "\n" for ln in original_text.split("\n")]
                 if original and original[-1] == "\n" and not original_text.endswith("\n"):
                     original = original[:-1]
@@ -946,14 +1034,13 @@ def _diff_from_code_blocks(raw: str, root: pathlib.Path) -> Tuple[str, List[str]
     # 1) Triple backticks
     for m in _CODE_FENCE_RE.finditer(raw):
         code_text = m.group(1)
-        rel = _guess_path_from_context(raw, m.start(), code_text)
+        rel = _guess_path_from_context(raw, m.start(), code_text, root, reasons)
         if not rel:
-            reasons.append("code fence without path hint")
             continue
         abs_path = root / rel
         try:
             if abs_path.exists():
-                original_text = abs_path.read_text(encoding="utf-8", errors="replace").replace("\r\n","\n").replace("\r","\n")
+                original_text = _read_text_all(abs_path)
                 original = [ln + "\n" for ln in original_text.split("\n")]
                 if original and original[-1] == "\n" and not original_text.endswith("\n"):
                     original = original[:-1]
@@ -973,14 +1060,13 @@ def _diff_from_code_blocks(raw: str, root: pathlib.Path) -> Tuple[str, List[str]
     # 2) Tilde fences
     for m in _TILDE_FENCE_RE.finditer(raw):
         code_text = m.group(1)
-        rel = _guess_path_from_context(raw, m.start(), code_text)
+        rel = _guess_path_from_context(raw, m.start(), code_text, root, reasons)
         if not rel:
-            reasons.append("tilde fence without path hint")
             continue
         abs_path = root / rel
         try:
             if abs_path.exists():
-                original_text = abs_path.read_text(encoding="utf-8", errors="replace").replace("\r\n","\n").replace("\r","\n")
+                original_text = _read_text_all(abs_path)
                 original = [ln + "\n" for ln in original_text.split("\n")]
                 if original and original[-1] == "\n" and not original_text.endswith("\n"):
                     original = original[:-1]
@@ -996,6 +1082,19 @@ def _diff_from_code_blocks(raw: str, root: pathlib.Path) -> Tuple[str, List[str]
             touched.append(rel)
         except Exception as e:
             reasons.append(f"tilde-fence error for {rel}: {e}")
+
+    # Deduplicate diffs for the same path by keeping the last one
+    if diffs:
+        by_path: Dict[str, str] = {}
+        for d in diffs:
+            tgt_line = next((ln for ln in d.splitlines() if ln.startswith("+++ ")), None)
+            path = None
+            if tgt_line:
+                path = tgt_line.split(" ",1)[1].strip()
+                if path.startswith("b/"): path = path[2:]
+            if path:
+                by_path[path] = d
+        diffs = list(by_path.values())
 
     joined = ("\n".join(diffs) + ("\n" if diffs else ""))
     return joined, touched, reasons
@@ -1039,16 +1138,17 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
         a_exists = a_abs.exists() if a_abs else False
         b_exists = b_abs.exists() if b_abs else False
 
+        # Delete
         if b_rel == "/dev/null" and a_rel != "/dev/null" and a_exists:
-            try:
-                data = (a_abs).read_text(encoding="utf-8", errors="replace")
-            except Exception:
+            data = _read_text_all(a_abs)
+            if not data:
                 continue
             orig = [ln + "\n" for ln in data.split("\n")]
             if orig and orig[-1] == "\n" and not data.endswith("\n"): orig = orig[:-1]
             file_diffs.append(_make_deleted_file_diff(a_rel, orig))
             continue
 
+        # New file
         if a_rel == "/dev/null" and b_rel != "/dev/null" and not b_exists:
             new_lines: List[str] = []
             for h in (sug.hunks or []):
@@ -1058,21 +1158,19 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
             file_diffs.append(_make_new_file_diff(b_rel, new_lines))
             continue
 
+        # Rename (with optional edits)
         is_rename = (a_rel != b_rel) and a_rel != "/dev/null" and b_rel != "/dev/null" and a_exists and (not b_exists)
         if is_rename:
-            try:
-                data = (a_abs).read_text(encoding="utf-8", errors="replace")
-            except Exception:
+            data = _read_text_all(a_abs)
+            if not data:
                 continue
-            data = data.replace("\r\n","\n").replace("\r","\n")
             orig = [ln + "\n" for ln in data.split("\n")]
             if orig and orig[-1] == "\n" and not data.endswith("\n"): orig = orig[:-1]
 
+            new_content = orig[:]
             if sug.hunks:
                 rep = _apply_hunks_to_content(orig, sug.hunks)
                 new_content = rep.result
-            else:
-                new_content = orig[:]
 
             file_diffs.append(_make_deleted_file_diff(a_rel, orig))
             file_diffs.append(_make_new_file_diff(b_rel, new_content))
@@ -1085,12 +1183,11 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
                     file_diffs.append(_make_unified_diff(rel, old_lines, new_lines))
             continue
 
+        # Edit existing file
         if a_exists:
-            try:
-                data = (a_abs).read_text(encoding="utf-8", errors="replace")
-            except Exception:
+            data = _read_text_all(a_abs)
+            if not data:
                 continue
-            data = data.replace("\r\n","\n").replace("\r","\n")
             original = [ln + "\n" for ln in data.split("\n")]
             if original and original[-1] == "\n" and not data.endswith("\n"):
                 original = original[:-1]
@@ -1101,11 +1198,11 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
                 file_diffs.append(_make_unified_diff(dst_rel, original, rep.result))
             continue
 
+        # otherwise ignore
         continue
 
     joined = ("\n".join(file_diffs) + ("\n" if file_diffs else ""))
     if joined and _ALLOW_WHITESPACE_ONLY is False and _diff_is_whitespace_only(joined):
-        # discard whitespace-only patch unless allowed
         return ""
     return joined
 
@@ -1268,6 +1365,15 @@ def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, v
         return False, report
 
     root = get_project_root()
+
+    # bail if not a git repo
+    try:
+        rc = subprocess.run(["git","rev-parse","--is-inside-work-tree"], cwd=root, text=True, capture_output=True).returncode
+        if rc != 0:
+            return False, report
+    except Exception:
+        return False, report
+
     diff_txt = patch_path.read_text(encoding="utf-8", errors="replace")
     touched = _touch_list_from_diff(diff_txt)
     report["touched"] = touched
