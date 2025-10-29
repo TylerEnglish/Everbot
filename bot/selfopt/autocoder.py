@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict, Iterable
-import os, pathlib, subprocess, time, re, difflib, json, math, textwrap
+from typing import List, Optional, Tuple, Dict
+import os, pathlib, subprocess, time, re, difflib, json, textwrap
 
 from bot.paths import get_project_root
 from bot.llm.provider import ask, info, NotConfigured
@@ -30,7 +30,13 @@ class AutoCodeResult:
     note: str
 
 # ---------- config / guards ----------
-_ALLOWED_DIFF_PREFIXES = ("diff --git", "index ", "--- ", "+++ ", "@@ ")
+# Accept more header lines so we don't drop otherwise-correct diffs (rename, modes, similarity, etc.)
+_ALLOWED_DIFF_PREFIXES = (
+    "diff --git", "index ", "--- ", "+++ ", "@@ ",
+    "new file mode ", "deleted file mode ", "old mode ", "new mode ",
+    "rename from ", "rename to ", "copy from ", "copy to ",
+    "similarity index ", "dissimilarity index "
+)
 _CODE_GLOBS = ("*.py","*.rs","*.go","*.c","*.cc","*.cpp","*.h","*.hpp","*.s","*.asm")
 _EXCLUDE_DIRS = {
     "test","ruleset","snapshots","accel/rust/target","accel/cpp/build",
@@ -48,6 +54,7 @@ def _llm_ok() -> bool:
     except NotConfigured:
         return False
 
+# ---------- bookkeeping to avoid thrashing ----------
 def _recent_autocode_touches(root: pathlib.Path) -> Dict[str, float]:
     """
     Scan snapshots/selfopt/autocode/*/apply.json and build a map:
@@ -61,7 +68,6 @@ def _recent_autocode_touches(root: pathlib.Path) -> Dict[str, float]:
         if not d.is_dir():
             continue
         ts = None
-        # dirs are named like YYYYMMDD_HHMMSS
         try:
             ts = time.mktime(time.strptime(d.name, "%Y%m%d_%H%M%S"))
         except Exception:
@@ -76,10 +82,9 @@ def _recent_autocode_touches(root: pathlib.Path) -> Dict[str, float]:
         touched = obj.get("touched") or []
         when = ts or os.path.getmtime(ap)
         for p in touched:
-            # normalize
             p = p.replace("\\", "/")
             if p.startswith("./"): p = p[2:]
-            if not p.startswith("bot/"): 
+            if not p.startswith("bot/"):
                 continue
             prev = out.get(p, 0.0)
             if when > prev:
@@ -140,12 +145,10 @@ def _scan_hotspots(root: pathlib.Path, max_files: int = 5) -> List[pathlib.Path]
         if last:
             hours = (now - last) / 3600.0
             if hours < _COOLDOWN_HOURS:
-                # scale from big penalty when just touched → 0 at cooldown boundary
                 scale = max(0.0, (_COOLDOWN_HOURS - hours) / _COOLDOWN_HOURS)
                 cd_pen = 200000.0 * scale
 
         base = (3 * todos + length) - touched_penalty - cd_pen
-        # Small positive bias if explicitly targeted
         if p in targeted:
             base += 50000.0
         return base
@@ -162,7 +165,6 @@ def _scan_hotspots(root: pathlib.Path, max_files: int = 5) -> List[pathlib.Path]
 
     files.sort(reverse=True, key=lambda t: t[0])
     top = [p for _, __, p in files[:max_files]]
-    # ensure targeted files appear (even if score fell below), but cap to max_files
     for p in targeted:
         if p not in top:
             top.append(p)
@@ -175,16 +177,17 @@ def _write_status(art_dir: pathlib.Path, status: Dict[str, object]) -> None:
         pass
 
 def _empty_reason(raw: str, sanitized: str, verified: str, no_op_reason: str) -> str:
-    if not raw.strip():
+    if not (raw or "").strip():
         return "llm_raw_empty"
-    if sanitized.strip() == "":
+    if (sanitized or "").strip() == "":
         return "sanitizer_dropped_non_diff_text"
     if no_op_reason:
         return f"filtered_noop:{no_op_reason}"
-    if verified.strip() == "":
+    if (verified or "").strip() == "":
         return "verified_patch_empty_after_filters"
     return "unknown"
 
+# ---------- prompt + sanitation ----------
 def _build_prompt(file_paths: List[pathlib.Path]) -> str:
     header = (
         "You are Everabot's internal code refactorer.\n"
@@ -658,7 +661,6 @@ def _rewrite_imports_for_rename(root: pathlib.Path, old_rel: str, new_rel: str) 
     return results
 
 # ---------- diff size accounting ----------
-
 def _touch_list_from_diff(diff_text: str) -> List[str]:
     touched = []
     for line in diff_text.splitlines():
@@ -744,7 +746,7 @@ def _generate_pr_md(diff_text: str) -> str:
         bullets = []
         if meta["added_typing_tc"]:
             bullets.append("add TYPE_CHECKING guard")
-        if meta["added_imports"]:
+        if meta["added_imports"] and not meta["added_typing_tc"]:
             for imp in meta["added_imports"]:
                 bullets.append(f"add `{imp}`")
         if not bullets:
@@ -763,7 +765,6 @@ def _generate_pr_md(diff_text: str) -> str:
     return "\n".join(lines)
 
 # ---------- synth fallback (only if nothing verified) ----------
-
 def _pick_first_python(hotspots: List[pathlib.Path]) -> Optional[pathlib.Path]:
     for p in hotspots:
         if p.suffix == ".py": return p
@@ -791,253 +792,7 @@ def _synthesize_python_type_checking_noop(rel_path: str, abs_path: pathlib.Path)
     insert += ["if TYPE_CHECKING:\n","    pass  # Autocode: non-functional type-only block\n"]
     return _make_unified_diff(rel_path, original, new_lines=original[:i] + insert + original[i:])
 
-# ---------- public API ----------
-
-def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional[AutoCodeResult]:
-    if not _llm_ok(): return None
-
-    root = get_project_root()
-    hotspots = _scan_hotspots(root, max_files=max_files)
-    if not hotspots: return None
-
-    # Keep the original context prompt; repair attempts should use fresh context, not prior raw output.
-    origin_prompt = _build_prompt(hotspots)
-    raw = ask(origin_prompt, max_tokens=2800, temperature=0.15)
-
-    sanitized = _sanitize_to_diff(raw)
-    verified = _verified_patch_from_llm_diff(sanitized) if sanitized else ""
-
-    # Reject typing-only or oversized patches
-    no_op_reason = ""
-    if verified:
-        if _STRICT_NOOP and _diff_is_typing_noop(verified):
-            verified = ""
-            no_op_reason = "typing-only"
-        elif _MAX_DIFF_LINES > 0 and _diff_line_count(verified) > _MAX_DIFF_LINES:
-            verified = ""
-            no_op_reason = f"too-large ({_diff_line_count(verified)}>{_MAX_DIFF_LINES})"
-
-    # repair loop if nothing verified yet
-    attempt = 0
-    while (not verified) and attempt < max(2, retries):
-        attempt += 1
-        pre = []
-        # Rebuild hotspots (files may change between attempts) and prompt with stronger constraints.
-        hotspots = _scan_hotspots(root, max_files=max_files)
-        fresh_ctx = _build_prompt(hotspots)
-        guard = [
-            "If your prior suggestion was rejected, it was likely non-functional:",
-            " - typing-only (TYPE_CHECKING) or comment/doc-only edits are disallowed;",
-            " - diffs without at least one '@@' hunk are invalid;",
-            " - keep paths under bot/ and avoid bot/cli.py.",
-            "",
-            "Now produce ONE VALID unified diff that makes a tiny, behavior-preserving code improvement",
-            "(e.g., input validation, tighter error handling, small helper extraction, minor micro-optimization).",
-            "Absolute rules:",
-            " - Only output the diff; no prose.",
-            " - Must include 'diff --git a/... b/...', '---', '+++', and at least one '@@' hunk per file.",
-            " - Do NOT add TYPE_CHECKING-only or docstring-only changes.",
-        ]
-        repair_prompt = textwrap.dedent("\n".join(guard)) + "\n\n" + fresh_ctx
-        raw2 = ask(repair_prompt, max_tokens=2400, temperature=0.1)
-        pre.append(
-            "Convert to a VALID unified diff (no prose). Each file needs 'diff --git a/... b/...' "
-            "+ headers and at least one '@@' hunk. Avoid comment/docstring-only edits.\nOUTPUT:\n"
-        )
-        repair_prompt = "".join(pre) + raw
-        # Nudge temp a bit to escape local minima
-        raw2 = ask(repair_prompt, max_tokens=2200, temperature=0.25)
-        sanitized2 = _sanitize_to_diff(raw2)
-        if sanitized2:
-            v2 = _verified_patch_from_llm_diff(sanitized2)
-            if v2:
-                # re-check guards
-                over = _MAX_DIFF_LINES > 0 and _diff_line_count(v2) > _MAX_DIFF_LINES
-                is_noop = _STRICT_NOOP and _diff_is_typing_noop(v2)
-                if not over and not is_noop:
-                    raw = raw2
-                    raw, sanitized, verified = raw2, sanitized2, v2
-                    verified = v2
-                    break
-        no_op_reason = ""
-
-    # If still nothing and synth not disabled, try tiny no-op once,
-    # BUT NEVER when _STRICT_NOOP is enabled (prevents the loop you've seen).
-    synth_used = False
-    if (not verified) and (not _NO_SYNTH) and (not _STRICT_NOOP):
-        target = _pick_first_python(hotspots)
-        if target is not None:
-            rel = str(target.relative_to(root).as_posix())
-            if rel.startswith("bot/") and not _is_excluded_path(rel):
-                synth = _synthesize_python_type_checking_noop(rel, target)
-                if synth.strip():
-                    verified = synth
-                    raw = synth
-                    synth_used = True
-
-    art_dir, diff_path, _ = _write_artifacts(origin_prompt, raw, verified)
-    # Persist a small status block explaining empties and bookkeeping details.
-    _write_status(art_dir, {
-        "reason": _empty_reason(raw, sanitized, verified, no_op_reason),
-        "sizes": {"raw": len(raw or ""), "sanitized": len(sanitized or ""), "verified": len(verified or "")},
-        "strict_noop": bool(_STRICT_NOOP),
-        "synth_used": bool(synth_used)
-    })
-    touched = _touch_list_from_diff(verified) if verified else []
-
-    applied = False
-    strategy_report: Dict[str, object] = {}
-    if verified:
-        applied, strategy_report = _git_apply(diff_path, artifacts_dir=str(art_dir), verbose=_VERBOSE)
-        try:
-            (pathlib.Path(art_dir) / "apply.json").write_text(json.dumps(strategy_report, indent=2), encoding="utf-8")
-        except Exception:
-            pass
-
-    note_bits = []
-    if synth_used:
-        note_bits.append("used synth fallback (TYPE_CHECKING no-op) because LLM diff could not be verified")
-    note_bits.append("patch applied via git apply" if applied else "no verified changes applied")
-    note = "; ".join(note_bits)
-
-    try:
-        pr_text = _generate_pr_md(verified if verified else "")
-        (pathlib.Path(art_dir) / "PR.md").write_text(pr_text, encoding="utf-8")
-    except Exception:
-        pass
-
-    return AutoCodeResult(
-        title="autocode-refactor",
-        patch_path=str(diff_path),
-        patch_applied=bool(applied),
-        touched_paths=touched,
-        artifacts_dir=str(art_dir),
-        note=note,
-    )
-
-# ---------- git apply with strategy report ----------
-
-def _summarize_cmd(cmd: List[str]) -> str:
-    return " ".join(cmd)
-
-def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, verbose: bool=False) -> Tuple[bool, Dict[str, object]]:
-    """
-    Smarter patch application with a strategy report:
-      1) Parse touched paths from the diff.
-      2) Probe path tracking + index cleanliness.
-      3) Try the safest strategy that fits:
-         a) If any new/untracked files or index mismatch → prefer working-tree apply (no --index), then stage.
-         b) Else try --index.
-         c) If that fails, try --3way (implies --index).
-         d) Last resort: --reject (treated as failure if any .rej created).
-    Writes a JSON report (apply.json) when artifacts_dir is set.
-    """
-    report: Dict[str, object] = {"touched": [], "has_untracked": False, "index_clean": True, "attempts": []}
-    if not patch_path.exists() or patch_path.stat().st_size == 0:
-        return False, report
-
-    root = get_project_root()
-    diff_txt = patch_path.read_text(encoding="utf-8", errors="replace")
-    touched = _touch_list_from_diff(diff_txt)
-    report["touched"] = touched
-
-    def _run(cmd: list[str]) -> tuple[int, str, str]:
-        try:
-            p = subprocess.run(cmd, cwd=root, text=True, capture_output=True, check=False)
-            return p.returncode, p.stdout, p.stderr
-        except Exception as e:
-            return 999, "", str(e)
-
-    def _tracked(path: str) -> bool:
-        code, _, _ = _run(["git","ls-files","--error-unmatch","--",path])
-        return code == 0
-
-    def _paths_clean(paths: list[str]) -> bool:
-        # Are these paths identical in index & working tree? If any differ, --index will balk.
-        if not paths:
-            return True
-        code, _, _ = _run(["git","diff-index","--quiet","--", "HEAD", "--", *paths])
-        # diff-index returns 0 when no differences
-        return code == 0
-
-    # Refresh stat info to avoid false index mismatches on Windows. (git update-index --refresh)
-    _run(["git","update-index","-q","--refresh"])  # docs: re-check stat info. :contentReference[oaicite:1]{index=1}
-
-    tracked_map = {p: _tracked(p) for p in touched}
-    has_untracked = any(not v for v in tracked_map.values())
-    index_clean = _paths_clean([p for p, t in tracked_map.items() if t])
-    report["has_untracked"] = has_untracked
-    report["index_clean"] = index_clean
-    if verbose:
-        print(f"[autocoder][apply] touched={len(touched)} has_untracked={has_untracked} index_clean={index_clean}")
-
-    def _check(cmd: list[str]) -> bool:
-        rc, _, _ = _run(["git","apply","--check", *cmd[2:], str(patch_path)])
-        return rc == 0
-
-    def _apply_cmd(cmd: list[str]) -> bool:
-        rc, _, _ = _run(cmd + [str(patch_path)])
-        return rc == 0
-
-    # Strategy candidates (ordered)
-    strategies: list[list[str]] = []
-    if has_untracked or not index_clean:
-        strategies.append(["git","apply","--whitespace=fix","--ignore-whitespace"])
-        strategies.append(["git","apply","--recount","--unidiff-zero","--whitespace=fix","--ignore-whitespace"])
-        strategies.append(["git","apply","--3way"])
-    else:
-        strategies.append(["git","apply","--index","--whitespace=fix"])
-        strategies.append(["git","apply","--index","--recount","--unidiff-zero","--whitespace=fix"])
-        strategies.append(["git","apply","--3way"])
-    strategies.append(["git","apply","--reject","--whitespace=nowarn"])
-
-    chosen = None
-    for cmd in strategies:
-        attempt: Dict[str, object] = {"cmd": _summarize_cmd(cmd), "check_ok": False, "applied": False, "rej_delta": 0}
-        check_ok = _check(cmd)
-        attempt["check_ok"] = bool(check_ok)
-        if not check_ok:
-            report["attempts"].append(attempt)
-            continue
-        before_rej = list(root.rglob("*.rej"))
-        applied = _apply_cmd(cmd)
-        after_rej = list(root.rglob("*.rej"))
-        attempt["applied"] = bool(applied)
-        attempt["rej_delta"] = max(0, len(after_rej) - len(before_rej))
-        report["attempts"].append(attempt)
-        if applied:
-            if "--reject" in cmd and attempt["rej_delta"]:
-                # treat partial apply as failure
-                continue
-            chosen = cmd
-            break
-
-    if chosen and ("--index" not in chosen and "--3way" not in chosen) and touched:
-        # stage touched files explicitly if we didn’t use an index strategy
-        _run(["git","add","--"] + touched)
-
-    ok = chosen is not None
-    report["chosen"] = _summarize_cmd(chosen) if chosen else None
-    if verbose:
-        ch = report["chosen"] or "NONE"
-        print(f"[autocoder][apply] result={ok} strategy={ch}")
-    if artifacts_dir:
-        try:
-            summary = (
-                f"chosen={report['chosen']}\n"
-                f"touched={len(touched)} has_untracked={has_untracked} index_clean={index_clean}\n"
-                + "\n".join(
-                    f"- try: {a['cmd']} check_ok={a['check_ok']} applied={a['applied']} rej_delta={a['rej_delta']}"
-                    for a in report["attempts"]
-                ) + "\n"
-            )
-            pathlib.Path(artifacts_dir, "apply.txt").write_text(summary, encoding="utf-8")
-        except Exception:
-            pass
-    return ok, report
-
-# ---------- utilities ----------
-
+# ---------- artifact helpers ----------
 def _write_artifacts(prompt: str, raw: str, diff: str) -> Tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
     base = get_project_root() / "snapshots" / "selfopt" / "autocode" / time.strftime("%Y%m%d_%H%M%S")
     base.mkdir(parents=True, exist_ok=True)
@@ -1054,6 +809,7 @@ def _write_artifacts(prompt: str, raw: str, diff: str) -> Tuple[pathlib.Path, pa
         pass
     return base, diff_path, base / "raw.txt"
 
+# ---------- build a verified, repo-accurate patch ----------
 def _verified_patch_from_llm_diff(diff_text: str) -> str:
     """
     Build a brand-new, correct unified diff by applying suggested hunks to actual files.
@@ -1153,3 +909,234 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
 
     return ("\n".join(file_diffs) + ("\n" if file_diffs else ""))
 
+# ---------- public API ----------
+def propose_and_apply_refactor(max_files: int = 5, retries: int = 2) -> Optional[AutoCodeResult]:
+    if not _llm_ok(): return None
+
+    root = get_project_root()
+    hotspots = _scan_hotspots(root, max_files=max_files)
+    if not hotspots: return None
+
+    # Base prompt with initial hotspots
+    origin_prompt = _build_prompt(hotspots)
+    raw = ask(origin_prompt, max_tokens=2800, temperature=0.15)
+
+    sanitized = _sanitize_to_diff(raw)
+    verified = _verified_patch_from_llm_diff(sanitized) if sanitized else ""
+
+    # Reject typing-only or oversized patches
+    no_op_reason = ""
+    if verified:
+        if _STRICT_NOOP and _diff_is_typing_noop(verified):
+            verified = ""
+            no_op_reason = "typing-only"
+        elif _MAX_DIFF_LINES > 0 and _diff_line_count(verified) > _MAX_DIFF_LINES:
+            verified = ""
+            no_op_reason = f"too-large ({_diff_line_count(verified)}>{_MAX_DIFF_LINES})"
+
+    # repair loop if nothing verified yet
+    attempt = 0
+    while (not verified) and attempt < max(2, retries):
+        attempt += 1
+        # Rebuild hotspots and prompt with stronger constraints; DO NOT reuse prior raw output.
+        hotspots = _scan_hotspots(root, max_files=max_files)
+        fresh_ctx = _build_prompt(hotspots)
+        guard_lines = [
+            "If your prior suggestion was rejected, it was likely non-functional:",
+            " - typing-only (TYPE_CHECKING) or comment/doc-only edits are disallowed;",
+            " - diffs without at least one '@@' hunk are invalid;",
+            " - keep paths under bot/ and avoid bot/cli.py.",
+            "",
+            "Now produce ONE VALID unified diff that makes a tiny, behavior-preserving code improvement",
+            "(e.g., input validation, tighter error handling, small helper extraction, minor micro-optimization).",
+            "",
+            "Absolute rules:",
+            " - Only output the diff; no prose.",
+            " - Must include 'diff --git a/... b/...', '---', '+++', and at least one '@@' hunk per file.",
+            " - Do NOT add TYPE_CHECKING-only or docstring-only changes.",
+        ]
+        repair_prompt = textwrap.dedent("\n".join(guard_lines)) + "\n\n" + fresh_ctx
+        raw2 = ask(repair_prompt, max_tokens=2400, temperature=0.2)
+        sanitized2 = _sanitize_to_diff(raw2)
+        if sanitized2:
+            v2 = _verified_patch_from_llm_diff(sanitized2)
+            if v2:
+                over = _MAX_DIFF_LINES > 0 and _diff_line_count(v2) > _MAX_DIFF_LINES
+                is_noop = _STRICT_NOOP and _diff_is_typing_noop(v2)
+                if not over and not is_noop:
+                    raw, sanitized, verified = raw2, sanitized2, v2
+                    break
+        no_op_reason = ""
+
+    # If still nothing and synth not disabled, try tiny no-op once,
+    # BUT NEVER when _STRICT_NOOP is enabled (prevents TYPE_CHECKING loop).
+    synth_used = False
+    if (not verified) and (not _NO_SYNTH) and (not _STRICT_NOOP):
+        target = _pick_first_python(hotspots)
+        if target is not None:
+            rel = str(target.relative_to(root).as_posix())
+            if rel.startswith("bot/") and not _is_excluded_path(rel):
+                synth = _synthesize_python_type_checking_noop(rel, target)
+                if synth.strip():
+                    verified = synth
+                    raw = synth
+                    synth_used = True
+
+    art_dir, diff_path, _ = _write_artifacts(origin_prompt, raw, verified)
+    _write_status(art_dir, {
+        "reason": _empty_reason(raw, sanitized, verified, no_op_reason),
+        "sizes": {"raw": len(raw or ""), "sanitized": len(sanitized or ""), "verified": len(verified or "")},
+        "strict_noop": bool(_STRICT_NOOP),
+        "synth_used": bool(synth_used)
+    })
+    touched = _touch_list_from_diff(verified) if verified else []
+
+    applied = False
+    strategy_report: Dict[str, object] = {}
+    if verified:
+        applied, strategy_report = _git_apply(diff_path, artifacts_dir=str(art_dir), verbose=_VERBOSE)
+        try:
+            (pathlib.Path(art_dir) / "apply.json").write_text(json.dumps(strategy_report, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    note_bits = []
+    if synth_used:
+        note_bits.append("used synth fallback (TYPE_CHECKING no-op) because LLM diff could not be verified")
+    note_bits.append("patch applied via git apply" if applied else "no verified changes applied")
+    note = "; ".join(note_bits)
+
+    try:
+        pr_text = _generate_pr_md(verified if verified else "")
+        (pathlib.Path(art_dir) / "PR.md").write_text(pr_text, encoding="utf-8")
+    except Exception:
+        pass
+
+    return AutoCodeResult(
+        title="autocode-refactor",
+        patch_path=str(diff_path),
+        patch_applied=bool(applied),
+        touched_paths=touched,
+        artifacts_dir=str(art_dir),
+        note=note,
+    )
+
+# ---------- git apply with strategy report ----------
+def _summarize_cmd(cmd: List[str]) -> str:
+    return " ".join(cmd)
+
+def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, verbose: bool=False) -> Tuple[bool, Dict[str, object]]:
+    """
+    Smarter patch application with a strategy report:
+      1) Parse touched paths from the diff.
+      2) Probe path tracking + index cleanliness.
+      3) Try the safest strategy that fits:
+         a) If any new/untracked files or index mismatch → prefer working-tree apply (no --index), then stage.
+         b) Else try --index.
+         c) If that fails, try --3way (implies --index).
+         d) Last resort: --reject (treated as failure if any .rej created).
+    Writes a JSON report (apply.json) when artifacts_dir is set.
+    """
+    report: Dict[str, object] = {"touched": [], "has_untracked": False, "index_clean": True, "attempts": []}
+    if not patch_path.exists() or patch_path.stat().st_size == 0:
+        return False, report
+
+    root = get_project_root()
+    diff_txt = patch_path.read_text(encoding="utf-8", errors="replace")
+    touched = _touch_list_from_diff(diff_txt)
+    report["touched"] = touched
+
+    def _run(cmd: list[str]) -> tuple[int, str, str]:
+        try:
+            p = subprocess.run(cmd, cwd=root, text=True, capture_output=True, check=False)
+            return p.returncode, p.stdout, p.stderr
+        except Exception as e:
+            return 999, "", str(e)
+
+    def _tracked(path: str) -> bool:
+        code, _, _ = _run(["git","ls-files","--error-unmatch","--",path])
+        return code == 0
+
+    def _paths_clean(paths: list[str]) -> bool:
+        # Are these paths identical in index & working tree? If any differ, --index will balk.
+        if not paths:
+            return True
+        code, _, _ = _run(["git","diff-index","--quiet","--", "HEAD", "--", *paths])
+        # diff-index returns 0 when no differences
+        return code == 0
+
+    # Refresh stat info to avoid false index mismatches on Windows.
+    _run(["git","update-index","-q","--refresh"])
+
+    tracked_map = {p: _tracked(p) for p in touched}
+    has_untracked = any(not v for v in tracked_map.values())
+    index_clean = _paths_clean([p for p, t in tracked_map.items() if t])
+    report["has_untracked"] = has_untracked
+    report["index_clean"] = index_clean
+    if verbose:
+        print(f"[autocoder][apply] touched={len(touched)} has_untracked={has_untracked} index_clean={index_clean}")
+
+    def _check(cmd: list[str]) -> bool:
+        rc, _, _ = _run(["git","apply","--check", *cmd[2:], str(patch_path)])
+        return rc == 0
+
+    def _apply_cmd(cmd: list[str]) -> bool:
+        rc, _, _ = _run(cmd + [str(patch_path)])
+        return rc == 0
+
+    # Strategy candidates (ordered)
+    strategies: list[list[str]] = []
+    if has_untracked or not index_clean:
+        strategies.append(["git","apply","--whitespace=fix","--ignore-whitespace"])
+        strategies.append(["git","apply","--recount","--unidiff-zero","--whitespace=fix","--ignore-whitespace"])
+        strategies.append(["git","apply","--3way"])
+    else:
+        strategies.append(["git","apply","--index","--whitespace=fix"])
+        strategies.append(["git","apply","--index","--recount","--unidiff-zero","--whitespace=fix"])
+        strategies.append(["git","apply","--3way"])
+    strategies.append(["git","apply","--reject","--whitespace=nowarn"])
+
+    chosen = None
+    for cmd in strategies:
+        attempt: Dict[str, object] = {"cmd": _summarize_cmd(cmd), "check_ok": False, "applied": False, "rej_delta": 0}
+        check_ok = _check(cmd)
+        attempt["check_ok"] = bool(check_ok)
+        if not check_ok:
+            report["attempts"].append(attempt)
+            continue
+        before_rej = list(root.rglob("*.rej"))
+        applied = _apply_cmd(cmd)
+        after_rej = list(root.rglob("*.rej"))
+        attempt["applied"] = bool(applied)
+        attempt["rej_delta"] = max(0, len(after_rej) - len(before_rej))
+        report["attempts"].append(attempt)
+        if applied:
+            if "--reject" in cmd and attempt["rej_delta"]:
+                # treat partial apply as failure
+                continue
+            chosen = cmd
+            break
+
+    if chosen and ("--index" not in chosen and "--3way" not in chosen) and touched:
+        # stage touched files explicitly if we didn’t use an index strategy
+        _run(["git","add","--"] + touched)
+
+    ok = chosen is not None
+    report["chosen"] = _summarize_cmd(chosen) if chosen else None
+    if verbose:
+        ch = report["chosen"] or "NONE"
+        print(f"[autocoder][apply] result={ok} strategy={ch}")
+    if artifacts_dir:
+        try:
+            summary = (
+                f"chosen={report['chosen']}\n"
+                f"touched={len(touched)} has_untracked={has_untracked} index_clean={index_clean}\n"
+                + "\n".join(
+                    f"- try: {a['cmd']} check_ok={a['check_ok']} applied={a['applied']} rej_delta={a['rej_delta']}"
+                    for a in report["attempts"]
+                ) + "\n"
+            )
+            pathlib.Path(artifacts_dir, "apply.txt").write_text(summary, encoding="utf-8")
+        except Exception:
+            pass
+    return ok, report
