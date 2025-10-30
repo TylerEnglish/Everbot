@@ -1,4 +1,5 @@
 from __future__ import annotations
+import ast
 import difflib, io, json, locale, os, pathlib, re, subprocess, textwrap, time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple, DefaultDict
@@ -62,6 +63,158 @@ _PLAIN_FILE_HEADER_RE = re.compile(r'(?im)^File\s*:\s*(bot/[A-Za-z0-9_\-./]+)\s*
 _hunk_header_re       = re.compile(r"^@@\s+-([0-9]+)(?:,([0-9]+))?\s+\+([0-9]+)(?:,([0-9]+))?\s+@@")
 _py_import_from       = re.compile(r'^\s*from\s+([a-zA-Z_][\w\.]*)\s+import\b')
 _py_import_direct     = re.compile(r'^\s*import\s+([a-zA-Z_][\w\.]*)(?:\s+as\b|\s*$|\s*,)')
+
+# --- NEW: header-protection + import-restore helpers -------------------------
+_FUNC_HEADER_RE = re.compile(r'^\s*(async\s+def|def|class)\s+[A-Za-z_]\w*')
+_TRIPLE_QUOTE_RE = re.compile(r'^\s*[rubfRUBF]?("""|\'\'\')')
+
+def _indent_count(s: str) -> int:
+    s = s.expandtabs(4)
+    return len(s) - len(s.lstrip(' '))
+
+def _protected_deletion_indices(hunk: List[str]) -> set[int]:
+    """
+    For a hunk, return indices (relative to hunk[1:]) of '-' lines that are
+    def/class headers where the body is *not* being deleted in the same hunk.
+    We protect those so an isolated header cannot be removed.
+    """
+    protected: set[int] = set()
+    lines = hunk[1:]
+    for j, raw in enumerate(lines):
+        if not raw.startswith("-"):
+            continue
+        s = raw[1:]
+        if not _FUNC_HEADER_RE.match(s):
+            continue
+        head_indent = _indent_count(s)
+        # consider it a full removal only if we see at least one '-' body line
+        removes_body = False
+        for nxt in lines[j+1:]:
+            if not nxt.startswith("-"):
+                continue
+            b = nxt[1:]
+            if b.strip() == "":
+                continue
+            if _indent_count(b) > head_indent:
+                removes_body = True
+                break
+        if not removes_body:
+            protected.add(j)
+    return protected
+
+def _extract_imports(lines: List[str]) -> List[Tuple[int, str, set[str]]]:
+    """
+    Return (line_index, line_text, introduced_names).
+    We approximate introduced names (aliases win). Handles multi-import lists.
+    """
+    out: List[Tuple[int, str, set[str]]] = []
+    for i, ln in enumerate(lines):
+        body = ln.rstrip("\n")
+        m_from = re.match(r'^\s*from\s+([.\w]+)\s+import\s+(.+)$', body)
+        m_imp  = re.match(r'^\s*import\s+(.+)$', body)
+        names: set[str] = set()
+        if m_from:
+            items = [p.strip() for p in m_from.group(2).split(",")]
+            for it in items:
+                if " as " in it:
+                    base, alias = [x.strip() for x in it.split(" as ", 1)]
+                    names.add(alias)
+                else:
+                    names.add(it.split(".",1)[0])
+        elif m_imp:
+            items = [p.strip() for p in m_imp.group(1).split(",")]
+            for it in items:
+                if " as " in it:
+                    base, alias = [x.strip() for x in it.split(" as ", 1)]
+                    names.add(alias)
+                else:
+                    names.add(it.split(".",1)[0])
+        if names:
+            out.append((i, ln, names))
+    return out
+
+def _collect_used_names(code_text: str) -> set[str]:
+    """
+    Walk AST and collect identifiers used in Load/Attribute contexts.
+    """
+    used: set[str] = set()
+    try:
+        tree = ast.parse(code_text)
+    except SyntaxError:
+        # On syntax errors, be conservative: don't treat imports as unused.
+        return used  # empty set forces "keep" in caller
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            used.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            # capture base 'np' in 'np.array'
+            if isinstance(node.value, ast.Name):
+                used.add(node.value.id)
+    return used
+
+def _find_import_insertion_index(lines: List[str]) -> int:
+    """
+    Place restored imports after shebang/encoding/module docstring and any top imports.
+    """
+    i, n = 0, len(lines)
+    # shebang
+    if i < n and lines[i].startswith("#!"):
+        i += 1
+    # encoding declaration
+    if i < n and re.match(r'^\s*#.*coding[:=]\s*([-\w.]+)', lines[i]):
+        i += 1
+    # module docstring
+    if i < n and _TRIPLE_QUOTE_RE.match(lines[i].rstrip("\n")):
+        q = lines[i].strip()[0:3]
+        i += 1
+        while i < n and (q not in lines[i]):
+            i += 1
+        if i < n:
+            i += 1
+    # advance past initial imports/comments/blank lines
+    last_import = -1
+    j = i
+    while j < n:
+        b = lines[j].rstrip("\n")
+        if b.strip().startswith("#") or b.strip() == "":
+            j += 1; continue
+        if b.startswith("from ") or b.startswith("import "):
+            last_import = j
+            j += 1; continue
+        break
+    return (last_import + 1) if last_import >= 0 else i
+
+def _restore_removed_imports_if_used(original: List[str], new_lines: List[str]) -> List[str]:
+    """
+    If the patch removed import lines whose names are still used, reinsert them.
+    """
+    orig_imps = _extract_imports(original)
+    new_imps  = _extract_imports(new_lines)
+    new_imp_texts = {ln for _, ln, _ in new_imps}
+
+    removed: List[Tuple[str, set[str]]] = []
+    for _, ln, names in orig_imps:
+        if ln not in new_imp_texts:
+            removed.append((ln, names))
+
+    code_text = "".join(new_lines)
+    used = _collect_used_names(code_text)
+    if not removed or used == set():
+        return new_lines
+
+    to_restore = []
+    for ln, names in removed:
+        # If we couldn't parse AST (used == set()), we already returned.
+        if any(name in used for name in names):
+            to_restore.append(ln if ln.endswith("\n") else (ln + "\n"))
+
+    if not to_restore:
+        return new_lines
+
+    insert_at = _find_import_insertion_index(new_lines)
+    # avoid duplicates if the same text got reintroduced elsewhere
+    restored = new_lines[:insert_at] + [t for t in to_restore if t not in new_lines] + new_lines[insert_at:]
+    return restored
 
 # ======================================================================================
 # Data classes
@@ -153,7 +306,6 @@ def _norm_sep(path: str) -> str:
 
 # ======================================================================================
 # Recent touches → cooldown
-# (unchanged from your version, omitted for brevity in this comment block)
 # ======================================================================================
 def _recent_autocode_touches(root: pathlib.Path) -> Dict[str, float]:
     base = root / "snapshots" / "selfopt" / "autocode"
@@ -182,7 +334,7 @@ def _recent_autocode_touches(root: pathlib.Path) -> Dict[str, float]:
     return out
 
 # ======================================================================================
-# Scan hotspots (same logic, kept)
+# Scan hotspots
 # ======================================================================================
 def _targets_from_env(root: pathlib.Path) -> List[pathlib.Path]:
     if not _TARGETS_ENV:
@@ -265,7 +417,7 @@ def _scan_hotspots(root: pathlib.Path, max_files: int = 5) -> List[pathlib.Path]
     return top[:max_files]
 
 # ======================================================================================
-# Prompt construction (unchanged)
+# Prompt construction
 # ======================================================================================
 def _build_prompt(file_paths: List[pathlib.Path]) -> str:
     header = (
@@ -497,7 +649,7 @@ def _doctor_diff(raw: str) -> str:
     return (final + ("\n" if final and not final.endswith("\n") else "")) if final else ""
 
 # ======================================================================================
-# Suggestion parsing (unchanged except using doctor’d blocks)
+# Suggestion parsing
 # ======================================================================================
 def _parse_suggestions(text: str) -> List[SuggestedFile]:
     out: List[SuggestedFile] = []
@@ -509,7 +661,7 @@ def _parse_suggestions(text: str) -> List[SuggestedFile]:
     return out
 
 # ======================================================================================
-# Py import rewrite on rename (unchanged)
+# Py import rewrite on rename
 # ======================================================================================
 def _py_module_from_path(rel_path: str) -> Optional[str]:
     if not rel_path.endswith(".py"): return None
@@ -572,7 +724,7 @@ def _rewrite_imports_for_rename(root: pathlib.Path, old_rel: str, new_rel: str) 
     return results
 
 # ======================================================================================
-# Unified diff helpers + fuzzy hunk applier (as in your version)
+# Unified diff helpers + fuzzy hunk applier
 # ======================================================================================
 def _old_sequence_from_hunk(hunk: List[str]) -> List[str]:
     seq: List[str] = []
@@ -582,16 +734,29 @@ def _old_sequence_from_hunk(hunk: List[str]) -> List[str]:
     return seq
 
 def _new_sequence_from_hunk(hunk: List[str], original_slice: List[str]) -> List[str]:
+    """
+    Apply a hunk to a given slice, with *protections*:
+      - Never remove a def/class header unless the hunk also removes body lines.
+    """
     new_seq: List[str] = []
     idx = 0
-    for ln in hunk[1:]:
+    protected = _protected_deletion_indices(hunk)  # indices in hunk[1:]
+    for j, ln in enumerate(hunk[1:]):
         tag = ln[:1]; body = ln[1:] + "\n"
         if tag == " ":
             if idx < len(original_slice): new_seq.append(original_slice[idx])
             else: new_seq.append(body)
             idx += 1
         elif tag == "-":
-            idx += 1
+            if j in protected:
+                # keep the original header line instead of deleting it
+                if idx < len(original_slice):
+                    new_seq.append(original_slice[idx])
+                else:
+                    new_seq.append(body)
+                idx += 1
+            else:
+                idx += 1
         elif tag == "+":
             new_seq.append(body)
     return new_seq
@@ -705,7 +870,7 @@ def _make_deleted_file_diff(rel_path: str, original: List[str]) -> str:
     return f"diff --git a/{rel_path} b/{rel_path}\n--- a/{rel_path}\n+++ /dev/null\n{hdr}{minus}"
 
 # ======================================================================================
-# Diff size / no-op detection (unchanged)
+# Diff size / no-op detection
 # ======================================================================================
 def _touch_list_from_diff(diff_text: str) -> List[str]:
     touched = []
@@ -813,7 +978,7 @@ def _generate_pr_md(diff_text: str) -> str:
     return "\n".join(lines)
 
 # ======================================================================================
-# Code/FILE-block salvage → diff (unchanged)
+# Code/FILE-block salvage → diff
 # ======================================================================================
 def _candidate_repo_files(root: pathlib.Path) -> List[pathlib.Path]:
     candidates: List[pathlib.Path] = []
@@ -1006,6 +1171,8 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
             if sug.hunks:
                 rep = _apply_hunks_to_content(orig, sug.hunks)
                 new_content = rep.result
+                # --- NEW: restore imports if patch removed still-used ones
+                new_content = _restore_removed_imports_if_used(orig, new_content)
             file_diffs.append(_make_deleted_file_diff(a_rel, orig))
             file_diffs.append(_make_new_file_diff(b_rel, new_content))
             rewrites = _rewrite_imports_for_rename(root, a_rel, b_rel)
@@ -1023,8 +1190,10 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
             if original and original[-1] == "\n" and not data.endswith("\n"): original = original[:-1]
             rep = _apply_hunks_to_content(original, sug.hunks or [])
             if rep.result != original and rep.applied:
+                # --- NEW: import restore pass
+                patched = _restore_removed_imports_if_used(original, rep.result)
                 dst_rel = b_rel or a_rel
-                file_diffs.append(_make_unified_diff(dst_rel, original, rep.result))
+                file_diffs.append(_make_unified_diff(dst_rel, original, patched))
             continue
 
     joined = ("\n".join(file_diffs) + ("\n" if file_diffs else ""))
@@ -1080,6 +1249,7 @@ def _repack_patch_against_worktree(root: pathlib.Path, file_patch: str) -> Optio
       - reading current worktree
       - re-applying hunks fuzzily
       - re-emitting a fresh unified diff (recounted hunks)
+      - and restoring imports if needed
     """
     sug = _parse_suggestions(file_patch)
     if not sug:
@@ -1098,7 +1268,9 @@ def _repack_patch_against_worktree(root: pathlib.Path, file_patch: str) -> Optio
     rep = _apply_hunks_to_content(orig, s.hunks or [])
     if rep.result == orig:
         return None
-    return _make_unified_diff(rel, orig, rep.result)
+    # --- NEW: import restore
+    patched = _restore_removed_imports_if_used(orig, rep.result)
+    return _make_unified_diff(rel, orig, patched)
 
 def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, verbose: bool=False) -> Tuple[bool, Dict[str, object]]:
     """
