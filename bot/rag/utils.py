@@ -6,7 +6,7 @@ import hashlib
 import time
 
 # Export selection API from priority to keep old imports working
-from .priority import Plan, select_next  # noqa: F401
+from bot.curriculum.priority import Plan, select_next  # noqa: F401
 
 # ---------------------------
 # Legacy helpers (kept so other modules don't break)
