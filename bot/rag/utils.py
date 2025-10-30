@@ -1,8 +1,12 @@
 from __future__ import annotations
-from dataclasses import dataclass
-import hashlib, json, time
 from pathlib import Path
-from typing import Iterable, Dict, Any, Optional, List, Tuple
+from typing import Optional, Dict, List, Tuple, Iterable, Any
+import json
+import hashlib
+import time
+
+# Export selection API from priority to keep old imports working
+from .priority import Plan, select_next  # noqa: F401
 
 # ---------------------------
 # Legacy helpers (kept so other modules don't break)
