@@ -15,6 +15,7 @@ from bot.rules.loader import load_all
 from bot.eval.harness import run_all
 from bot.rag.utils import read_jsonl, write_jsonl
 from bot.telemetry.tracing import get_tracer, force_flush
+from bot.eval.postprocess import enhance_eval_payload
 
 app = typer.Typer(help="Everabot CLI")
 rag_app = typer.Typer(help="RAG substrate commands")
