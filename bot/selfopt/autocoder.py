@@ -1,3 +1,4 @@
+# File: bot/autocoder.py
 from __future__ import annotations
 import ast
 import difflib, io, json, locale, os, pathlib, re, subprocess, textwrap, time
@@ -64,7 +65,7 @@ _hunk_header_re       = re.compile(r"^@@\s+-([0-9]+)(?:,([0-9]+))?\s+\+([0-9]+)(
 _py_import_from       = re.compile(r'^\s*from\s+([a-zA-Z_][\w\.]*)\s+import\b')
 _py_import_direct     = re.compile(r'^\s*import\s+([a-zA-Z_][\w\.]*)(?:\s+as\b|\s*$|\s*,)')
 
-# --- NEW: header-protection + import-restore helpers -------------------------
+# --- header-protection + import-restore helpers (hardened) -------------------
 _FUNC_HEADER_RE = re.compile(r'^\s*(async\s+def|def|class)\s+[A-Za-z_]\w*')
 _TRIPLE_QUOTE_RE = re.compile(r'^\s*[rubfRUBF]?("""|\'\'\')')
 
@@ -74,9 +75,9 @@ def _indent_count(s: str) -> int:
 
 def _protected_deletion_indices(hunk: List[str]) -> set[int]:
     """
-    For a hunk, return indices (relative to hunk[1:]) of '-' lines that are
-    def/class headers where the body is *not* being deleted in the same hunk.
-    We protect those so an isolated header cannot be removed.
+    Protect '-' lines that are def/class headers where the body is not being
+    deleted in the same hunk, and also protect any immediately-adjacent
+    decorator lines that belong to that header.
     """
     protected: set[int] = set()
     lines = hunk[1:]
@@ -87,7 +88,6 @@ def _protected_deletion_indices(hunk: List[str]) -> set[int]:
         if not _FUNC_HEADER_RE.match(s):
             continue
         head_indent = _indent_count(s)
-        # consider it a full removal only if we see at least one '-' body line
         removes_body = False
         for nxt in lines[j+1:]:
             if not nxt.startswith("-"):
@@ -100,37 +100,71 @@ def _protected_deletion_indices(hunk: List[str]) -> set[int]:
                 break
         if not removes_body:
             protected.add(j)
+            # also protect contiguous decorator lines just ABOVE the header
+            k = j - 1
+            while k >= 0 and lines[k].startswith("-") and lines[k][1:].lstrip().startswith("@"):
+                protected.add(k)
+                k -= 1
     return protected
+
+# ------- import detection (now handles multi-line and continuations) ----------
+def _gobble_import_block(lines: List[str], start: int) -> Tuple[str, int]:
+    """
+    Returns (full_import_text, end_index) starting at a potential import line.
+    Joins parenthesized or backslash-continued imports.
+    """
+    buf = [lines[start].rstrip("\n")]
+    i = start + 1
+    paren = buf[0].count("(") - buf[0].count(")")
+    cont = buf[0].rstrip().endswith("\\")
+    while i < len(lines) and (paren > 0 or cont):
+        buf.append(lines[i].rstrip("\n"))
+        paren += lines[i].count("(") - lines[i].count(")")
+        cont = lines[i].rstrip().endswith("\\")
+        i += 1
+    return ("\n".join(buf)), i
 
 def _extract_imports(lines: List[str]) -> List[Tuple[int, str, set[str]]]:
     """
-    Return (line_index, line_text, introduced_names).
-    We approximate introduced names (aliases win). Handles multi-import lists.
+    Return a list of (line_index, import_text, introduced_names).
+    This version supports:
+      - 'from x import (a, b as c, d)'
+      - 'import a, b as bb, c.d'
+      - backslash-continued import lists
     """
     out: List[Tuple[int, str, set[str]]] = []
-    for i, ln in enumerate(lines):
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
         body = ln.rstrip("\n")
-        m_from = re.match(r'^\s*from\s+([.\w]+)\s+import\s+(.+)$', body)
-        m_imp  = re.match(r'^\s*import\s+(.+)$', body)
-        names: set[str] = set()
-        if m_from:
-            items = [p.strip() for p in m_from.group(2).split(",")]
-            for it in items:
-                if " as " in it:
-                    base, alias = [x.strip() for x in it.split(" as ", 1)]
-                    names.add(alias)
-                else:
-                    names.add(it.split(".",1)[0])
-        elif m_imp:
-            items = [p.strip() for p in m_imp.group(1).split(",")]
-            for it in items:
-                if " as " in it:
-                    base, alias = [x.strip() for x in it.split(" as ", 1)]
-                    names.add(alias)
-                else:
-                    names.add(it.split(".",1)[0])
-        if names:
-            out.append((i, ln, names))
+        if re.match(r'^\s*(from\s+[.\w]+\s+import|import\s+)', body):
+            block, j = _gobble_import_block(lines, i)
+            flat = re.sub(r"\s+", " ", block.strip())
+            names: set[str] = set()
+            m_from = re.match(r'^\s*from\s+([.\w]+)\s+import\s+(.+)$', flat)
+            m_imp  = re.match(r'^\s*import\s+(.+)$', flat)
+            if m_from:
+                items = m_from.group(2).strip()
+                if items.startswith("(") and items.endswith(")"):
+                    items = items[1:-1]
+                for it in [p.strip() for p in items.split(",") if p.strip()]:
+                    if " as " in it:
+                        base, alias = [x.strip() for x in it.split(" as ", 1)]
+                        names.add(alias)
+                    else:
+                        names.add(it.split(".",1)[0])
+            elif m_imp:
+                for it in [p.strip() for p in m_imp.group(1).split(",") if p.strip()]:
+                    if " as " in it:
+                        base, alias = [x.strip() for x in it.split(" as ", 1)]
+                        names.add(alias)
+                    else:
+                        names.add(it.split(".",1)[0])
+            if names:
+                out.append((i, block if block.endswith("\n") else (block + "\n"), names))
+            i = j
+            continue
+        i += 1
     return out
 
 def _collect_used_names(code_text: str) -> set[str]:
@@ -147,23 +181,26 @@ def _collect_used_names(code_text: str) -> set[str]:
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
             used.add(node.id)
         elif isinstance(node, ast.Attribute):
-            # capture base 'np' in 'np.array'
             if isinstance(node.value, ast.Name):
                 used.add(node.value.id)
     return used
 
 def _find_import_insertion_index(lines: List[str]) -> int:
     """
-    Place restored imports after shebang/encoding/module docstring and any top imports.
+    Place restored imports after:
+      1) shebang
+      2) encoding decl (PEP 263)
+      3) module docstring (PEP 257)
+      4) __future__ imports (PEP 8: imports at top, futures first)
     """
     i, n = 0, len(lines)
     # shebang
     if i < n and lines[i].startswith("#!"):
         i += 1
-    # encoding declaration
+    # encoding declaration (PEP 263)
     if i < n and re.match(r'^\s*#.*coding[:=]\s*([-\w.]+)', lines[i]):
         i += 1
-    # module docstring
+    # module docstring (PEP 257)
     if i < n and _TRIPLE_QUOTE_RE.match(lines[i].rstrip("\n")):
         q = lines[i].strip()[0:3]
         i += 1
@@ -171,22 +208,24 @@ def _find_import_insertion_index(lines: List[str]) -> int:
             i += 1
         if i < n:
             i += 1
-    # advance past initial imports/comments/blank lines
+    # __future__ imports, then any existing imports
     last_import = -1
     j = i
     while j < n:
         b = lines[j].rstrip("\n")
         if b.strip().startswith("#") or b.strip() == "":
             j += 1; continue
+        if b.startswith("from __future__ import"):
+            last_import = j; j += 1; continue
         if b.startswith("from ") or b.startswith("import "):
-            last_import = j
-            j += 1; continue
+            last_import = j; j += 1; continue
         break
     return (last_import + 1) if last_import >= 0 else i
 
 def _restore_removed_imports_if_used(original: List[str], new_lines: List[str]) -> List[str]:
     """
     If the patch removed import lines whose names are still used, reinsert them.
+    Handles single- and multi-line import statements.
     """
     orig_imps = _extract_imports(original)
     new_imps  = _extract_imports(new_lines)
@@ -199,20 +238,21 @@ def _restore_removed_imports_if_used(original: List[str], new_lines: List[str]) 
 
     code_text = "".join(new_lines)
     used = _collect_used_names(code_text)
-    if not removed or used == set():
+    if not removed:
         return new_lines
 
     to_restore = []
     for ln, names in removed:
-        # If we couldn't parse AST (used == set()), we already returned.
-        if any(name in used for name in names):
+        # If AST failed, we returned empty set -> don't "optimize away"
+        if not used or any(name in used for name in names):
+            # keep exact text to avoid reformat churn
             to_restore.append(ln if ln.endswith("\n") else (ln + "\n"))
 
     if not to_restore:
         return new_lines
 
     insert_at = _find_import_insertion_index(new_lines)
-    # avoid duplicates if the same text got reintroduced elsewhere
+    # avoid textual duplicates
     restored = new_lines[:insert_at] + [t for t in to_restore if t not in new_lines] + new_lines[insert_at:]
     return restored
 
@@ -735,8 +775,8 @@ def _old_sequence_from_hunk(hunk: List[str]) -> List[str]:
 
 def _new_sequence_from_hunk(hunk: List[str], original_slice: List[str]) -> List[str]:
     """
-    Apply a hunk to a given slice, with *protections*:
-      - Never remove a def/class header unless the hunk also removes body lines.
+    Apply a hunk to a given slice, with protections:
+      - Never remove a def/class header (or its decorators) unless the hunk also removes body lines.
     """
     new_seq: List[str] = []
     idx = 0
@@ -749,7 +789,6 @@ def _new_sequence_from_hunk(hunk: List[str], original_slice: List[str]) -> List[
             idx += 1
         elif tag == "-":
             if j in protected:
-                # keep the original header line instead of deleting it
                 if idx < len(original_slice):
                     new_seq.append(original_slice[idx])
                 else:
@@ -1171,7 +1210,6 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
             if sug.hunks:
                 rep = _apply_hunks_to_content(orig, sug.hunks)
                 new_content = rep.result
-                # --- NEW: restore imports if patch removed still-used ones
                 new_content = _restore_removed_imports_if_used(orig, new_content)
             file_diffs.append(_make_deleted_file_diff(a_rel, orig))
             file_diffs.append(_make_new_file_diff(b_rel, new_content))
@@ -1190,7 +1228,6 @@ def _verified_patch_from_llm_diff(diff_text: str) -> str:
             if original and original[-1] == "\n" and not data.endswith("\n"): original = original[:-1]
             rep = _apply_hunks_to_content(original, sug.hunks or [])
             if rep.result != original and rep.applied:
-                # --- NEW: import restore pass
                 patched = _restore_removed_imports_if_used(original, rep.result)
                 dst_rel = b_rel or a_rel
                 file_diffs.append(_make_unified_diff(dst_rel, original, patched))
@@ -1239,7 +1276,6 @@ def _per_file_patches(diff_text: str) -> Dict[str, str]:
     for key, pieces in groups.items():
         txt = "\n".join(pieces)
         out[_norm_sep(key)] = (txt + ("\n" if txt and not txt.endswith("\n") else "")) if txt else ""
-    # return sorted by class then path
     return dict(sorted(out.items(), key=lambda kv: (meta.get(kv[0], 2), kv[0])))
 
 def _repack_patch_against_worktree(root: pathlib.Path, file_patch: str) -> Optional[str]:
@@ -1268,7 +1304,6 @@ def _repack_patch_against_worktree(root: pathlib.Path, file_patch: str) -> Optio
     rep = _apply_hunks_to_content(orig, s.hunks or [])
     if rep.result == orig:
         return None
-    # --- NEW: import restore
     patched = _restore_removed_imports_if_used(orig, rep.result)
     return _make_unified_diff(rel, orig, patched)
 
@@ -1347,17 +1382,14 @@ def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, v
             base.append(["git","apply","--whitespace=fix","--ignore-whitespace"])
             base.append(["git","apply","--recount","--unidiff-zero","--whitespace=fix","--ignore-whitespace"])
             base.append(["git","apply","--3way"])
-        # extra forgiveness toggles
         if forgiving:
             base.append(["git","apply","--inaccurate-eof","--whitespace=fix","--ignore-whitespace"])
-        # last chance: --reject (if chosen, we will inspect .rej)
         base.append(["git","apply","--reject","--whitespace=nowarn"])
         return base
 
     def _reverse_probe_ok(patch: pathlib.Path, cmd: List[str]) -> bool:
         if not _REVERSE_PROBE:
             return False
-        # Try check with reverse
         rc, _, _ = _run_bytes(["git","apply","--check","-R", *cmd[2:], str(patch)])
         return rc == 0
 
@@ -1368,15 +1400,11 @@ def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, v
         for cmd in _strategy_ladder(for_index_clean, forgiving):
             attempt: Dict[str, object] = {"cmd": _summarize_cmd(cmd), "check_ok": False, "applied": False, "rej_delta": 0, "reversed": False}
             if not _check(cmd, tmp_patch_path):
-                # reverse probe
                 if _REVERSE_PROBE and _reverse_probe_ok(tmp_patch_path, cmd):
                     attempt["reversed"] = True
-                    rc, out, err = _run_bytes(["git","apply","-R","--check", *cmd[2:], str(tmp_patch_path)])
-                    ok = (rc == 0)
                 else:
                     attempts_local.append(attempt); continue
             before_rej = _list_rej(root)
-            # normal or reversed apply
             if attempt.get("reversed"):
                 applied = _apply_cmd(["git","apply","-R", *cmd[2:]], tmp_patch_path)
             else:
@@ -1388,7 +1416,6 @@ def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, v
             attempts_local.append(attempt)
             if applied:
                 if "--reject" in cmd and attempt["rej_delta"]:
-                    # not good enough; continue trying better strategies
                     continue
                 chosen_local = cmd
                 break
@@ -1400,12 +1427,10 @@ def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, v
     if _APPLY_PER_FILE:
         per = _per_file_patches(diff_txt)
         for rel, ptxt in per.items():
-            # write temp patch file for this file alone
             pf = (pathlib.Path(artifacts_dir) if artifacts_dir else get_project_root() / "snapshots") / f"__single_{rel.replace('/','_')}.patch"
             pf.parent.mkdir(parents=True, exist_ok=True)
             pf.write_text(ptxt, encoding="utf-8")
             ok, detail = _apply_single_patch(pf, index_clean, forgiving=True)
-            # If REJ and allowed, repack and retry once
             if (not ok) and _REPACK_AFTER_REJ and detail.get("attempts"):
                 had_rej = any(a.get("rej_delta") for a in detail["attempts"])
                 if had_rej:
@@ -1420,7 +1445,6 @@ def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, v
             overall_ok = overall_ok and ok
         report["per_file"] = per_file_report
 
-        # If anything failed, try whole patch as a final fallback
         if not overall_ok:
             if _VERBOSE:
                 print("[autocoder][apply] per-file path had failures; attempting whole-patch fallback.")
@@ -1435,9 +1459,6 @@ def _git_apply(patch_path: pathlib.Path, *, artifacts_dir: Optional[str]=None, v
             if not _check(cmd, patch_path):
                 if _REVERSE_PROBE and _reverse_probe_ok(patch_path, cmd):
                     attempt["reversed"] = True
-                    rc, out, err = _run_bytes(["git","apply","-R","--check", *cmd[2:], str(patch_path)])
-                    if rc != 0:
-                        report["attempts"].append(attempt); continue
                 else:
                     report["attempts"].append(attempt); continue
             before_rej = _list_rej(root)
