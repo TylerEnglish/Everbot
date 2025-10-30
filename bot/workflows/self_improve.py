@@ -11,7 +11,7 @@ from bot.selfopt.autocoder import propose_and_apply_refactor, AutoCodeResult
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     pass  # Autocode: non-functional type-only block
-
+from bot.eval.postprocess import load_baseline_score, enhance_eval_payload, should_adopt
 
 def _git_safe_commit(msg: str, paths: list[str]) -> None:
     try:
@@ -124,6 +124,18 @@ def _diff_has_duplicate_except_or_spam(diff_text: str) -> bool:
         return True
     return False
 
+def _run_root_eval() -> dict:
+    p = subprocess.run([sys.executable, "-m", "bot.cli", "eval"], capture_output=True, text=True, check=False)
+    # The CLI prints a summary line; we load the JSON artifact that eval wrote.
+    # Find the newest root_eval_*.json under snapshots/evals
+    root = pathlib.Path(__file__).resolve().parents[2]
+    evdir = root / "snapshots" / "evals"
+    latest = max(evdir.glob("root_eval_*.json"), key=lambda p: p.stat().st_mtime)
+    obj = json.loads(latest.read_text(encoding="utf-8"))
+    return enhance_eval_payload(obj, write_back=True)
+
+def _git_reset_hard(ref: str="HEAD"):
+    subprocess.run(["git","reset","--hard", ref], check=False)
 
 def run() -> int:
     """
