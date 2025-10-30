@@ -105,6 +105,7 @@ def eval():
     tracer = get_tracer("everabot.cli")
     with tracer.start_as_current_span("cli.eval"):
         payload = run_all()
+        payload = enhance_eval_payload(payload, write_back=True)
         print(payload.get("overall"), "-", payload.get("artifact"))
     force_flush()
 
@@ -199,6 +200,7 @@ def learn(
 
         # 2) root eval (explicit print for visibility)
         root = run_all()
+        root = enhance_eval_payload(root, write_back=True)
         print(f"root eval: {root.get('overall')}  artifact={root.get('artifact')}")
 
         # 3) self-improve (A/B accelerators + autocode)
